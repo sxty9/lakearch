@@ -1,0 +1,1 @@
+In dem Ordner /semantics wird die Bedeutung der lakearch hinterlegt. Dabei handelt es sich lediglich um die Architektur des Datenmodells und nicht etwa um ihre technologische Umsetzung
