@@ -1,0 +1,10 @@
+[package]
+name = "lakearch-core"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "lakearch kernel substrate: append-only content-addressed graph store, traversal, gate"
+
+[dependencies]
+blake3 = { workspace = true }
