@@ -8,3 +8,7 @@ description = "lakearch kernel substrate: append-only content-addressed graph st
 
 [dependencies]
 blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+minicbor = { version = "2.2.2", default-features = false, features = ["alloc"] }
