@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lakearch-core"]
+members = ["crates/lakearch-core", "crates/lakearchd", "crates/lakearch-ffi"]
 
 [workspace.package]
 edition = "2021"

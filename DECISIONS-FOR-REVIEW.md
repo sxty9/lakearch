@@ -1192,3 +1192,215 @@ Commit pro grüner Phase). **Grün verifiziert** (`source $HOME/.cargo/env`, in
 `model.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`. Kein neues Verb
 berechnet/invalidiert — die spec-kritische Grenze (§1.5/§10.3) ist eingehalten und
 durch einen Negativ-Test eingefroren.
+
+### Phase 7 (Teil) — Daemon `lakearchd` + Transport-Entscheidung (Branch `kernel-impl`)
+
+Der Daemon-Rand (`crates/lakearchd`): **ein** Bestand (= **ein** `LakearchKernel`)
+hinter **einer** Schreib-Pipeline mit **vielen** nebenläufigen Lesern, die
+Kernel-Primitive über das Netz, das **Tor** (§11) auf **jeder** Anfrage. **Grün:**
+`cargo build --all-targets`, `cargo test` (Workspace: 242 lakearch-core + 5
+lakearchd-Unit + 2 lakearchd-Integration), `cargo clippy --all-targets -- -D warnings`.
+
+#### Transport-Entscheidung: gRPC/tonic (GEWÄHLT) — kein Fallback nötig
+
+- **Gewählt: echtes gRPC über `tonic` 0.14** (+ `tonic-prost` 0.14 / `prost` 0.14),
+  exakt wie im Plan vorgesehen (Topologie-Tabelle: „gRPC (tonic) + Arrow Flight
+  (Bulk)"). Der Plan markiert Wire-Protokoll/Transport ausdrücklich als **billig
+  revidierbare** Rand-Entscheidung (§14.2) — der Kernel ist davon unberührt.
+- **`protoc`-Trick (umgesetzt):** in dieser Umgebung ist **kein** System-`protoc`
+  installiert. `crates/lakearchd/build.rs` setzt daher `PROTOC` auf das von der
+  **Build-Dependency `protoc-bin-vendored` 3** mitgelieferte, vorgebaute Binär
+  (`libprotoc 31.1`), bevor `tonic-prost-build` die `.proto` kompiliert — so braucht
+  weder der Build noch der CI ein System-`protoc`. Verifiziert: der ganze
+  tonic/prost/hyper/axum/tower-Stack baut grün mit Rust 1.96.
+  - *Hinweis:* `std::env::set_var` ist unter Rust 1.96 `unsafe`; build.rs ruft es in
+    einem `unsafe`-Block (single-threaded vor jeder Nebenläufigkeit) — der
+    dokumentierte Weg, prost/tonic ein protoc vorzugeben.
+- **Der pure-Rust-Fallback (tokio-TCP + längen-präfigierte postcard/serde-Frames)
+  war NICHT nötig** und wurde **nicht** gebaut: der gRPC-Stack baute ohne Reibung
+  grün. Bliebe er je hängen (Versions-Friktion in einer anderen Umgebung), ist der
+  Fallback die dokumentierte Rückfallebene; da Transport-Serialisierung eine
+  Rand-Entscheidung ist (§14.2), ist der Wechsel billig.
+
+#### Bewusst vertagt (nicht-blockierend)
+
+- **Arrow Flight (Bulk-Streaming) VERTAGT** (Plan Phase 7: „Arrow Flight Bulk").
+  Heute **nicht** gebaut, um den schweren `arrow`-Stack nicht hereinzuziehen. Die
+  Unary-RPCs decken alle Primitive ab; Bulk-/Stream-Reads (großvolumige
+  Traversier-/Scan-Ausgaben) kommen als eigener `arrow-flight`-Dienst am selben
+  Rand dazu, **ohne** Kernel-Änderung (§14.2: reine Rand-Entscheidung). Der
+  bidirektionale Explore-Stream + server-seitiges bounded Multi-Hop (gegen N+1) ist
+  ebenfalls eine spätere Rand-Ergänzung.
+- **C-ABI / PyO3-Binding (Plan Phase 7) VERTAGT** — separates `lakearch-ffi`-Crate,
+  hier nicht im Auftrag.
+- **TLS / mTLS am Rand VERTAGT:** der Server bindet heute Klartext-gRPC (für den
+  In-Process-/lokalen Betrieb). Produktiv gehört mTLS + Subjekt-Authentifizierung an
+  den Rand (der Daemon ist die Sicherheits-Grenze); das Subjekt kommt heute als
+  Anfrage-Feld (`Subject.subject_id`), perspektivisch aus dem authentifizierten
+  Verbindungs-Kontext (TLS-Identität / Token).
+- **Read-Audit am Rand VERTAGT** (Plan/Trust-Modell: „Read-Audit lebt im Daemon, nicht
+  im Kernel"; §8.4 Lesen erzeugt im Kernel nichts). Heute nur `tracing` am Rand; der
+  strukturierte Audit-Datensatz (Subjekt, Scope, Snapshot, Grant-ID,
+  Ergebnis-Kardinalität) ist eine eigene Rand-Ergänzung.
+
+#### Topologie & Gate-Durchsetzung (umgesetzt)
+
+- **Ein Bestand, eine Schreib-Pipeline (`bestand.rs`):** `Bestand::open` öffnet
+  **einen** `LakearchKernel<RedbEdgeIndex>` und startet **einen** dedizierten
+  Writer-Thread. Alle `append`s (§7.1, die EINZIGE Mutation) laufen über **einen**
+  bounded `tokio::mpsc`-Kanal (Backpressure) **seriell** durch diesen Thread (eine
+  Append-Reihenfolge). Lesevorgänge laufen **nebenläufig** über `spawn_blocking`
+  direkt am `&self`-Kernel (der Kernel-`RwLock` erlaubt viele gleichzeitige Leser;
+  MVCC-Snapshot über das Watermark, §8.4/§13). **Async am Rand, sync im Kern** — der
+  Kernel bleibt unverändert sync/threaded; kein `async` im Kernel.
+- **Gate auf JEDER Anfrage (`service.rs`, §11):** jede lesende RPC trägt ein
+  `Subject`. Der Daemon pinnt einen Snapshot und stellt — strukturell aus den
+  aktiven (nicht entzogenen) Berechtigungen im Snapshot (§11.2/§11.4) — über
+  `LakearchKernel::authorize_subject` eine `Capability` aus. **Ein leeres Subjekt ⇒
+  keine gewährten Bereiche** (nur unbeschränkte Daten sichtbar — fail-safe, kein
+  Leck ohne Recht). VANISH (§11.3: verborgen ununterscheidbar von „nicht
+  vorhanden") und fail-closed (§11: Inkonsistenz/Korruption/Vergiftung ⇒
+  `Status::internal`, nie ein leckendes Teilergebnis) sind die des Kernels — der Rand
+  reicht nur durch. `get_by_content_id` legt Inhalt **nur** über `gate::open` gegen
+  dieselbe Capability frei (§11.5).
+- **Exponierte Primitive (NUR diese, §1.4/§14.2):** `append`, `get_by_content_id`,
+  die DREI §1.3-Prädikate getrennt (`content_equal`/`context_points_to`/
+  `is_member_of_set`), die beschränkte `traverse` (Tiefe/Knoten-Budget §1.7 a,
+  strukturelles `edge_type_filter` §3.3) und `find_dependents` (§10.3). **KEIN**
+  Sortieren/Aggregieren/Ranken/Rechnen am Rand: Traversier-Schritte kommen in der vom
+  Kernel emittierten aufsteigenden `ContentId`-Adress-Order (§5.2/§1.4) — der Rand
+  ordnet **nichts** um.
+- **Datum-Wire-Form:** `oneof { leaf-bytes | node(context_ids: [bytes;32]…) }`; die
+  kanonische Kodierung/Identität (§K5) bestimmt der Kernel — der Rand reicht die Form
+  nur durch und lehnt Formfehler (ID ≠ 32 Byte, leerer Knoten §K2.1) als
+  `InvalidArgument` ab, sodass der Kernel nie eine ungültige Eingabe sieht.
+
+#### Review-Härtung: §1.3-(ii/iii)-Prädikate am Daemon GEGATET (umgesetzt)
+
+- **`context_points_to`/`is_member_of_set` tragen am Rand ein `Subject` und laufen
+  durchs Tor (§11.2/§11.3).** Begründung: beide Prädikate verraten einen
+  strukturellen **Besitz-/Zugehörigkeits-Fakt** über (potentiell) bereichs-
+  beschränkte **oder** noch **inaktive** (§13) Daten — ein ungegateter Roh-Index-
+  Match wäre ein **Struktur-Orakel** über verborgene Daten (§11.3-Verstoß). Der
+  Daemon leitet daher — wie bei `get_by_content_id`/`traverse` — aus dem Subjekt die
+  gewährten Bereiche ab (`authorize_subject`) und ruft die **neuen gegateten
+  Kernel-Einstiege** `LakearchKernel::context_points_to_visible` /
+  `is_member_of_set_visible`: beide Operanden werden am gepinnten Watermark gegen die
+  Sichtbarkeit geprüft (`visible_filter` bündelt is_active §13 + Kuratierung §9.5 +
+  §11-Bereich + fail-closed §11); ist **ein** Operand nicht sichtbar/inaktiv ⇒
+  `value = false` (**VANISH**) — der Roh-Index wird für verborgene Operanden **nie**
+  konsultiert. `content_equal` (§1.3 i) ist reine **Adress-Gleichheit** (kein Inhalt,
+  kein Bereich) und trägt bewusst **kein** Subjekt.
+- **`crates/lakearch-core` bleibt verhaltens-unverändert:** die Erweiterung ist rein
+  **additiv** — zwei neue `pub`-Methoden (`context_points_to_visible`/
+  `is_member_of_set_visible`) neben den **unangetasteten** frozen-Form-Trait-Methoden
+  `Kernel::context_points_to`/`is_member_of_set` (Phase-0.5-Form unberührt; alle 214
+  Kern-lib-Tests weiterhin grün). Dies verfeinert die Phase-2-Notiz „die Prädikate
+  tragen keine Capability": das gilt für die **frozen-Form**; der **gegatete
+  Daemon-Pfad** legt die Capability über die `*_visible`-Methoden vor.
+
+#### Tests (`crates/lakearchd/tests/grpc_e2e.rs`, in-process, ephemerer Port :0)
+
+- **`append_get_traverse_and_concurrent_read`:** `append` → `get_by_content_id`
+  (Round-Trip durchs Tor) → kleine `traverse` (Nachbarn x,y) → `context_points_to`
+  → `find_dependents` (leer für Nicht-Herkunft) → **nebenläufig** 64 Appends
+  (Client A) parallel zu 64 Reads (Client B); jeder Read sieht das durable Datum
+  (MVCC, keine Leser-Blockade während laufender Writes).
+- **`gate_vanishes_restricted_datum_without_granting_scope`:** ein dem Bereich
+  angehörendes (beschränktes) Datum **VANISHt** ohne gewährten Bereich (kein
+  Subjekt **und** unberechtigtes Subjekt ⇒ `present = false`); nach Anhängen der
+  Berechtigung (Subjekt → Bereich) sieht das **berechtigte** Subjekt es (§11.2);
+  ein unbeschränktes Datum bleibt für alle sichtbar (Policy-Default §11.3).
+- **5 Unit-Tests** (`service.rs`): Wire→Kernel-Konvertierungen (ID-Länge, leaf/node,
+  leerer Knoten), Richtungs-Default Forward, sichtbarkeits-blinde/fail-closed
+  Fehler-Abbildung.
+
+`crates/lakearch-core` ist **verhaltens-unverändert** (keine Bearbeitung; 242
+Kern-Tests weiterhin grün). Workspace-Member `crates/lakearchd` ergänzt.
+
+### Phase 7 — C-ABI / In-Prozess-FFI (`crates/lakearch-ffi`, Branch `kernel-impl`)
+
+Die **C-ABI** für das **IN-PROZESS-Embedding** in EINER Vertrauenszone (§Trust-
+Modell): ein neuer Workspace-Member `crates/lakearch-ffi`, der die Kernel-
+Primitive über `extern "C"`-Funktionen + opake Handle-Pointer als **cdylib +
+staticlib** (+ rlib für den Rust-Integrationstest) exponiert. **Grün:**
+`cargo build --all-targets`, `cargo test` (253 Tests: 214 Kern-lib + 12 Kanonik +
+11 kernel_e2e + 5 store + **4 FFI c_abi** + 5 lakearchd-lib + 2 grpc_e2e),
+`cargo clippy --all-targets -- -D warnings`.
+
+#### Trust-Modell-Verortung (warum FFI ≠ Daemon)
+
+- **Embedding bedient NUR eine Vertrauenszone.** Der Einbetter ist die
+  vertrauenswürdige Schicht-darüber (Read-Audit, Berechtigungs-Ausstellung,
+  Auflösung/Rechnung). **Mandantenfähig/reguliert ⇒ der Daemon** (`lakearchd`),
+  nicht diese FFI. Konkret: die Lese-Verben (`get_by_content_id`, `traverse`) laufen
+  mit **leeren** gewährten Bereichen (`authorize(GrantedScopes::from_scope_ids([]))`) — nur
+  unbeschränkte Daten sind ohne explizites Recht sichtbar, bereichs-beschränkte
+  Daten VANISHen (fail-safe §11.3). Das Tor (§11) wird dennoch auf **jedem** Read
+  durchgesetzt (kein Byte-Bypass; Inhalt nur über `gate::open`).
+- **Exponierte Primitive (NUR diese, §1.4/§14.2):** `lakearch_open`/`lakearch_close`
+  (RAII-Handle), `lakearch_append` (§7.1), `lakearch_get_by_content_id` (§5.2 durchs
+  Tor §11), `lakearch_traverse` (§1.2/§1.7 a, Streaming-Callback). **KEIN** Sortieren/
+  Aggregieren/Ranken/Rechnen an der Grenze — die Schritte kommen in der vom Kernel
+  emittierten aufsteigenden `ContentId`-Adress-Order (§5.2/§1.4).
+
+#### ABI-Sicherheit: kein Panic über die C-Grenze (UB-Schutz)
+
+- **`std::panic::catch_unwind` umschließt JEDEN FFI-Rumpf** (`guard(...)`). Ein über
+  die C-ABI **unwindender** Rust-Panic ist UB; `guard` fängt ihn und liefert
+  `LakearchStatus::Panic` (Code 1). **Kein** `unwrap`/`expect`/`panic!` in den
+  FFI-Pfaden — Fehler sind ausschließlich Rückgabe-Codes (`LakearchStatus`,
+  sichtbarkeits-blind §11.3, mechanisch §1.4). `KernelError` → genau ein Code.
+- **WICHTIGE Nuance (Callback-Panic):** ein Panic, der durch eine **fremde**
+  `extern "C"`-Callback-Funktion (z. B. der Traversier-Callback des C-Aufrufers)
+  unwindet, **abortet bereits am Callback-Rand** (Rust-Verhalten für
+  `extern "C"`-Funktionen, die der Aufrufer bereitstellt) — er erreicht unser
+  `catch_unwind` nicht. Der Vertrag ist daher: **der C-Aufrufer darf keinen
+  Rust-Panic durch seinen Callback lassen.** `guard` schützt den **eigenen**
+  Rust-Rumpf, der die UB-relevante Stelle für diese Bibliothek ist. Der Panic-Test
+  (`forced_panic_inside_ffi_is_caught_as_error_code`) erzwingt deshalb einen Panic im
+  **eigenen** Rumpf über das `#[doc(hidden)]`-Test-Symbol
+  `lakearch_force_panic_for_testing` (spiegelt exakt den `guard`-Rumpf) und prüft
+  Code 1 statt SIGABRT.
+- **`#![deny(unsafe_op_in_unsafe_fn)]`** auf `lib.rs`/`handle.rs`: jedes Pointer-
+  Deref / `slice::from_raw_parts` trägt einen expliziten `unsafe`-Block mit
+  SAFETY-Begründung. Null-/Form-Fehler ⇒ definierte Codes (`NullArgument`,
+  `InvalidHandle`), nie Deref eines Null-Pointers.
+
+#### Puffer-/Streaming-Protokoll (zero-surprise C-Konventionen)
+
+- **`get_by_content_id`:** `*out_len` trägt beim Aufruf die Puffer-**Kapazität**,
+  nach Erfolg die geschriebene Länge; zu klein ⇒ `BufferTooSmall` + benötigte Länge
+  in `*out_len` (kein Datenverlust; Längen-Abfrage via `out_buf = null, *out_len = 0`).
+- **`traverse`:** **Streaming** über `LakearchStepCallback` (je Schritt aufgerufen;
+  Rückgabe `0` ⇒ kooperativer Abbruch ⇒ `Cancelled`). `out_emitted` (optional)
+  meldet die Schrittzahl. Gewählt statt eines vorab dimensionierten Schritt-Puffers,
+  weil die Schrittzahl a priori unbekannt ist und der Callback echte Backpressure/
+  Deadline erlaubt — die Traversierung bleibt server-seitig beschränkt
+  (`max_depth`/`max_nodes`, §1.7 a). **Kein `edge_type_filter`** in v1 dieser FFI
+  (das Verb bietet die volle Filter-Signatur am Kernel/Daemon); nicht-blockierend,
+  später additiv ergänzbar ohne ABI-Bruch (neue Funktion/Parameter).
+
+#### C-Header
+
+- **Hand-geschrieben:** `crates/lakearch-ffi/include/lakearch_ffi.h` (mit den
+  Rust-Signaturen in `src/lib.rs` abgeglichen). **`cbindgen` ist in dieser Umgebung
+  NICHT installiert** — der Header wird daher hand-gepflegt; sobald `cbindgen`
+  verfügbar ist, kann er daraus generiert werden (nicht-blockierend).
+
+#### PyO3 — VERTAGT (libpython-Embed-Dev fehlt; Default-Build bleibt grün)
+
+- **Geprüft:** `python3` (3.14.4) ist vorhanden und `libpython3.14.so.1` liegt unter
+  `/usr/lib/x86_64-linux-gnu/`, **aber** es gibt **kein** `pkg-config python3`/
+  `python3-embed` und **keine** `python3-dev`-Header für das **Embedding-Linken**
+  (PyO3 braucht die Entwickler-Header/Embed-Konfiguration). Daher wird **PyO3 NICHT
+  in den Default-Build aufgenommen** (sonst bräche der Workspace-Grün-Zustand).
+- **Vertagt — intendierte Python-Story (wenn `python3-dev`/Embed verfügbar):** ein
+  separates `pyo3`-Feature/Crate, das die opaken Handles als Python-Klasse mit
+  **RAII-Guards** (`__enter__/__exit__` bzw. `__del__` ⇒ `lakearch_close`) kapselt
+  und Bytes als **`PyBytes`-Kopien** über die Grenze reicht (kein geliehenes
+  Rust-Slice in Python-Hand). Bis dahin ist die C-ABI (`cdylib`) über `ctypes`/
+  `cffi` direkt nutzbar.
+
+`crates/lakearch-core` und `crates/lakearchd` sind **verhaltens-unverändert** (keine
+Bearbeitung). Workspace-Member `crates/lakearch-ffi` ergänzt.

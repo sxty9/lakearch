@@ -304,6 +304,89 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
+    /// **Gegatetes context_points_to** (§1.3 ii / §11.3) — der **gegatete** Einstieg
+    /// zum Prädikat „zeigt der Kontext `ctx` auf `target`?", der — anders als die
+    /// frozen-Form-[`Kernel::context_points_to`] — eine [`Capability`] trägt und das
+    /// Tor **vor** dem Roh-Index-Match anwendet.
+    ///
+    /// Das Prädikat verrät einen strukturellen **Besitz-Fakt** über (potentiell)
+    /// bereichs-beschränkte oder noch **inaktive** Daten (§13.2) — es **muss** daher
+    /// über dasselbe Tor wie [`get_by_content_id`](Kernel::get_by_content_id)/
+    /// [`traverse_with`](LakearchKernel::traverse_with) laufen (§11.2). Beide
+    /// Operanden (`ctx` **und** `target`) werden am gepinnten Watermark gegen die
+    /// **Sichtbarkeit** geprüft ([`crate::store::ContentStore::visible_filter`], das
+    /// is_active §13 + Kuratierung §9.5 + §11-Bereich + fail-closed §11 bündelt):
+    ///
+    /// - Ist **ein** Operand nicht sichtbar/inaktiv ⇒ `false` (**VANISH**,
+    ///   ununterscheidbar von „der Fakt besteht nicht", §11.3) — der Roh-Index wird
+    ///   für verborgene Operanden **nie** konsultiert (kein Existenz-/Struktur-Orakel
+    ///   über einen halb-vollzogenen Umbau oder beschränkte Daten).
+    /// - Sind **beide** sichtbar ⇒ reines Mengen-Matching (§1.3) über den Vorwärts-
+    ///   Index (`target ∈ contexts_of(ctx)`), wie die frozen-Form.
+    ///
+    /// **Fail-closed (§11):** eine Index-/Log-Inkonsistenz im Sichtbarkeits-Filter ⇒
+    /// [`KernelError`] (DENY), **nie** ein leckendes `true`. Der `snapshot`-Token
+    /// pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
+    pub fn context_points_to_visible(
+        &self,
+        ctx: ContentId,
+        target: ContentId,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+    ) -> Result<bool, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let granted = capability.scopes().scope_ids();
+        let w = snapshot.watermark();
+        // §11.3 Filter-vor-Auflösen: beide Operanden müssen sichtbar sein, sonst
+        // VANISH (false). `visible_filter` wendet is_active (§13) + Kuratierung
+        // (§9.5) + §11-Bereich + fail-closed (§11) am gepinnten `w` an.
+        let visible = store.visible_filter(&[ctx, target], granted, w)?;
+        if !(visible.contains(&ctx) && visible.contains(&target)) {
+            return Ok(false);
+        }
+        // Beide sichtbar ⇒ reines Mengen-Matching (§1.3) über den Vorwärts-Index.
+        let ctxs = store.index().contexts_of(ctx)?;
+        Ok(ctxs.binary_search(&target).is_ok())
+    }
+
+    /// **Gegatetes is_member_of_set** (§1.3 iii / §11.3) — der **gegatete** Einstieg
+    /// zum Prädikat „ist `elem` Mitglied der vom Mengen-Kontext `set_ctx`
+    /// aufgespannten Menge?", der — anders als die frozen-Form-[`Kernel::is_member_of_set`]
+    /// — eine [`Capability`] trägt und das Tor **vor** dem Roh-Index-Match anwendet.
+    ///
+    /// Wie [`context_points_to_visible`](LakearchKernel::context_points_to_visible)
+    /// verrät das Prädikat einen strukturellen **Zugehörigkeits-Fakt** über
+    /// (potentiell) beschränkte oder noch **inaktive** Daten (§13.2) und läuft daher
+    /// über dasselbe Tor (§11.2): beide Operanden (`elem` **und** `set_ctx`) werden am
+    /// gepinnten Watermark gegen die Sichtbarkeit geprüft. Ist **ein** Operand nicht
+    /// sichtbar/inaktiv ⇒ `false` (**VANISH**, §11.3) — der Roh-Index wird für
+    /// verborgene Operanden **nie** konsultiert. Sind **beide** sichtbar ⇒ reines
+    /// Mengen-Matching (`elem ∈ contexts_of(set_ctx)`, §1.3).
+    ///
+    /// **Fail-closed (§11):** eine Inkonsistenz im Sichtbarkeits-Filter ⇒
+    /// [`KernelError`] (DENY), **nie** ein leckendes `true`. Der `snapshot`-Token
+    /// pinnt das Watermark `W` (§13).
+    pub fn is_member_of_set_visible(
+        &self,
+        elem: ContentId,
+        set_ctx: ContentId,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+    ) -> Result<bool, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let granted = capability.scopes().scope_ids();
+        let w = snapshot.watermark();
+        // §11.3 Filter-vor-Auflösen: beide Operanden müssen sichtbar sein, sonst
+        // VANISH (false). Bündelt is_active (§13) + Kuratierung (§9.5) + §11-Bereich.
+        let visible = store.visible_filter(&[elem, set_ctx], granted, w)?;
+        if !(visible.contains(&elem) && visible.contains(&set_ctx)) {
+            return Ok(false);
+        }
+        // Beide sichtbar ⇒ reines Mengen-Matching (§1.3) über den Vorwärts-Index.
+        let members = store.index().contexts_of(set_ctx)?;
+        Ok(members.binary_search(&elem).is_ok())
+    }
+
     /// **Gegatete Ersetzungs-Traversierung — supersedes** (§6.3/§11.3): die für die
     /// `capability` **sichtbaren** **älteren** Daten, die `newer` überholt (neuer →
     /// älter). Reines strukturelles Folgen der Ersetzungs-Kontexte (§1.2/§1.3); der

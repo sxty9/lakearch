@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+// lakearchd — der Daemon-Rand (§1.4/§12/§14.2). Die Service-Oberfläche exponiert
+// AUSSCHLIESSLICH die Kernel-Primitive: speichern (append), eine Adresse lesen
+// (get_by_content_id, durch das Tor §11), die DREI §1.3-Match-Prädikate, die
+// beschränkte Traversierung (§1.2/§1.7 a) und find_dependents (§10.3). KEIN
+// Sortieren/Aggregieren/Ranken/Rechnen am Rand (§1.4/§14.2) — die Auflösungs-/
+// Rechen-Schicht liegt darüber und wird hier NICHT gebaut.
+package lakearch.v1;
+
+// Ein Daten auf der Leitung (§2.1/§K2.1): ENTWEDER ein atomares Blatt (opake
+// Bytes) ODER ein besitzender Knoten (Menge besessener Kontext-ContentIds, je 32
+// Byte). Die kanonische Kodierung/Identität bestimmt der Kernel (§K5) — der Rand
+// reicht die Form nur durch.
+message Datum {
+  oneof kind {
+    // Atomares Blatt: opake Nutzlast-Bytes (§K2.1). Leeres Blatt ist wohlgeformt.
+    bytes leaf = 1;
+    // Besitzender Knoten: die besessenen Kontext-ContentIds (§K2.3). Der Kernel
+    // sortiert + dedupliziert kanonisch — die Reihenfolge hier ist bedeutungslos.
+    NodeContexts node = 2;
+  }
+}
+
+// Die besessenen Kontexte eines Knotens — je eine rohe 32-Byte-ContentId.
+message NodeContexts {
+  repeated bytes context_ids = 1; // je genau 32 Byte (§5.2).
+}
+
+// ----------------------------------------------------------------------------
+// append (§7.1) — die EINZIGE Mutation. Geht durch die EINE Schreib-Pipeline.
+// ----------------------------------------------------------------------------
+message AppendRequest {
+  Datum datum = 1;
+}
+message AppendResponse {
+  bytes content_id = 1; // 32-Byte-ContentId des (ggf. schon vorhandenen) Daten.
+}
+
+// ----------------------------------------------------------------------------
+// Lese-Subjekt (§11.1). Der Daemon ist die Sicherheits-Grenze: JEDE Anfrage trägt
+// das Subjekt, aus dem der Kernel die gewährten Bereiche strukturell ableitet
+// (authorize_subject, §11.2). Ein leeres `subject` ⇒ keine gewährten Bereiche
+// (nur unbeschränkte Daten sichtbar — fail-safe, §11.3). VANISH/fail-closed wie
+// im Kernel.
+message Subject {
+  bytes subject_id = 1; // 32-Byte-ContentId des Subjekts; leer ⇒ keine Scopes.
+}
+
+// ----------------------------------------------------------------------------
+// get_by_content_id (§5.2) — geht DURCH DAS TOR (§11). VANISH: verborgen ist
+// ununterscheidbar von nicht vorhanden (kein Existenz-Orakel, §11.3).
+// ----------------------------------------------------------------------------
+message GetRequest {
+  Subject subject = 1;
+  bytes content_id = 2; // 32-Byte-ContentId.
+}
+message GetResponse {
+  // present == false ⇒ nicht sichtbar ODER nicht vorhanden (VANISH, §11.3) —
+  // der Leser kann es nicht unterscheiden. present == true ⇒ canonical_bytes
+  // trägt die durablen kanonischen CBOR-Bytes (§K4), freigelegt durch das Tor.
+  bool present = 1;
+  bytes canonical_bytes = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Die DREI §1.3-Prädikate, GETRENNT. Reines strukturelles Matching (§1.3) — nur
+// ein bool über IDs, die der Aufrufer bereits besitzt; kein Inhalt freigelegt.
+//
+// context_points_to/is_member_of_set tragen — wie get_by_content_id/traverse —
+// ein `subject`: sie geben strukturelle Besitz-/Zugehörigkeits-Fakten über
+// (potentiell) bereichs-beschränkte ODER noch INAKTIVE (§13) Daten preis und
+// MÜSSEN daher durch das Tor (§11.2). Ist ein Operand für das Subjekt nicht
+// sichtbar/inaktiv, antwortet der Daemon value=false (VANISH, §11.3) — er
+// konsultiert NIE den Roh-Index für verborgene Operanden. content_equal ist
+// reine Adress-Gleichheit (kein Inhalt, kein Bereich) und trägt KEIN Subjekt.
+// ----------------------------------------------------------------------------
+// (i) Gleichheit auf Adressebene (§1.3 i). Unkritisch ⇒ kein Subjekt.
+message ContentEqualRequest { bytes a = 1; bytes b = 2; }
+// (ii) Zeigt ein Kontext auf ein Daten? (§1.3 ii) — gegated über das Subjekt.
+message ContextPointsToRequest { Subject subject = 1; bytes ctx = 2; bytes target = 3; }
+// (iii) Zugehörigkeit zu einer per Kontext gegebenen Menge (§1.3 iii) — gegated.
+message IsMemberOfSetRequest { Subject subject = 1; bytes elem = 2; bytes set_ctx = 3; }
+message BoolResponse { bool value = 1; }
+
+// ----------------------------------------------------------------------------
+// Traversierung (§1.2/§1.7 a) — beschränkt (Tiefe/Knoten-Budget), zyklensicher,
+// gegated (VANISH). KEIN Wert-Sort am Rand: die Schritte kommen in der vom Kernel
+// bestimmten aufsteigenden ContentId-Adress-Order (§5.2/§1.4) — der Rand ordnet
+// NICHTS um.
+// ----------------------------------------------------------------------------
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0; // ⇒ Forward (Default).
+  FORWARD = 1;
+  BACKWARD = 2;
+  BOTH = 3;
+}
+message TraverseRequest {
+  Subject subject = 1;
+  bytes start = 2;            // 32-Byte-Start-ContentId.
+  Direction direction = 3;
+  uint32 max_depth = 4;       // Budget der beschränkten Traversierung (§1.7 a).
+  uint64 max_nodes = 5;       // Knoten-Budget (kein unbeschränkter Speicher).
+  // Strukturelles Kanten-Typ-Filter (§3.3): je 32-Byte-ContentId; leer ⇒ kein
+  // Filter. Matcht NUR strukturell auf das Relations-Daten, nie Wert (§1.4).
+  repeated bytes edge_type_filter = 6;
+}
+// Ein durchschrittener Kanten-Schritt (§1.2). Owned, föderationsstabil.
+message Step {
+  bytes from = 1;
+  bytes edge_ctx = 2; // besessener Kontext in seiner Kanten-Rolle (§3.1/§3.3).
+  bytes to = 3;
+  uint32 depth = 4;   // Tiefe ab Start; reines Mechanik-Maß (§1.7 a), kein Wert.
+}
+message StepList {
+  repeated Step steps = 1;
+}
+
+// ----------------------------------------------------------------------------
+// find_dependents (§10.2/§10.3) — Rückwärts-Traversierung der Herkunfts-Kontexte
+// (transitiv, zyklensicher). Der Kernel LÄUFT NUR rückwärts und matcht (§1.3);
+// Als-stale-markieren/Neu-Berechnen liegt AUSSERHALB (§1.5/§7.1).
+// ----------------------------------------------------------------------------
+message FindDependentsRequest {
+  Subject subject = 1;
+  bytes input = 2; // 32-Byte-ContentId der geänderten Eingabe.
+}
+
+// Die Daemon-Service-Oberfläche: NUR Kernel-Primitive (§1.4/§14.2).
+service Lakearch {
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc GetByContentId(GetRequest) returns (GetResponse);
+  rpc ContentEqual(ContentEqualRequest) returns (BoolResponse);
+  rpc ContextPointsTo(ContextPointsToRequest) returns (BoolResponse);
+  rpc IsMemberOfSet(IsMemberOfSetRequest) returns (BoolResponse);
+  rpc Traverse(TraverseRequest) returns (StepList);
+  rpc FindDependents(FindDependentsRequest) returns (StepList);
+}

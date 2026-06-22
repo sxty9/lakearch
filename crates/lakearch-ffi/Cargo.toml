@@ -1,0 +1,20 @@
+[package]
+name = "lakearch-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "lakearch-ffi — C-ABI für das IN-PROZESS-Embedding (eine Vertrauenszone, §Trust-Modell): cdylib + staticlib, die die Kernel-Primitive über opake Handles + extern \"C\" exponieren. Jede Grenzen-Funktion fängt Panics ab (catch_unwind) — ein Panic über die C-ABI wäre UB."
+
+[lib]
+name = "lakearch_ffi"
+# cdylib: dynamisch ladbar (Python/JNI/dlopen). staticlib: zum Einbetten in ein
+# C/C++-Programm. rlib: damit der Rust-Integrationstest die crate-internen Items
+# (und das Crate selbst) gegen die extern-"C"-Symbole linken kann.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+lakearch-core = { path = "../lakearch-core" }
+
+[dev-dependencies]
+tempfile = "3"
