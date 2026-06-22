@@ -435,3 +435,244 @@ inhaltlichen Phase-1-Entscheidungen stehen in den Abschnitten oben
   nicht-durablen/checkpointed Index mit **einer** realen Barriere vor; da der Index
   neu baubar ist, ist die Umstellung billig (spätere Performance-Runde, Risiko
   „Doppelte Durability-Barriere/Skew").
+
+### Phase 2 — Mechanische Traversierung + Tor-Logik (Branch `kernel-impl`)
+
+Die drei §1.3-Match-Prädikate, die beschränkte zyklensichere Traversierung
+(`traverse.rs`) und die **Tor-Sichtbarkeitslogik** (§11: Filter-vor-Auflösen,
+VANISH, fail-closed, sichtbarkeits-blind). **Grün:** `cargo build --all-targets`,
+`cargo test` (127 lib + 12 Kanonik + 5 Kernel-E2E + 5 Store = 149 Tests),
+`cargo clippy --all-targets -- -D warnings`.
+
+> **⚠ SICHERHEITS-RELEVANTER POLICY-DEFAULT — bitte bestätigen.**
+> **Ein Daten OHNE Bereichs-Zugehörigkeit gilt als UNBESCHRÄNKT (für alle
+> sichtbar).** Bereiche (§11.1) sind damit **additive Restriktionen**: erst eine
+> Bereichs-Zugehörigkeit beschränkt ein Daten; ohne sie ist es allgemein lesbar.
+> Begründung: lakearch ist domänen-frei; die meisten Daten tragen anfangs keinen
+> Bereich, und ein „fail-closed-by-default" (alles unsichtbar, bis ein Bereich
+> gewährt) würde einen frisch befüllten Bestand **vollständig blind** machen und
+> die Bereichs-Semantik gegen §11.1 invertieren (dort ist Zugehörigkeit eine
+> *Hinzufügung*, kein Pflichtfeld). **Fail-closed gilt weiterhin für Korruption/
+> Inkonsistenz** (Index-/Log-Fehler ⇒ DENY), **nicht** für „kein Bereich
+> zugewiesen". Wer das Gegenteil will (jedes Daten muss explizit einem Bereich
+> angehören, sonst unsichtbar), sagt Bescheid — die Umkehr ist eine **ein-Zeilen-
+> Änderung** in `gate::is_visible` (das `areas.is_empty() ⇒ true` zu `⇒ false`),
+> erfordert dann aber eine Bestands-weite Bereichs-Zuweisung.
+
+- **Bereichs-Modell (§11.1), reine Konvention/Struktur:** ein **Bereich** ist ein
+  gewöhnliches Daten; **Zugehörigkeit ist ein Kontext** — konkret ein eingefrorener
+  Marker-`{ Marker, Bereich }`-Knoten (`Datum::area_membership`, Marker-Atom
+  `lakearch/area-membership/v1`, 27 Byte, analog zur Platzhalter-Konvention §3.6).
+  Besitzt ein Daten einen solchen Kontext, gehört es dem Bereich an; es darf
+  **mehreren** Bereichen angehören (§11.1). Der Kernel **erkennt** die Struktur nur
+  (reines Matching §1.3); die schreibende Schicht **baut** sie (§7.2). Rein
+  konventionell — **kein** neues Speicher-/Match-Primitiv (§14.2), keine
+  Modell-Erweiterung.
+- **Bereichs-Zugehörigkeits-Index (`Daten → { Bereiche }`):** in-memory im
+  `ContentStore`, **reines, neu-baubares Derivat** (§8.4) — beim Öffnen vollständig
+  aus dem Log rekonstruiert (`rebuild_areas_from_log`), genau wie die Dedup-Karte.
+  Bewusst **nicht** in die redb-`EdgeIndex`-Engine/das Schema gegossen (kleiner,
+  schnell rekonstruierbar; hält die Engine-Abstraktion schmal). Falls die
+  Bereichs-Mengen je sehr groß/zahlreich werden, ist die Verlagerung in einen
+  persistenten Index eine billige spätere Änderung (Log = Wahrheit).
+- **Tor-Durchsetzung (§11.3) zweiphasig:** das `SealedRecord` trägt jetzt die
+  server-seitig bestimmten Bereiche des Daten; **`gate::open`** matcht
+  *Bereiche ∩ gewährte Bereiche* (Phase A, match-only §1.3) **vor** der Freilegung
+  der Bytes (Phase B). Nicht sichtbar ⇒ `None` (**VANISH**, ununterscheidbar von
+  „existiert nicht"). Sowohl `get_by_content_id` **als auch** die Traversierung
+  laufen durchs Tor — kein Read-Bypass.
+- **Traversierung gegated:** in `traverse.rs` ist ein nicht-sichtbarer Nachbar ein
+  **interner Front-Stopp** (weder Step noch Betreten) und verändert die
+  Ergebnisform **nicht** (VANISH: getestet, dass 0/1/5 verborgene Nachbarn dem
+  rechtlosen Leser dieselbe sichtbare Schritt-Zahl liefern — kein Nachbarzahl-
+  Orakel). Deterministische Emission in aufsteigender `(to, edge_ctx, from)`-
+  Adress-Order (§5.2/§1.4, **kein** Wert-Sort), Visited-Set-beschränkt
+  (zyklensicher §1.6), `max_depth`/`max_nodes`-Budget (Knoten-Budget ⇒ definierter
+  `TraversalBudgetExceeded`, nie unbeschränkter Speicher), kooperatives
+  `CancelFlag` (⇒ `Cancelled`). `edge_type_filter` = strukturelles `ContentId`-
+  Matching auf `edge_ctx` (§3.3), nie Wert.
+- **Frozen-Form-`Kernel::traverse` ohne Capability:** die Trait-Signatur (Phase 0.5
+  eingefroren) trägt **keine** Capability. Entscheidung: die Trait-Methode läuft
+  daher mit **leersten gewährten Bereichen** (nur unbeschränkte Daten sichtbar,
+  beschränkte VANISHen — fail-safe, kein Leck ohne Recht); der **volle gegatete**
+  Einstieg mit vorgelegter `Capability` + `CancelFlag` ist die konkrete
+  `LakearchKernel::traverse_with`. So bleibt die frozen Form unangetastet und der
+  gegatete Pfad vollständig nutzbar. (Alternative — die Trait-Signatur um eine
+  `Capability` erweitern — wurde **nicht** gewählt, um die Phase-0.5-Form nicht zu
+  brechen; falls gewünscht, leicht nachziehbar.)
+- **Die drei §1.3-Prädikate** (`content_equal`/`context_points_to`/
+  `is_member_of_set`) sind **reines strukturelles Matching** und tragen in der
+  frozen Form **keine** Capability (nur `SnapshotToken`). Sie geben **nur einen
+  bool** über IDs zurück, die der Aufrufer bereits besitzt, und **materialisieren
+  keinen Inhalt** — daher kein Tor-Bypass (der inhalts-freilegende Pfad
+  `get_by_content_id`/`open` bleibt gegated). `content_equal` ist reine
+  Adress-Gleichheit; `context_points_to`/`is_member_of_set` sind Mitgliedschaft im
+  Vorwärts-Index (`contexts_of`).
+- **Match-only / keine Zeit (§1.4/§11.5):** das Tor wertet **keine** Zeitfenster
+  aus (das wäre Ordnung → §1.4). „Aktiv" ist strukturell-im-Snapshot; die volle
+  §13-Aktiv-Marker-Logik (Hook reserviert) ist **Phase 5**, die bitemporalen Achsen
+  **Phase 3**. Der `SnapshotToken` pinnt in Phase 2 die Watermark `W`; die volle
+  Epochen-Semantik folgt in Phase 5.
+- **Sichtbarkeits-blind (§11.3):** `KernelMetrics` sind labellose Aggregat-Zähler
+  (keine pro-Bereich-Labels, keine IDs); `KernelError`-Texte nennen **keine**
+  konkreten Daten/IDs/Bereiche (Negativ-Test `error_texts_are_visibility_blind`).
+- **`#![forbid(unsafe_code)]`** auf `traverse.rs` (mechanische Traversierung muss
+  beweisbar sicheres Rust sein), zusätzlich zu `gate.rs`/`model.rs`/`store.rs`/
+  `kernel.rs`.
+
+**Vertagte, nicht-blockierende Punkte (Phase 2+):**
+- **OTel-Traces über eine Traversierung** (Plan „Betrieb, Phase 2"): die Histogramme
+  (Tiefe/Fanout/Visited-Set-Größe) und Tor-Evaluierungs-/Denied-Zähler sind noch
+  nicht instrumentiert — sie gehören in den Daemon-Rand (§8.4: Lesen erzeugt im
+  Kernel nichts) und kommen mit Phase 7.
+- **Visited-Set-Spill auf Platte** (Roaring/AnchorId) für riesige Traversierungen:
+  aktuell ist die Besuchsmenge eine in-memory `HashSet`, hart durch `max_nodes`
+  begrenzt (definierter Budget-Fehler statt Spill). Der Platten-Spill ist eine
+  spätere Skalierungs-Option (Plan „Beschränkte Traversierung & Backpressure").
+- **`trybuild`-Compile-Fail-Test** für die Tor-Unumgehbarkeit (in `gate.rs` als
+  auskommentierte Negativ-Fälle dokumentiert): maschinelle Einfrierung weiterhin
+  offen (Phase-0.5-Notiz), nicht-blockierend.
+
+### Phase 2 — Tor-Härtung: Berechtigung, Entzug, Fail-closed-Metrik (Branch `kernel-impl`)
+
+Ergänzungen zum Tor (§11), die den Tor-Auftrag vollständig erfüllen: das
+**Berechtigungs-Modell** (§11.1), der **strukturelle Entzug** (§11.4), die
+**Fail-closed-auf-Korruption**-Durchsetzung des sicherheits-tragenden Bereichs-
+Index und ein **Fail-closed-Zähler**. **Grün:** `cargo build --all-targets`,
+`cargo test` (139 lib + 12 Kanonik + 6 Kernel-E2E + 5 Store = 162 Tests),
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Berechtigungs-Modell (§11.1), reine Konvention/Struktur (`model.rs`):** eine
+  **Berechtigung** ist ein gewöhnlicher Knoten, der das eingefrorene
+  `permission`-Marker-Atom (`lakearch/permission/v1`), einen **Subjekt-Rollen-
+  Kontext** (`{ lakearch/perm-subject/v1, subject }`) und einen **Bereichs-Rollen-
+  Kontext** (`{ lakearch/perm-area/v1, area }`) besitzt — analog zur
+  Zugehörigkeits-Konvention `{ Marker, Bereich }`. Da die `owns`-Menge adress-
+  sortiert ist (§K2.3), trägt die **Position** keine Bedeutung; die Rollen werden
+  rein **strukturell** (§1.3) über ihre Rollen-Marker abgelesen
+  (`Datum::permission_subject_area`). Weitere Kontexte (Recht/Zeit/Urheber, §11.1)
+  dürfen hinzukommen, ohne die Ablesbarkeit zu stören; der Kernel **wertet sie
+  nicht** (§1.4). Der Kernel **baut** keine Berechtigung — die schreibende Schicht
+  tut das (§7.2); der Kernel **liest** sie nur (§11.2).
+- **Entzug = strukturell-aktiv-im-Snapshot (§11.4/§11.5), kein Wall-Clock:** ein
+  **Entzug** ist ein Knoten `{ lakearch/revocation/v1, permission_id }`, der auf die
+  `ContentId` der entzogenen Berechtigung zeigt (append-only, §6.3 — nie gelöscht).
+  „Aktiv" ist damit eine **strukturelle** Notion (§11.5): aktiv ist eine
+  Berechtigung, die im Snapshot vorliegt **und** von keinem Entzugs-Kontext im
+  Snapshot benannt wird — **kein** Zeitfenster-Vergleich (das wäre Ordnung →
+  §1.4-Verstoß). Welche Berechtigung für einen *Zeitpunkt* gilt, ist eine Lese-
+  Projektion der Schicht darüber (§6.4/§8.2). **Reihenfolge-unabhängig** (§Append-
+  Order-Semantik): ein Entzug, der im Log **vor** seiner Berechtigung steht, filtert
+  trotzdem (Test `revocation_before_permission_in_log_still_filters`); „neuester
+  Offset gewinnt" gibt es **nicht**.
+- **Berechtigungs-/Entzugs-Index + Subjekt-Auflösung (`store.rs`), reines Derivat
+  (§8.4):** in-memory `permissions: ContentId → (Subjekt, Bereich)` und
+  `revoked: { ContentId }`, beim Öffnen vollständig aus dem Log rekonstruiert
+  (`rebuild_permissions_from_log`), genau wie die Bereichs-/Dedup-Karten.
+  `granted_areas_for_subject(subject)` leitet die gewährten Bereiche **strukturell**
+  ab (§1.3): alle Bereiche aktiver (nicht entzogener) Berechtigungen des Subjekts.
+- **`LakearchKernel::authorize_subject(subject, snap)` (§11.1/§11.2):** der **volle**
+  Tor-Einstieg — stellt eine `Capability` aus, deren gewährte Bereiche der Kernel
+  aus den aktiven Berechtigungen ableitet (analog `traverse_with` ↔ `traverse`). Die
+  **frozen-Form** `Kernel::authorize(scopes, snap)` bleibt unangetastet (sie nimmt
+  die Scopes direkt entgegen, für In-Process-Einbetter); die Subjekt-Auflösung ist
+  die konkrete Zusatz-Methode. So bleibt die Phase-0.5-Trait-Form unverändert.
+- **Fail-closed auf korruptem Bereichs-Index (§11), mit Metrik:** der Bereichs-Index
+  ist sicherheits-tragend (er bestimmt, was VANISHt). `areas_of_checked` prüft die
+  **gecachte** Bereichs-Menge eines Daten gegen die aus dem **durablen** Inhalt neu
+  abgeleitete Wahrheit (§8.4); bei Abweichung ⇒ `KernelError::Inconsistent` (DENY)
+  **statt** einer unsicheren (leckenden) Sicht. Sowohl `get_sealed` als auch die
+  Traversierung (`is_visible_node`) laufen über diesen geprüften Pfad. Ein stiller
+  Index-Defekt, der ein beschränktes Daten fälschlich als „unbeschränkt" auswiese,
+  ist damit ausgeschlossen. **Metrik:** neuer Zähler
+  `StoreMetrics/KernelMetrics::fail_closed_count` (Atomic, auch auf `&self`-
+  Lesepfaden erhöhbar) zählt **dass** ein Fail-closed auftrat — **sichtbarkeits-
+  blind** (§11.3: kein Daten/keine ID/kein Bereich). Tests:
+  `corrupt_scope_index_fails_closed_with_metric` (Store),
+  `traversal_fails_closed_on_corrupt_scope_index` (Traversierung). **Fail-closed
+  gilt für Korruption/Inkonsistenz, NICHT für „kein Bereich zugewiesen"** (letzteres
+  bleibt der unten markierte Unrestricted-Default).
+- **Neue Tests (Tor-Auftrag):** Filter-vor-Auflösen (nicht-sichtbarer Nachbar
+  erscheint nie in gegateter Traversierung **noch** in `get_by_content_id`:
+  `get_by_content_id_filters_before_resolve`, `non_visible_neighbor_vanishes_…`);
+  Fail-closed bei korruptem Scope-Index (oben); VANISH-Ergebnisform-Invarianz
+  (`hidden_neighbor_count_does_not_change_result_shape`); Entzug verbirgt künftige
+  Reads (`revocation_hides_future_reads_over_public_api`,
+  `authorize_subject_then_revoke_hides_future_reads`); Telemetrie/Fehler ohne
+  nicht-sichtbare ID (`error_texts_are_visibility_blind`).
+
+### Phase 2 — Review-Härtung II (drei blockierende Findings behoben, Branch `kernel-impl`)
+
+Drei blockierende Review-Findings adressiert; **alle drei warranted ⇒ behoben**
+(keine Wegerklärung). **Grün:** `cargo build --all-targets`, `cargo test`
+(143 lib + 12 Kanonik + 6 Kernel-E2E + 5 Store = 166 Tests),
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Finding 1 (Tor §11.3 — EXISTENZ-ORAKEL auf `get_by_content_id`, VANISH-Loch).**
+  `Kernel::get_by_content_id` (`kernel.rs`) lieferte `Ok(Some(SealedRecord))`,
+  **sobald** das Daten durabel vorhanden war — **unabhängig** von der Capability;
+  die Sichtbarkeit prüfte erst `gate::open` **danach**. Ein rechtloser Leser konnte
+  so allein aus der **Rückgabeform** „existiert-aber-verborgen" (`Some`) von
+  „existiert nicht" (`None`) unterscheiden — genau das von §11.3 verbotene
+  Existenz-Orakel über die berechenbaren Hash-Adressen, und ein Bruch des eigenen
+  frozen-Form-Vertrags (`api.rs`: „`None` ⇒ nicht sichtbar **oder** nicht
+  vorhanden — der Leser kann es nicht unterscheiden"). Die Traversierung war
+  **nicht** betroffen (`is_visible_node` kollabiert abwesend/verborgen bereits zu
+  `false`); nur der Einzel-Fetch verriet die Existenz.
+  **Behebung:** `get_by_content_id` matcht die Sichtbarkeit jetzt **vor** der
+  Rückgabe (`areas_of_checked` + `gate::is_visible` gegen die gewährten Bereiche,
+  fail-closed §11) und liefert `Ok(None)`, wenn nicht sichtbar — verborgen ist
+  damit an der **Verb-Grenze** ununterscheidbar von abwesend (wie `is_visible_node`
+  in der Traversierung). Das abschließende `gate::open` setzt die Sichtbarkeit ein
+  zweites Mal durch (Tor bleibt einzige Inhalts-Quelle). **Tests umgestellt**
+  (verborgenes Daten ⇒ `is_none()` statt `Some`): `get_by_content_id_filters_before_
+  resolve`, `authorize_subject_then_revoke_hides_future_reads` (lib),
+  `gate_vanish_over_public_api`, `revocation_hides_future_reads_over_public_api`
+  (e2e). **Neuer Regressions-Test** `get_by_content_id_is_not_an_existence_oracle`:
+  verborgenes Daten und zufällige unbekannte Adresse liefern für den rechtlosen
+  Leser GENAU dieselbe Rückgabeform.
+
+- **Finding 2 (§1.3/§1.7 a — `edge_type_filter` unsortiert ⇒ falsches/nicht-
+  deterministisches Matching).** Die Filter-Mitgliedschafts-Prüfung in
+  `run_traversal` (`filter.binary_search(&edge_ctx)`) ist nur auf einem
+  **sortierten** Slice korrekt. Der frozen-Form-`Kernel::traverse` sortierte+
+  deduplizierte zwar, doch der volle Einstieg `LakearchKernel::traverse_with` reichte
+  ein vom Aufrufer befülltes `TraversalParams` **ungeprüft** durch — und das
+  `pub`-Feld `edge_type_filter` trägt keine erzwungene Invariante. Ein unsortierter
+  Filter ergab unspezifizierte `binary_search`-Treffer: passende Kanten konnten still
+  fallen (Unter-Inklusion) oder nicht-passende durchrutschen (Über-Inklusion) — Bruch
+  des strukturellen Matchings **und** des Determinismus (zwei Reihenfolgen ⇒ zwei
+  Ergebnisse).
+  **Behebung (Invariante unbrechbar gemacht, mehrschichtig):** (a) neuer Konstruktor
+  `TraversalParams::new(...)`, der den Filter aufsteigend sortiert + dedupliziert;
+  (b) `traverse_with` normalisiert den Filter an der Verb-Grenze über diesen
+  Konstruktor; (c) `run_traversal` normalisiert **zusätzlich defensiv** (borgt einen
+  bereits sortierten Filter ohne Klon; baut sonst eine normalisierte Kopie) und führt
+  ein `debug_assert!(is_sorted_deduped(..))`. **Neuer Regressions-Test**
+  `unsorted_duplicated_filter_is_normalized_and_order_irrelevant`: ein unsortierter,
+  duplizierter Filter behält alle passenden Kanten, und zwei verschiedene Filter-
+  Reihenfolgen liefern identische Schritte.
+
+- **Finding 3 (§1.7 a — Per-Level-Speicher nicht durch `max_nodes` beschränkt).**
+  Das `max_nodes`-Budget bremste nur die **Besuchsmenge** (distinkte Knoten); der
+  Budget-Check feuerte erst beim Einfügen eines neuen Front-Knotens. Ein **einzelner**
+  Knoten sehr hohen Ausgangsgrades (ein Owner mit N Kontexten) materialisierte aber
+  O(N) `Step`s in `level_steps` und in das eager gebaute `out`-`Vec`, **bevor** der
+  knoten-basierte Check zünden konnte — Bruch der Modul-Zusage „nie unbeschränkter
+  Speicher". Zudem wurde das `CancelFlag` nicht **innerhalb** der Nachbar-Expansion
+  eines Knotens geprüft, sodass eine laufende hochgradige Expansion nicht kooperativ
+  abbrechbar war.
+  **Behebung:** ein aus `max_nodes` abgeleitetes **Schritt-/Kanten-Budget** (`step_
+  budget = max_nodes`): jede **zugelassene** (gefilterte + sichtbare) Kante zählt
+  dagegen, und der Lauf bricht mit `TraversalBudgetExceeded` ab, **bevor** ein
+  weiterer `Step` gepuffert wird ⇒ Speicher O(`max_nodes`), auch unter adversariellem
+  Fan-out. Zusätzlich ein `CancelFlag`-Check **innerhalb** der inneren Nachbar-
+  Schleife. **Neue Regressions-Tests:** `high_out_degree_node_respects_step_budget`
+  (Ausgangsgrad 50, `max_nodes=3` ⇒ definierter Abbruch, ≤ 3 Schritte materialisiert)
+  und `cancel_interrupts_high_out_degree_expansion`.
+  *Hinweis zur Semantik-Verschärfung:* das Schritt-Budget kann einen Lauf nun
+  **früher** abbrechen als zuvor (sobald die gepufferten Schritte `max_nodes`
+  erreichen), nicht erst beim N-ten distinkten Knoten. Das ist die beabsichtigte,
+  speicher-sichere Schranke; bestehende Budget-/Knoten-Tests bleiben grün. Falls ein
+  **getrenntes** Schritt-Budget (unabhängig von `max_nodes`) gewünscht ist, ist das
+  eine billige additive Erweiterung der `TraversalParams` (nicht-blockierend).

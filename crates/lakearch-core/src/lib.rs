@@ -59,6 +59,14 @@
 //!   Dedup §5.3, Index erst nach Log-`fsync` §8.4) und `get_by_content_id`
 //!   (§5.2-Fetch, liefert ein [`SealedRecord`] durchs Tor §11). Aggregierte
 //!   Betriebs-Zähler [`KernelMetrics`] über [`LakearchKernel::stats`] (§Betrieb).
+//! - [`traverse`] — die **mechanische Traversierung** (§1.2/§1.7 a): beschränkt
+//!   (Tiefe/Knoten-Budget), zyklensicher über ein server-seitiges Visited-Set
+//!   (§1.6), deterministisch emittiert in aufsteigender `ContentId`-Adress-Order
+//!   (§5.2/§1.4, **kein** Wert-Sort), mit strukturellem `edge_type_filter` (§3.3)
+//!   und kooperativem [`CancelFlag`]. Sie läuft **durch das Tor** (§11.3):
+//!   Filter-vor-Auflösen + VANISH (nicht-sichtbare Nachbarn sind interne
+//!   Front-Stopps und verändern die Ergebnisform nicht). Bei Budget-/Abbruch/
+//!   Inkonsistenz endet der Strom mit einem definierten [`KernelError`].
 //! - [`error`] — [`error::KernelError`] (rein **mechanische** Zustände, §1.4).
 //! - Platzhalter-Konvention (§3.6) auf [`Datum`]
 //!   ([`Datum::placeholder`]/[`Datum::unresolved_marker`]): geschlossene
@@ -76,6 +84,7 @@ pub mod index;
 pub mod kernel;
 pub mod log;
 pub mod store;
+pub mod traverse;
 
 pub use api::{Direction, Kernel, SnapshotToken, Step, StepStream};
 pub use error::KernelError;
@@ -92,6 +101,7 @@ pub use log::{LogMetrics, LoggedRecord, SegmentLog};
 pub use model::Datum;
 pub use serialize::{canonical_cbor, strict_decode};
 pub use store::{ContentStore, StoreMetrics};
+pub use traverse::{CancelFlag, TraversalParams};
 
 #[cfg(test)]
 mod tests {

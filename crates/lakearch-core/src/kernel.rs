@@ -41,7 +41,7 @@
 
 use std::sync::RwLock;
 
-use crate::api::{Kernel, SnapshotToken};
+use crate::api::{Direction, Kernel, SnapshotToken, StepStream};
 use crate::error::KernelError;
 use crate::gate::{Capability, GrantedScopes, SealedRecord};
 use crate::id::ContentId;
@@ -49,6 +49,7 @@ use crate::index::EdgeIndex;
 use crate::log::SegmentLog;
 use crate::model::Datum;
 use crate::store::ContentStore;
+use crate::traverse::{run_traversal, CancelFlag, TraversalParams};
 
 /// Aggregierte **Betriebs-Zähler** des Kernels (§Betrieb). Reine Mechanik-Signale
 /// (§1.4): keine Wertung, **keine** sichtbaren Daten/IDs/Bereiche in Labels
@@ -75,6 +76,10 @@ pub struct KernelMetrics {
     pub segment_count: u64,
     /// Committete Log-Bytes (= durable Watermark `W`, der committed offset).
     pub committed_bytes: u64,
+    /// Anzahl **Fail-closed-Ereignisse** (§11): Lese-/Tor-/Traversier-Pfade, die
+    /// wegen Index-/Log-Inkonsistenz **DENY** gewählt haben. Sichtbarkeits-blind
+    /// (§11.3): zählt nur **dass** es geschah, nie **was**.
+    pub fail_closed_count: u64,
 }
 
 /// Die konkrete **Kernel-Implementierung**: besitzt den
@@ -101,6 +106,80 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         }
     }
 
+    /// **Gegatete, beschränkte mechanische Traversierung** (§1.7 a) mit explizit
+    /// vorgelegter [`Capability`] und kooperativem [`CancelFlag`] — der volle
+    /// Phase-2-Einstieg.
+    ///
+    /// Diese konkrete Methode trägt — anders als die frozen-Form-`Kernel::traverse`
+    /// — die [`Capability`] des Subjekts, sodass das Tor (§11.3) die Sichtbarkeit
+    /// gegen die **gewährten Bereiche** matchen kann: nicht-sichtbare Nachbarn sind
+    /// interne Front-Stopps (VANISH) und verändern die Ergebnisform nicht. Der
+    /// Snapshot ist am Start gepinnt (§1.7 a/§13); die volle §13-Epochen-Semantik
+    /// folgt in Phase 5.
+    ///
+    /// Liefert einen owned [`StepStream`]; jeder Schritt ist ein [`crate::api::Step`] oder ein
+    /// definierter [`KernelError`] (Budget/Abbruch/Inkonsistenz — fail-closed §11).
+    /// Der Strom ist durch `max_nodes` speicher-beschränkt (kein unbeschränkter
+    /// Speicher, §1.7 a).
+    pub fn traverse_with<'a>(
+        &'a self,
+        params: TraversalParams,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+        cancel: &CancelFlag,
+    ) -> Result<StepStream<'a>, KernelError> {
+        // Snapshot wird am Start gepinnt; in Phase 1/2 ist die Wahrheit alles bis
+        // zur committeten Watermark. Volle §13-Epochen-Semantik: Phase 5.
+        let _ = snapshot;
+        // Den `edge_type_filter` an der **Verb-Grenze** normalisieren (aufsteigend
+        // sortiert + dedupliziert, §1.3/§1.7 a): ein vom Aufrufer direkt befülltes
+        // `TraversalParams` darf einen unsortierten Filter tragen — die
+        // `binary_search`-Mitgliedschafts-Prüfung in `run_traversal` setzt aber
+        // Sortierung voraus (sonst über-/unter-inklusive Treffer + Determinismus-
+        // Bruch). `TraversalParams::new` stellt die Invariante her; `run_traversal`
+        // prüft sie zusätzlich defensiv.
+        let params = TraversalParams::new(
+            params.start,
+            params.dir,
+            params.max_depth,
+            params.max_nodes,
+            params.edge_type_filter,
+        );
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let steps = run_traversal(&store, capability, &params, cancel);
+        Ok(Box::new(steps.into_iter()))
+    }
+
+    /// **Berechtigungs-basierte Autorisierung** (§11.1/§11.2) — der volle
+    /// Tor-Einstieg: stellt für ein **Subjekt** eine [`Capability`] aus, deren
+    /// gewährte Bereiche der Kernel aus den **aktiven** Berechtigungen im Snapshot
+    /// **strukturell** ableitet (§11.2/§1.3) — alle Bereiche von Berechtigungen,
+    /// deren Subjekt `subject` ist und die **nicht** entzogen sind (§11.4).
+    ///
+    /// „Aktiv" ist eine **strukturelle** Notion (§11.5): eine Berechtigung gilt,
+    /// solange kein Entzugs-Kontext sie im Snapshot benennt — **kein** Wall-Clock-
+    /// Vergleich (das wäre Ordnung → §1.4). Ein frisch angehängter Entzug verbirgt
+    /// damit **künftige** Lesevorgänge des Daten-Bereichs (§11.4); bereits Gelesenes
+    /// bleibt (§6.3).
+    ///
+    /// Diese konkrete Methode ergänzt die frozen-Form-[`Kernel::authorize`] (die das
+    /// Subjekt-Konzept noch nicht trägt und die Scopes direkt entgegennimmt) — analog
+    /// zu [`LakearchKernel::traverse_with`] gegenüber [`Kernel::traverse`]. Der
+    /// `snapshot` pinnt die Lese-Epoche (Phase 1/2: die committete Watermark `W`;
+    /// volle §13-Epoche: Phase 5).
+    pub fn authorize_subject(
+        &self,
+        subject: ContentId,
+        snapshot: SnapshotToken,
+    ) -> Result<Capability, KernelError> {
+        let _ = snapshot;
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        // §11.2 strukturelles Matching: die aktiven (nicht entzogenen) Bereiche des
+        // Subjekts. Reines Mengen-Matching (§1.3), kein Wall-Clock (§1.4).
+        let areas = store.granted_areas_for_subject(subject);
+        Ok(Capability::issue(GrantedScopes::from_scope_ids(areas)))
+    }
+
     /// Aggregierte **Betriebs-Zähler** (§Betrieb). Liest sowohl die Store- als auch
     /// die Log-Metriken unter dem Lese-Lock zusammen.
     pub fn stats(&self) -> Result<KernelMetrics, KernelError> {
@@ -115,6 +194,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
             fsync_count: lm.fsync_count,
             segment_count: lm.segment_count,
             committed_bytes: lm.committed_bytes,
+            fail_closed_count: sm.fail_closed_count,
         })
     }
 }
@@ -186,24 +266,154 @@ impl<I: EdgeIndex> Kernel for LakearchKernel<I> {
 
     /// **get_by_content_id** (§5.2-Fetch) — geht **durchs Tor** (§11): liefert ein
     /// opakes [`SealedRecord`], dessen Inhalt **nur** [`crate::gate::open`] gegen
-    /// die [`Capability`] freilegt. `None` ⇒ nicht vorhanden.
+    /// die [`Capability`] freilegt. `None` ⇒ **nicht sichtbar ODER nicht vorhanden**
+    /// — der Leser kann es **nicht** unterscheiden (VANISH, §11.3).
     ///
-    /// **Stand (Phase 1).** Die Tor-**Sichtbarkeitslogik** (VANISH: verborgen und
-    /// „nicht vorhanden" ununterscheidbar; Bereichs-Filter §11.3) ist Phase 2.
-    /// Diese Phase liefert bereits den `SealedRecord`, sodass **kein** Aufrufer die
-    /// Bytes ohne das (künftige) Tor lesen kann. `capability` und `snapshot`
-    /// werden formal entgegengenommen; ihre Auswertung folgt in Phase 2/5.
+    /// ## VANISH schon an der Verb-Grenze (§11.3 — kein Existenz-Orakel)
+    ///
+    /// Die Sichtbarkeit wird **vor** der Rückgabe gematcht (Filter-vor-Auflösen,
+    /// §11.3, reines Mengen-Matching §1.3): ist das Daten durabel vorhanden, aber
+    /// für die `capability` **nicht** sichtbar, liefert dieses Verb `Ok(None)` —
+    /// **ununterscheidbar** von „nicht vorhanden". Andernfalls könnte ein rechtloser
+    /// Leser allein aus der Rückgabeform (`Some` vs. `None`) ein Existenz-Orakel
+    /// über die berechenbaren Hash-Adressen ableiten (§11.3 verbietet genau das, und
+    /// der API-Vertrag in [`crate::api::Kernel::get_by_content_id`] fordert `None`
+    /// für Verborgenes). Damit verhält sich dieses Verb wie `is_visible_node` in der
+    /// Traversierung: „abwesend" und „vorhanden-aber-verborgen" kollabieren beide zu
+    /// `None`. Erst ein **sichtbares** Daten wird als `SealedRecord` versiegelt; das
+    /// abschließende [`crate::gate::open`] gegen dieselbe `capability` setzt die
+    /// Sichtbarkeit ein zweites Mal durch (Tor bleibt die einzige Inhalts-Quelle).
+    ///
+    /// **Fail-closed (§11):** eine Index-/Log-Inkonsistenz (`areas_of_checked` ⇒
+    /// `Inconsistent`) ist ein **Fehler** (DENY + Fail-closed-Vermerk), **nie** ein
+    /// stilles `Some`/`None`, das Unsichtbares durchsickern ließe.
+    ///
+    /// `snapshot` wird formal entgegengenommen (volle §13-Epoche: Phase 5); jede
+    /// Tor-Operation läuft über **dasselbe** S (§11.2).
     fn get_by_content_id(
         &self,
         id: ContentId,
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Option<SealedRecord>, KernelError> {
-        // Phase 2/5: hier wertet das Tor `capability`/`snapshot` aus (Sichtbarkeit
-        // + Snapshot-Epoche); in Phase 1 versiegeln wir den durablen Inhalt.
-        let _ = (capability, snapshot);
+        // `snapshot` wird formal entgegengenommen (volle §13-Epoche: Phase 5).
+        let _ = snapshot;
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        store.get_sealed(id)
+        // Server-seitig versiegeln: `None` ⇒ nicht vorhanden.
+        let sealed = match store.get_sealed(id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        // §11.3 Filter-vor-Auflösen / VANISH **an der Verb-Grenze**: ist das Daten
+        // vorhanden, aber für diese Capability nicht sichtbar, kollabiert die
+        // Rückgabe zu `Ok(None)` — ununterscheidbar von „nicht vorhanden", kein
+        // Existenz-Orakel (§11.3). Reines Mengen-Matching (§1.3) über die durable
+        // Wahrheit (`areas_of_checked`, fail-closed §11).
+        let areas = store.areas_of_checked(id)?;
+        if !crate::gate::is_visible(&areas, capability.scopes().scope_ids()) {
+            // VANISH: verborgen ist ununterscheidbar von abwesend.
+            return Ok(None);
+        }
+        Ok(Some(sealed))
+    }
+
+    /// **content_equal** (§1.3 i) — Gleichheit auf **Adressebene**: tragen `a` und
+    /// `b` dieselbe [`ContentId`]? Reines Adress-Matching (§5.2), **kein** Wert-
+    /// Vergleich (§1.4). Die `ContentId` ist ein berechenbarer, nicht-geheimer Hash;
+    /// der Vergleich legt **keinen** Inhalt offen (kein Tor-Bypass) — er materialisiert
+    /// nichts. Der `snapshot` wird formal entgegengenommen.
+    fn content_equal(
+        &self,
+        a: ContentId,
+        b: ContentId,
+        snapshot: SnapshotToken,
+    ) -> Result<bool, KernelError> {
+        let _ = snapshot;
+        Ok(a == b)
+    }
+
+    /// **context_points_to** (§1.3 ii) — „zeigt der Kontext `ctx` auf `target`?":
+    /// besitzt der Knoten `ctx` das Daten `target` (§3.3)? Reines strukturelles
+    /// Matching über den Vorwärts-Index (`owner → contexts`, §1.2/§3.2): `target`
+    /// ist genau dann ein Ziel, wenn es in `contexts_of(ctx)` liegt. **Kein** Wert
+    /// (§1.4); materialisiert keinen Inhalt.
+    fn context_points_to(
+        &self,
+        ctx: ContentId,
+        target: ContentId,
+        snapshot: SnapshotToken,
+    ) -> Result<bool, KernelError> {
+        let _ = snapshot;
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        // `contexts_of` liefert aufsteigend sortierte owned IDs (§EdgeIndex) ⇒
+        // Binärsuche ist zulässig (reines Mengen-Matching, §1.3).
+        let ctxs = store.index().contexts_of(ctx)?;
+        Ok(ctxs.binary_search(&target).is_ok())
+    }
+
+    /// **is_member_of_set** (§1.3 iii) — Zugehörigkeit zu der per Kontext gegebenen
+    /// Menge: ist `elem` Mitglied der Menge, die der Mengen-Kontext `set_ctx`
+    /// aufspannt? Reines Mengen-Matching über den Vorwärts-Index: `elem` ist genau
+    /// dann Mitglied, wenn es in den von `set_ctx` besessenen Kontexten liegt.
+    /// **Kein** Wert/Ordnung (§1.4); materialisiert keinen Inhalt.
+    fn is_member_of_set(
+        &self,
+        elem: ContentId,
+        set_ctx: ContentId,
+        snapshot: SnapshotToken,
+    ) -> Result<bool, KernelError> {
+        let _ = snapshot;
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let members = store.index().contexts_of(set_ctx)?;
+        Ok(members.binary_search(&elem).is_ok())
+    }
+
+    /// **traverse** (§1.2/§1.7 a) — die beschränkte, zyklensichere mechanische
+    /// Traversierung in der **frozen-Form**-Signatur (ohne explizite
+    /// [`Capability`]).
+    ///
+    /// Da diese Trait-Form **keine** Capability trägt, läuft sie mit der **leersten
+    /// möglichen** Sichtbarkeit (keine gewährten Bereiche): **unbeschränkte** Daten
+    /// (ohne Bereichs-Zugehörigkeit) sind traversierbar, **bereichs-beschränkte**
+    /// VANISHen (§11.3) — fail-safe, kein Leck ohne explizites Recht. Der volle
+    /// gegatete Einstieg mit vorgelegter Capability ist
+    /// [`LakearchKernel::traverse_with`].
+    ///
+    /// Deterministische Emission in aufsteigender `ContentId`-Adress-Order
+    /// (§5.2/§1.4); `edge_type_filter` als strukturelles `ContentId`-Matching auf
+    /// `edge_ctx` (§3.3). Budget-/Abbruch-/Inkonsistenz-Ende ist ein definierter
+    /// [`KernelError`] (fail-closed §11).
+    fn traverse<'a>(
+        &'a self,
+        start: ContentId,
+        dir: Direction,
+        max_depth: u32,
+        max_nodes: u64,
+        edge_type_filter: Option<&'a [ContentId]>,
+        snapshot: SnapshotToken,
+    ) -> Result<StepStream<'a>, KernelError> {
+        let _ = snapshot;
+        // Frozen-Form ohne Capability ⇒ fail-safe leere gewährte Bereiche: nur
+        // unbeschränkte Daten sichtbar, beschränkte VANISHen (§11.3).
+        let capability = Capability::issue(GrantedScopes::from_scope_ids([]));
+        // Den Kanten-Typ-Filter in eine sortierte, owned Menge überführen (schnelle
+        // Mitgliedschafts-Prüfung; aufsteigende Adress-Order, kein Wert-Sort §1.4).
+        let edge_type_filter = edge_type_filter.map(|f| {
+            let mut v = f.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        });
+        let params = TraversalParams {
+            start,
+            dir,
+            max_depth,
+            max_nodes,
+            edge_type_filter,
+        };
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let steps = run_traversal(&store, &capability, &params, &CancelFlag::new());
+        Ok(Box::new(steps.into_iter()))
     }
 }
 
@@ -377,24 +587,15 @@ mod tests {
 
     #[test]
     fn unwired_verbs_still_report_their_phase() {
+        // Nach Phase 2 sind Matching + Traversierung verdrahtet; die noch
+        // unverdrahteten Verben (Aktiv-Marker = Phase 5, Provenance = Phase 6)
+        // melden weiterhin ihre Phase, kein Verb panickt.
         let dir = tempdir().unwrap();
         let k = open_kernel(dir.path());
         let snap = k.pin_snapshot().unwrap();
         let a = ContentId::from_bytes([0x01; 32]);
         let b = ContentId::from_bytes([0x02; 32]);
 
-        assert!(matches!(
-            k.content_equal(a, b, snap),
-            Err(KernelError::NotYetImplemented(2))
-        ));
-        assert!(matches!(
-            k.context_points_to(a, b, snap),
-            Err(KernelError::NotYetImplemented(2))
-        ));
-        assert!(matches!(
-            k.is_member_of_set(a, b, snap),
-            Err(KernelError::NotYetImplemented(2))
-        ));
         assert!(matches!(
             k.set_active_marker(&[a, b]),
             Err(KernelError::NotYetImplemented(5))
@@ -403,5 +604,242 @@ mod tests {
             k.find_dependents(a, snap).err(),
             Some(KernelError::NotYetImplemented(6))
         ));
+        assert!(matches!(
+            k.traverse_provenance_backward(a, 4, 100, snap).err(),
+            Some(KernelError::NotYetImplemented(6))
+        ));
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 2: die drei §1.3-Prädikate sind verdrahtet (reines Matching).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn match_predicates_are_wired() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let snap = k.pin_snapshot().unwrap();
+
+        let b = k.append(&Datum::leaf(b"b".to_vec())).unwrap();
+        let c = k.append(&Datum::leaf(b"c".to_vec())).unwrap();
+        let a = k.append(&Datum::node([b, c]).unwrap()).unwrap();
+
+        // content_equal: reine Adress-Gleichheit (§1.3 i).
+        assert!(k.content_equal(a, a, snap).unwrap());
+        assert!(!k.content_equal(a, b, snap).unwrap());
+
+        // context_points_to: A besitzt B und C (§1.3 ii).
+        assert!(k.context_points_to(a, b, snap).unwrap());
+        assert!(k.context_points_to(a, c, snap).unwrap());
+        // A besitzt sich nicht selbst.
+        assert!(!k.context_points_to(a, a, snap).unwrap());
+
+        // is_member_of_set: B und C sind Mitglieder der von A aufgespannten Menge
+        // (§1.3 iii).
+        assert!(k.is_member_of_set(b, a, snap).unwrap());
+        assert!(k.is_member_of_set(c, a, snap).unwrap());
+        let unknown = ContentId::from_bytes([0xEE; 32]);
+        assert!(!k.is_member_of_set(unknown, a, snap).unwrap());
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 2: die frozen-Form-`traverse` läuft (fail-safe leere Bereiche) und
+    // emittiert in aufsteigender ContentId-Order.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn trait_traverse_runs_over_unrestricted_data() {
+        use crate::api::Direction;
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let snap = k.pin_snapshot().unwrap();
+
+        let b = k.append(&Datum::leaf(b"b".to_vec())).unwrap();
+        let c = k.append(&Datum::leaf(b"c".to_vec())).unwrap();
+        let a = k.append(&Datum::node([b, c]).unwrap()).unwrap();
+
+        let stream = k
+            .traverse(a, Direction::Forward, 2, 100, None, snap)
+            .unwrap();
+        let steps: Vec<_> = stream.map(|r| r.unwrap()).collect();
+        let tos: Vec<ContentId> = steps.iter().map(|s| s.to).collect();
+        let mut expected = vec![b, c];
+        expected.sort_unstable();
+        assert_eq!(tos, expected, "Forward-Nachbarn von A, aufsteigend");
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 2: die gegatete `traverse_with` setzt die Sichtbarkeit (VANISH) durch.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn traverse_with_enforces_visibility() {
+        use crate::api::Direction;
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _marker = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+        let public_leaf = k.append(&Datum::leaf(b"public".to_vec())).unwrap();
+        let secret = k.append(&Datum::node([membership]).unwrap()).unwrap();
+        let a = k.append(&Datum::node([public_leaf, secret]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let p = TraversalParams {
+            start: a,
+            dir: Direction::Forward,
+            max_depth: 2,
+            max_nodes: 100,
+            edge_type_filter: None,
+        };
+
+        // Ohne den Bereich: das geheime Daten VANISHt.
+        let denied = k
+            .authorize(GrantedScopes::from_scope_ids([]), snap)
+            .unwrap();
+        let steps: Vec<_> = k
+            .traverse_with(p.clone(), &denied, snap, &CancelFlag::new())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(steps.iter().all(|s| s.to != secret), "geheim VANISHt");
+        assert!(steps.iter().any(|s| s.to == public_leaf));
+
+        // Mit dem Bereich: sichtbar.
+        let granted = k
+            .authorize(GrantedScopes::from_scope_ids([area]), snap)
+            .unwrap();
+        let steps2: Vec<_> = k
+            .traverse_with(p, &granted, snap, &CancelFlag::new())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(steps2.iter().any(|s| s.to == secret), "mit Recht sichtbar");
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 2: `authorize_subject` leitet die gewährten Bereiche aus aktiven
+    // Berechtigungen ab; ein Entzug verbirgt künftige Reads (§11.1/§11.2/§11.4).
+    // ------------------------------------------------------------------------
+
+    /// Hängt eine vollständige Berechtigung an den Kernel und liefert ihre ID.
+    fn append_permission(
+        k: &LakearchKernel<RedbEdgeIndex>,
+        subject: ContentId,
+        area: ContentId,
+    ) -> ContentId {
+        k.append(&Datum::permission_subject_marker()).unwrap();
+        k.append(&Datum::permission_area_marker()).unwrap();
+        k.append(&Datum::permission_marker()).unwrap();
+        k.append(&Datum::permission_subject_role(subject)).unwrap();
+        k.append(&Datum::permission_area_role(area)).unwrap();
+        k.append(&Datum::permission(subject, area)).unwrap()
+    }
+
+    #[test]
+    fn authorize_subject_then_revoke_hides_future_reads() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let subject = k.append(&Datum::leaf(b"subject".to_vec())).unwrap();
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+        let secret = k.append(&Datum::node([membership]).unwrap()).unwrap();
+        let perm = append_permission(&k, subject, area);
+
+        // Aktiv: das Subjekt sieht das geheime Daten.
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize_subject(subject, snap).unwrap();
+        let sealed = k.get_by_content_id(secret, &cap, snap).unwrap().unwrap();
+        assert!(open(&sealed, &cap).is_some(), "aktive Berechtigung ⇒ sichtbar");
+
+        // Entzug ⇒ künftige Autorisierung gewährt den Bereich nicht mehr; das Verb
+        // selbst liefert dann `None` (VANISH an der Verb-Grenze, §11.4/§11.3 — kein
+        // Existenz-Orakel über die Rückgabeform).
+        k.append(&Datum::revocation_marker()).unwrap();
+        k.append(&Datum::revocation(perm)).unwrap();
+        let snap2 = k.pin_snapshot().unwrap();
+        let cap2 = k.authorize_subject(subject, snap2).unwrap();
+        assert!(
+            k.get_by_content_id(secret, &cap2, snap2).unwrap().is_none(),
+            "nach Entzug ⇒ VANISH an der Verb-Grenze (§11.4)"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Filter-vor-Auflösen / VANISH über get_by_content_id (§11.3): ein
+    // bereichs-beschränktes Daten ist ohne den Bereich schon an der VERB-GRENZE
+    // None (ununterscheidbar von „existiert nicht") — kein Existenz-Orakel über
+    // die Rückgabeform.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn get_by_content_id_filters_before_resolve() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+        let secret = k.append(&Datum::node([membership]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        // Ohne den Bereich: das Verb selbst liefert bereits `None` (VANISH) — die
+        // Sichtbarkeit wird VOR der Rückgabe gematcht, sodass „vorhanden-aber-
+        // verborgen" von „nicht vorhanden" ununterscheidbar ist (kein Existenz-
+        // Orakel über die Rückgabeform, §11.3).
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(
+            k.get_by_content_id(secret, &denied, snap).unwrap().is_none(),
+            "verborgenes Daten ist an der Verb-Grenze None (VANISH, §11.3)"
+        );
+
+        // Eine unbekannte Adresse ist ebenfalls None — beide Fälle sind für den
+        // rechtlosen Leser ununterscheidbar (kein Existenz-Orakel).
+        let missing = ContentId::from_bytes([0xCD; 32]);
+        assert!(k.get_by_content_id(missing, &denied, snap).unwrap().is_none());
+
+        // Mit gewährtem Bereich wird dasselbe Daten sichtbar — erst dann gibt das
+        // Verb ein `SealedRecord` heraus, das `open` freilegt.
+        let granted = k
+            .authorize(GrantedScopes::from_scope_ids([area]), snap)
+            .unwrap();
+        let sealed = k
+            .get_by_content_id(secret, &granted, snap)
+            .unwrap()
+            .expect("mit Recht vorhanden");
+        assert!(open(&sealed, &granted).is_some(), "mit Bereich sichtbar");
+    }
+
+    // ------------------------------------------------------------------------
+    // KEIN EXISTENZ-ORAKEL an der Verb-Grenze (§11.3): die Rückgabeform von
+    // `get_by_content_id` darf „vorhanden-aber-verborgen" NICHT von „nicht
+    // vorhanden" unterscheidbar machen. Ein rechtloser Leser sieht für ein
+    // verborgenes Daten und für eine zufällige unbekannte Adresse GENAU dieselbe
+    // Form (`Ok(None)`).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn get_by_content_id_is_not_an_existence_oracle() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+        let secret = k.append(&Datum::node([membership]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+        // Verborgenes (durabel vorhandenes) Daten ⇒ None.
+        let hidden = k.get_by_content_id(secret, &denied, snap).unwrap();
+        // Zufällige, nie geschriebene Adresse ⇒ None.
+        let absent = k
+            .get_by_content_id(ContentId::from_bytes([0x13; 32]), &denied, snap)
+            .unwrap();
+        // Die Rückgabeform ist in beiden Fällen IDENTISCH — kein Orakel (§11.3).
+        assert!(hidden.is_none() && absent.is_none());
+        assert_eq!(hidden.is_some(), absent.is_some());
     }
 }

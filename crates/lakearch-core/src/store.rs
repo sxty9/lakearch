@@ -41,7 +41,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::KernelError;
 use crate::gate::SealedRecord;
@@ -62,6 +63,13 @@ pub struct StoreMetrics {
     pub dedup_hit_count: u64,
     /// Anzahl in den Index committeter Kanten (über alle Appends/Rebuilds).
     pub edge_count: u64,
+    /// Anzahl **Fail-closed-Ereignisse** (§11): ein Lese-/Tor-/Traversier-Pfad
+    /// hat wegen einer Index-/Log-Inkonsistenz oder unverifizierbaren Scopes
+    /// **DENY** (leeres/abgebrochenes Ergebnis) gewählt. Reines Mechanik-Signal
+    /// (§1.4), sichtbarkeits-blind (§11.3): es zählt nur **dass** ein Fail-closed
+    /// auftrat, nennt **kein** Daten/keine ID/keinen Bereich. Wird über einen
+    /// internen Atomic-Zähler auch auf `&self`-Lesepfaden erhöht.
+    pub fail_closed_count: u64,
 }
 
 /// Der **Content-Store**: Append + Dedup über dem Log, plus die abgeleiteten
@@ -78,8 +86,30 @@ pub struct ContentStore<I: EdgeIndex> {
     /// In-memory **Dedup-Karte** `ContentId → Record-Offset` (§5.3). Reines
     /// Derivat aus dem Log; beim Öffnen rekonstruiert.
     dedup: HashMap<ContentId, u64>,
+    /// In-memory **Bereichs-Zugehörigkeits-Index** `Daten → { Bereiche }` (§11.1):
+    /// die Bereiche, denen ein Daten angehört. Ein Daten gehört einem Bereich an,
+    /// wenn es einen **Zugehörigkeits-Kontext** besitzt (einen Knoten
+    /// `{ Marker, Bereich }`, [`Datum::area_membership_target`]). Reines,
+    /// neu-baubares Derivat aus dem Log (§8.4); beim Öffnen rekonstruiert. Das Tor
+    /// (§11) liest es **vor** jeder Auflösung (Filter-vor-Auflösen, §11.3).
+    areas: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Berechtigungs-Karte** `Berechtigung-ContentId → (Subjekt,
+    /// Bereich)` (§11.1): alle im Log vorliegenden Berechtigungs-*Fakten*. Reines,
+    /// neu-baubares Derivat (§8.4). „Aktiv" entscheidet erst der Abgleich mit
+    /// [`revoked`](ContentStore::revoked) (§11.4) — eine **strukturelle** Notion,
+    /// **kein** Wall-Clock (§11.5).
+    permissions: HashMap<ContentId, (ContentId, ContentId)>,
+    /// In-memory **Entzugs-Menge** (§11.4): die `ContentId`s der Berechtigungen,
+    /// die ein Entzugs-Kontext im Log benennt. Reines, neu-baubares Derivat (§8.4).
+    /// Eine Berechtigung ist **aktiv** (für das Tor wirksam), wenn sie hier **nicht**
+    /// enthalten ist (strukturell-aktiv-im-Snapshot, §11.5).
+    revoked: HashSet<ContentId>,
     /// Betriebs-Zähler (§Betrieb).
     metrics: StoreMetrics,
+    /// **Fail-closed-Zähler** als Atomic (§11): er wird auch auf `&self`-Lese-/
+    /// Tor-/Traversier-Pfaden erhöht, wenn fail-closed DENY gewählt wurde. In
+    /// [`StoreMetrics::fail_closed_count`] gespiegelt.
+    fail_closed: AtomicU64,
 }
 
 impl<I: EdgeIndex> ContentStore<I> {
@@ -91,9 +121,15 @@ impl<I: EdgeIndex> ContentStore<I> {
             log,
             index,
             dedup: HashMap::new(),
+            areas: HashMap::new(),
+            permissions: HashMap::new(),
+            revoked: HashSet::new(),
             metrics: StoreMetrics::default(),
+            fail_closed: AtomicU64::new(0),
         };
         store.rebuild_dedup_from_log()?;
+        store.rebuild_areas_from_log()?;
+        store.rebuild_permissions_from_log()?;
         store.reconcile_index_with_log()?;
         Ok(store)
     }
@@ -137,6 +173,12 @@ impl<I: EdgeIndex> ContentStore<I> {
         let new_watermark = self.log.committed_offset();
         self.index.commit_edges(&edges, new_watermark)?;
         self.metrics.edge_count += edges.len() as u64;
+
+        // Bereichs-Zugehörigkeits-Index (§11.1) nachziehen: besitzt das neue Daten
+        // einen Zugehörigkeits-Kontext, gehört es dem darin benannten Bereich an.
+        self.index_area_memberships_of(id, datum)?;
+        // Berechtigungs-/Entzugs-Index (§11.1/§11.4) nachziehen.
+        self.index_permission_or_revocation_of(id, datum)?;
 
         Ok(id)
     }
@@ -193,16 +235,129 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// nur [`crate::gate::open`] gegen eine [`crate::gate::Capability`] legt ihn
     /// frei (§11.5). Die Prüfsumme ist beim Lesen verifiziert (§Durability).
     ///
-    /// **Stand (Phase 1).** Hier wird **noch keine** Sichtbarkeit ausgewertet
-    /// (VANISH/Bereichs-Filter = Phase 2); das Versiegeln stellt allein sicher,
-    /// dass kein Aufrufer die Bytes **ohne** das künftige Tor liest. `None` ⇒
-    /// nicht vorhanden (ab Phase 2 zusätzlich „oder nicht sichtbar", ununter-
-    /// scheidbar).
+    /// Das Versiegeln trägt die **Bereiche** bei, denen das Daten angehört (§11.1),
+    /// server-seitig aus dem Zugehörigkeits-Index ([`ContentStore::areas_of`])
+    /// bestimmt — das Tor ([`crate::gate::open`]) matcht sie **vor** der Freilegung
+    /// gegen die gewährten Bereiche (Filter-vor-Auflösen, §11.3). `None` ⇒ nicht
+    /// vorhanden; nicht-sichtbar wird **erst im Tor** zu `None` (VANISH, ununter-
+    /// scheidbar von „nicht vorhanden").
     pub fn get_sealed(&self, id: ContentId) -> Result<Option<SealedRecord>, KernelError> {
         match self.get_canonical_bytes(id)? {
-            Some(bytes) => Ok(Some(SealedRecord::seal(id, bytes))),
+            Some(bytes) => {
+                // Fail-closed (§11): die versiegelten Bereiche werden gegen die
+                // durable Wahrheit geprüft; ein korrupter Bereichs-Index ⇒
+                // `Inconsistent` (DENY + Metrik), statt eine unsichere Sicht zu
+                // versiegeln.
+                let areas = self.areas_of_checked(id)?;
+                Ok(Some(SealedRecord::seal(id, bytes, areas)))
+            }
             None => Ok(None),
         }
+    }
+
+    /// Die **Bereiche**, denen das Daten `id` angehört (§11.1) — owned, aufsteigend
+    /// in 32-Byte-`ContentId`-Order (deterministisch, kein Wert-Sort §1.4). Leerer
+    /// Vec ⇒ **unbeschränkt** (Policy-Default; das Tor behandelt es als für alle
+    /// sichtbar). Reines strukturelles Lesen des Zugehörigkeits-Index (§1.3).
+    pub fn areas_of(&self, id: ContentId) -> Vec<ContentId> {
+        self.areas.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// **Fail-closed** geprüfte Bereichs-Zugehörigkeit (§11): liefert die Bereiche
+    /// von `id` **nur**, wenn der in-memory Zugehörigkeits-Index (reines Derivat,
+    /// §8.4) mit der **durablen Wahrheit** (dem Log) übereinstimmt — andernfalls
+    /// [`KernelError::Inconsistent`] (DENY) **und** ein Fail-closed-Vermerk (§11.3
+    /// sichtbarkeits-blind).
+    ///
+    /// Begründung (§11): der Bereichs-Index ist sicherheits-tragend (er bestimmt,
+    /// was VANISHt). Ein **stiller** Index-Defekt — etwa eine Zugehörigkeit, die im
+    /// Index fehlt, obwohl das Daten den Zugehörigkeits-Kontext durabel besitzt —
+    /// würde ein beschränktes Daten fälschlich als **unbeschränkt** (für alle
+    /// sichtbar) ausweisen und so lecken. Daher wird die gecachte Bereichs-Menge
+    /// gegen die aus dem durablen Inhalt **neu abgeleitete** Menge geprüft; bei
+    /// Abweichung wird **fail-closed** verweigert, statt eine unsichere Sicht zu
+    /// liefern (§11: „bei Index/Log-Inkonsistenz ⇒ DENY"). Fehlt das Daten gar nicht
+    /// (`None`-Fall im Aufrufer), ist das **kein** Defekt — VANISH greift ohnehin.
+    pub fn areas_of_checked(&self, id: ContentId) -> Result<Vec<ContentId>, KernelError> {
+        // Die durable Wahrheit: aus dem gespeicherten Inhalt von `id` die Bereiche
+        // neu ableiten (genau wie der Index-Aufbau, §8.4). Ist `id` nicht durabel
+        // vorhanden (`None`), gibt es keine Zugehörigkeit — der Aufrufer behandelt
+        // Nicht-Existenz separat via VANISH, der Cache muss dann leer sein.
+        let truth = self.derive_areas_from_content(id)?.unwrap_or_default();
+        let cached = self.areas_of(id);
+        if cached != truth {
+            // Index-/Log-Inkonsistenz ⇒ fail-closed DENY + Metrik (§11).
+            self.note_fail_closed();
+            return Err(KernelError::Inconsistent);
+        }
+        Ok(truth)
+    }
+
+    /// Leitet die **Bereiche** eines vorhandenen Daten `id` direkt aus seinem
+    /// **durablen Inhalt** ab (§8.4) — die maßgebliche Wahrheit, gegen die
+    /// [`areas_of_checked`](ContentStore::areas_of_checked) den Index prüft.
+    /// `None`, wenn `id` nicht durabel vorhanden ist. Aufsteigend + dedupliziert
+    /// (deterministisch, kein Wert-Sort §1.4).
+    fn derive_areas_from_content(&self, id: ContentId) -> Result<Option<Vec<ContentId>>, KernelError> {
+        let bytes = match self.get_canonical_bytes(id)? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let datum = strict_decode(&bytes)?;
+        let owns = match datum.owns() {
+            Some(o) => o,
+            None => return Ok(Some(Vec::new())), // Blatt: keine Zugehörigkeit.
+        };
+        let mut found: Vec<ContentId> = Vec::new();
+        for ctx_id in owns {
+            let ctx_bytes = match self.get_canonical_bytes(*ctx_id)? {
+                Some(b) => b,
+                None => continue, // fehlender Kontext: §3.6 Sache der Schreibschicht.
+            };
+            let ctx = strict_decode(&ctx_bytes)?;
+            if let Some(area) = ctx.area_membership_target() {
+                found.push(area);
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        Ok(Some(found))
+    }
+
+    /// **Test-Hook (§11-Fail-closed).** Überschreibt die **gecachten** Bereiche
+    /// eines Daten direkt, um einen korrupten Bereichs-Index zu simulieren — der
+    /// durable Inhalt im Log bleibt unberührt, sodass
+    /// [`areas_of_checked`](ContentStore::areas_of_checked) die Abweichung erkennt
+    /// und fail-closed verweigert. Nur in Tests verfügbar.
+    #[cfg(test)]
+    pub(crate) fn corrupt_area_cache(&mut self, id: ContentId, areas: Vec<ContentId>) {
+        if areas.is_empty() {
+            self.areas.remove(&id);
+        } else {
+            self.areas.insert(id, areas);
+        }
+    }
+
+    /// Die **gewährten Bereiche** eines Subjekts (§11.1/§11.2) — abgeleitet aus den
+    /// **aktiven** Berechtigungen im Store: alle Bereiche von Berechtigungen, deren
+    /// Subjekt `subject` ist und die **nicht** entzogen sind (§11.4). „Aktiv" ist
+    /// eine **strukturelle** Notion (§11.5): eine Berechtigung ist aktiv, solange
+    /// kein Entzugs-Kontext sie benennt — **kein** Wall-Clock-Vergleich (§1.4).
+    ///
+    /// Reines Mengen-Matching (§1.3); owned, aufsteigend in 32-Byte-`ContentId`-
+    /// Order (deterministisch, kein Wert-Sort §1.4). Das ist genau die Menge, mit
+    /// der das Tor (§11.2) eine [`crate::gate::Capability`] ausstellt.
+    pub fn granted_areas_for_subject(&self, subject: ContentId) -> Vec<ContentId> {
+        let mut areas: Vec<ContentId> = self
+            .permissions
+            .iter()
+            .filter(|(perm_id, _)| !self.revoked.contains(perm_id))
+            .filter(|(_, (subj, _))| *subj == subject)
+            .map(|(_, (_, area))| *area)
+            .collect();
+        areas.sort_unstable();
+        areas.dedup();
+        areas
     }
 
     /// `true`, wenn die `ContentId` durabel im Store vorhanden ist (§5.2). Reines
@@ -221,9 +376,19 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.dedup.is_empty()
     }
 
-    /// Betriebs-Zähler des Stores (§Betrieb).
+    /// Betriebs-Zähler des Stores (§Betrieb). Der Fail-closed-Zähler (§11) wird aus
+    /// dem internen Atomic gespiegelt, da er auch auf `&self`-Pfaden wächst.
     pub fn metrics(&self) -> StoreMetrics {
-        self.metrics
+        let mut m = self.metrics;
+        m.fail_closed_count = self.fail_closed.load(Ordering::Relaxed);
+        m
+    }
+
+    /// Vermerkt ein **Fail-closed-Ereignis** (§11) — rein das *Dass*, **kein**
+    /// Daten/keine ID/kein Bereich (sichtbarkeits-blind, §11.3). Auf `&self`
+    /// nutzbar (Atomic), damit Lese-/Tor-/Traversier-Pfade es zählen können.
+    pub(crate) fn note_fail_closed(&self) {
+        self.fail_closed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Lese-Sicht auf die Log-Metriken (§Betrieb).
@@ -278,6 +443,136 @@ impl<I: EdgeIndex> ContentStore<I> {
             // §5.3; ein zweiter physischer Record gleicher ID wäre ein Dedup-
             // Fehler oberhalb — er käme hier nie zustande).
             self.dedup.entry(id).or_insert(rec.offset);
+        }
+        Ok(())
+    }
+
+    /// Baut den in-memory **Bereichs-Zugehörigkeits-Index** (`Daten → { Bereiche }`,
+    /// §11.1) vollständig aus dem Log neu (§8.4: Log = Wahrheit). Idempotent.
+    /// Setzt voraus, dass die Dedup-Karte bereits gebaut ist (sie löst die
+    /// besessenen Kontext-`ContentId`s zu deren Inhalt auf).
+    fn rebuild_areas_from_log(&mut self) -> Result<(), KernelError> {
+        self.areas.clear();
+        let records = self.log.read_all()?;
+        for rec in &records {
+            let datum = strict_decode(&rec.payload)?;
+            let id = ContentId::of_datum(&datum);
+            self.index_area_memberships_of(id, &datum)?;
+        }
+        Ok(())
+    }
+
+    /// Trägt die **Bereichs-Zugehörigkeiten** eines Daten `id` (mit Inhalt `datum`)
+    /// in den Zugehörigkeits-Index ein (§11.1) — rein **mechanisch** (§1.4): für
+    /// jeden besessenen Kontext `K` wird `K`s durabler Inhalt aufgelöst; ist `K`
+    /// ein **Zugehörigkeits-Kontext** (`{ Marker, Bereich }`,
+    /// [`Datum::area_membership_target`]), gehört `id` dem benannten Bereich an.
+    ///
+    /// Ein Blatt oder ein Knoten ohne Zugehörigkeits-Kontexte trägt nichts ein.
+    /// Ein noch nicht vorhandener Kontext (referenzielle Geschlossenheit erzwingt
+    /// die schreibende Schicht, §3.6/§7.2) wird übersprungen — der Kernel
+    /// **validiert nicht** (§1.4). Die eingetragene Bereichs-Liste ist aufsteigend
+    /// sortiert und dedupliziert (deterministisch, kein Wert-Sort §1.4).
+    fn index_area_memberships_of(
+        &mut self,
+        id: ContentId,
+        datum: &Datum,
+    ) -> Result<(), KernelError> {
+        let owns = match datum.owns() {
+            Some(o) => o,
+            None => return Ok(()), // Blatt: keine Kontexte, keine Zugehörigkeit.
+        };
+        let mut found: Vec<ContentId> = Vec::new();
+        for ctx_id in owns {
+            // Den besessenen Kontext auflösen; fehlt er (Geschlossenheit ist Sache
+            // der schreibenden Schicht, §3.6), überspringen — keine Wertung (§1.4).
+            let bytes = match self.get_canonical_bytes(*ctx_id)? {
+                Some(b) => b,
+                None => continue,
+            };
+            let ctx = strict_decode(&bytes)?;
+            if let Some(area) = ctx.area_membership_target() {
+                found.push(area);
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        // Aufsteigend + dedupliziert (deterministischer, föderationsstabiler
+        // Tiebreak; §5.2/§1.4 — kein Wert-Sort).
+        found.sort_unstable();
+        found.dedup();
+        self.areas.insert(id, found);
+        Ok(())
+    }
+
+    /// Baut die in-memory **Berechtigungs-Karte** und **Entzugs-Menge** (§11.1/§11.4)
+    /// vollständig aus dem Log neu (§8.4: Log = Wahrheit). Idempotent. Setzt voraus,
+    /// dass die Dedup-Karte bereits gebaut ist (sie löst die Rollen-Kontexte auf).
+    fn rebuild_permissions_from_log(&mut self) -> Result<(), KernelError> {
+        self.permissions.clear();
+        self.revoked.clear();
+        let records = self.log.read_all()?;
+        for rec in &records {
+            let datum = strict_decode(&rec.payload)?;
+            let id = ContentId::of_datum(&datum);
+            self.index_permission_or_revocation_of(id, &datum)?;
+        }
+        Ok(())
+    }
+
+    /// Trägt eine **Berechtigung** (§11.1) oder einen **Entzug** (§11.4) eines Daten
+    /// `id` (mit Inhalt `datum`) in die jeweiligen Karten ein — rein **mechanisch**
+    /// (§1.4). Ein Entzug benennt die `ContentId` der entzogenen Berechtigung; eine
+    /// Berechtigung liefert *(Subjekt, Bereich)* über ihre Rollen-Kontexte (deren
+    /// Inhalt aus dem Store aufgelöst wird). Ein gewöhnliches Daten trägt nichts ein.
+    ///
+    /// Reine Reihenfolge-Unabhängigkeit (§6.3/§11.4): ein Entzug, der **vor** seiner
+    /// Berechtigung im Log steht, wird trotzdem korrekt verbucht — die Entzugs-Menge
+    /// referenziert nur die `ContentId` und [`granted_areas_for_subject`] gleicht
+    /// stets gegen sie ab. „Neuester Offset gewinnt" gibt es **nicht** (§Append-
+    /// Order-Semantik).
+    fn index_permission_or_revocation_of(
+        &mut self,
+        id: ContentId,
+        datum: &Datum,
+    ) -> Result<(), KernelError> {
+        // Entzug zuerst prüfen (kleinere, eindeutige Struktur).
+        if let Some(perm_id) = datum.revocation_target() {
+            self.revoked.insert(perm_id);
+            return Ok(());
+        }
+        // Berechtigung: (Subjekt, Bereich) strukturell ablesen. Die Rollen-Kontexte
+        // sind besessene Daten, die wir aus dem Store auflösen (Geschlossenheit ist
+        // Sache der schreibenden Schicht, §3.6; fehlt einer, liefert die Ablesung
+        // None — keine Wertung, §1.4).
+        //
+        // Der `resolve`-Closure liest die kanonischen Bytes über `&self`; wir sammeln
+        // mögliche Lese-Inkonsistenzen separat ein, da der Closure selbst keinen
+        // Fehler propagieren kann.
+        let mut read_err: Option<KernelError> = None;
+        let resolve = |ctx_id: ContentId| -> Option<Datum> {
+            match self.get_canonical_bytes(ctx_id) {
+                Ok(Some(bytes)) => match strict_decode(&bytes) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        read_err = Some(e);
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    read_err = Some(e);
+                    None
+                }
+            }
+        };
+        let subject_area = datum.permission_subject_area(resolve);
+        if let Some(e) = read_err {
+            return Err(e);
+        }
+        if let Some((subject, area)) = subject_area {
+            self.permissions.insert(id, (subject, area));
         }
         Ok(())
     }
@@ -586,6 +881,159 @@ mod tests {
             store.index().watermark().unwrap(),
             store.log_metrics().committed_bytes
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Bereichs-Zugehörigkeits-Index (§11.1): ein Daten mit Zugehörigkeits-Kontext
+    // wird dem Bereich zugeordnet; geprüfte Bereiche stimmen mit der durablen
+    // Wahrheit überein.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn area_membership_is_indexed_and_checked() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let area = store.append_datum(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _marker = store.append_datum(&Datum::area_membership_marker()).unwrap();
+        let membership = store.append_datum(&Datum::area_membership(area)).unwrap();
+        let secret = store.append_datum(&Datum::node([membership]).unwrap()).unwrap();
+        let public = store.append_datum(&Datum::leaf(b"public".to_vec())).unwrap();
+
+        assert_eq!(store.areas_of(secret), vec![area]);
+        assert_eq!(store.areas_of_checked(secret).unwrap(), vec![area]);
+        // Ein unbeschränktes Daten hat keine Bereiche (Policy-Default).
+        assert!(store.areas_of(public).is_empty());
+        assert!(store.areas_of_checked(public).unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // FAIL-CLOSED bei korruptem Bereichs-Index (§11): weicht der gecachte
+    // Bereichs-Index von der durablen Wahrheit ab, verweigert `areas_of_checked`
+    // mit `Inconsistent` (DENY) + Fail-closed-Metrik — statt eine unsichere
+    // (leckende) Sicht zu liefern.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn corrupt_scope_index_fails_closed_with_metric() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let area = store.append_datum(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _marker = store.append_datum(&Datum::area_membership_marker()).unwrap();
+        let membership = store.append_datum(&Datum::area_membership(area)).unwrap();
+        let secret = store.append_datum(&Datum::node([membership]).unwrap()).unwrap();
+
+        // Vorher konsistent, kein Fail-closed.
+        assert_eq!(store.areas_of_checked(secret).unwrap(), vec![area]);
+        assert_eq!(store.metrics().fail_closed_count, 0);
+
+        // Korruptions-Szenario 1: der Index sagt fälschlich „unbeschränkt" (leere
+        // Bereiche), obwohl das Daten durabel dem Bereich angehört → würde lecken.
+        store.corrupt_area_cache(secret, vec![]);
+        assert!(matches!(
+            store.areas_of_checked(secret),
+            Err(KernelError::Inconsistent)
+        ));
+        assert_eq!(store.metrics().fail_closed_count, 1, "Fail-closed gezählt (§11)");
+
+        // Korruptions-Szenario 2: der Index nennt einen falschen Bereich.
+        store.corrupt_area_cache(secret, vec![ContentId::from_bytes([0x99; 32])]);
+        assert!(matches!(
+            store.areas_of_checked(secret),
+            Err(KernelError::Inconsistent)
+        ));
+        assert_eq!(store.metrics().fail_closed_count, 2);
+    }
+
+    // ------------------------------------------------------------------------
+    // Berechtigung & Entzug (§11.1/§11.4): gewährte Bereiche eines Subjekts werden
+    // aus aktiven (nicht entzogenen) Berechtigungen abgeleitet; ein Entzug verbirgt
+    // den Bereich für künftige Ableitungen (strukturell, kein Wall-Clock §11.5).
+    // ------------------------------------------------------------------------
+
+    /// Hängt eine vollständige Berechtigung (Rollen-Kontexte + Marker + Knoten) an
+    /// den Store und liefert ihre `ContentId`.
+    fn append_permission(
+        store: &mut ContentStore<RedbEdgeIndex>,
+        subject: ContentId,
+        area: ContentId,
+    ) -> ContentId {
+        store.append_datum(&Datum::permission_subject_marker()).unwrap();
+        store.append_datum(&Datum::permission_area_marker()).unwrap();
+        store.append_datum(&Datum::permission_marker()).unwrap();
+        store.append_datum(&Datum::permission_subject_role(subject)).unwrap();
+        store.append_datum(&Datum::permission_area_role(area)).unwrap();
+        store.append_datum(&Datum::permission(subject, area)).unwrap()
+    }
+
+    #[test]
+    fn granted_areas_derive_from_active_permissions() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let subject = store.append_datum(&Datum::leaf(b"subject".to_vec())).unwrap();
+        let area1 = store.append_datum(&Datum::leaf(b"area-1".to_vec())).unwrap();
+        let area2 = store.append_datum(&Datum::leaf(b"area-2".to_vec())).unwrap();
+
+        let _p1 = append_permission(&mut store, subject, area1);
+        let _p2 = append_permission(&mut store, subject, area2);
+
+        let mut granted = store.granted_areas_for_subject(subject);
+        granted.sort_unstable();
+        let mut expected = vec![area1, area2];
+        expected.sort_unstable();
+        assert_eq!(granted, expected, "beide aktiven Bereiche gewährt (§11.1)");
+
+        // Ein fremdes Subjekt bekommt nichts.
+        let other = store.append_datum(&Datum::leaf(b"other".to_vec())).unwrap();
+        assert!(store.granted_areas_for_subject(other).is_empty());
+    }
+
+    #[test]
+    fn revocation_hides_area_from_future_authorizations() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let subject = store.append_datum(&Datum::leaf(b"subject".to_vec())).unwrap();
+        let area = store.append_datum(&Datum::leaf(b"area".to_vec())).unwrap();
+        let perm = append_permission(&mut store, subject, area);
+
+        // Vor dem Entzug: der Bereich ist gewährt.
+        assert_eq!(store.granted_areas_for_subject(subject), vec![area]);
+
+        // Entzug anhängen (§11.4): künftige Ableitungen filtern die Berechtigung.
+        store.append_datum(&Datum::revocation_marker()).unwrap();
+        store.append_datum(&Datum::revocation(perm)).unwrap();
+
+        // Nach dem Entzug: der Bereich ist nicht mehr gewährt (strukturell, §11.5).
+        assert!(
+            store.granted_areas_for_subject(subject).is_empty(),
+            "Entzug verbirgt den Bereich künftiger Lesevorgänge (§11.4)"
+        );
+    }
+
+    #[test]
+    fn revocation_before_permission_in_log_still_filters() {
+        // §6.3/§11.4-Reihenfolge-Unabhängigkeit: ein Entzug, der VOR seiner
+        // Berechtigung im Log steht (etwa nach Neu-Aufbau), filtert trotzdem —
+        // „neuester Offset gewinnt" gibt es nicht (§Append-Order-Semantik).
+        let dir = tempdir().unwrap();
+        let subject;
+        let area;
+        let perm_id;
+        {
+            let mut store = open_store(dir.path());
+            subject = store.append_datum(&Datum::leaf(b"subj".to_vec())).unwrap();
+            area = store.append_datum(&Datum::leaf(b"ar".to_vec())).unwrap();
+            // Berechtigungs-ID vorab berechnen, um den Entzug ZUERST anzuhängen.
+            perm_id = ContentId::of_datum(&Datum::permission(subject, area));
+            store.append_datum(&Datum::revocation_marker()).unwrap();
+            store.append_datum(&Datum::revocation(perm_id)).unwrap();
+            // Erst danach die Berechtigung selbst.
+            let actual = append_permission(&mut store, subject, area);
+            assert_eq!(actual, perm_id);
+            assert!(store.granted_areas_for_subject(subject).is_empty());
+        }
+        // Auch nach Reopen (Neu-Aufbau der Karten aus dem Log) bleibt sie gefiltert.
+        let store = open_store(dir.path());
+        assert!(store.granted_areas_for_subject(subject).is_empty());
     }
 
     #[test]
