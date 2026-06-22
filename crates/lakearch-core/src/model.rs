@@ -230,6 +230,21 @@ const PERMISSION_MARKER_PAYLOAD: &[u8; 22] = b"lakearch/permission/v1";
 /// 22 Bytes ASCII; **niemals** ändern.
 const REVOCATION_MARKER_PAYLOAD: &[u8; 22] = b"lakearch/revocation/v1";
 
+/// Eingefrorene atomare Nutzlast des **Aufzeichnungszeit**-Achsen-Marker-Atoms
+/// (§6.2: „wann das System es erfuhr"). Exakt 26 Bytes ASCII; **niemals** ändern
+/// (verschöbe alle Aufzeichnungszeit-Aussagen). Bewusst **verschieden** von der
+/// Gültigkeitszeit-Achse, damit die beiden Achsen strukturell unterscheidbar sind.
+const RECORDING_TIME_MARKER_PAYLOAD: &[u8; 26] = b"lakearch/recording-time/v1";
+
+/// Eingefrorene atomare Nutzlast des **Gültigkeitszeit**-Achsen-Marker-Atoms
+/// (§6.2: „wann der Sachverhalt in der Welt gilt"). Exakt 25 Bytes ASCII;
+/// **niemals** ändern.
+const VALIDITY_TIME_MARKER_PAYLOAD: &[u8; 25] = b"lakearch/validity-time/v1";
+
+/// Eingefrorene atomare Nutzlast des **Ersetzungs**-Marker-Atoms (§6.3:
+/// Ersetzungs-Kontext). Exakt 22 Bytes ASCII; **niemals** ändern.
+const SUPERSESSION_MARKER_PAYLOAD: &[u8; 22] = b"lakearch/supersedes/v1";
+
 /// Bereichs-Zugehörigkeit (§11.1) — „Zugehörigkeit ist ein Kontext".
 ///
 /// **Konvention (§11.1/§1.3).** Ein **Bereich** ist ein gewöhnliches Daten; die
@@ -465,6 +480,158 @@ impl Datum {
     }
 }
 
+/// Zeit als Daten (§6) — **rein strukturelle Konvention** (§1.3), die der Kernel
+/// **niemals** interpretiert, ordnet, vergleicht oder bereichs-testet.
+///
+/// **TIME IS DATA (§6.1).** Zeitpunkte und Zeiträume sind **gewöhnliche** Daten;
+/// eine **Zeit-Aussage** ist ein **besonderer Kontext**. Der **Zeit-Wert** selbst
+/// (z. B. ein Blatt mit den Zeit-Bytes) ist ein **opakes** Daten: lakearch sieht
+/// ihn als Bytes (§1.4) und **parst/ordnet/vergleicht ihn nie**.
+///
+/// **Zwei Achsen (§6.2).** Es gibt **zwei** Zeitachsen, ausgedrückt über zwei
+/// eingefrorene, **verschiedene** Achsen-Marker-Atome:
+///
+/// - **Aufzeichnungszeit** ([`Datum::recording_time_marker`]) — wann das System
+///   den Sachverhalt **erfuhr**.
+/// - **Gültigkeitszeit** ([`Datum::validity_time_marker`]) — wann der Sachverhalt
+///   **in der Welt gilt**.
+///
+/// Ein Daten **darf beide** tragen; die Achsen **dürfen auseinanderfallen** (§6.2)
+/// — sie sind strukturell **distinkt und unabhängig** (verschiedene Marker ⇒
+/// verschiedene Kontext-`ContentId`s). Eine **Zeit-Aussage** ist — analog zur
+/// Zugehörigkeit (§11.1) und zum Ersetzungs-Kontext (§6.3) — der Knoten
+/// `{ Achsen-Marker, Zeit-Wert }`. Die schreibende Schicht hängt einen solchen
+/// Kontext als besessenen Kontext an das Daten, dessen Zeit auf der jeweiligen
+/// Achse er aussagt.
+///
+/// **HARTE GRENZE (§1.4/§6.4/§8.2).** Der Kernel stellt **ausschließlich** bereit:
+/// Zeit **als Daten speichern**, Zeit-Aussage-Kontexte für den **strukturellen
+/// LOOKUP** indizieren (Exakt-Match/Mitgliedschaft, §1.3 — **keine** geordneten
+/// Bereichs-Abfragen) und **strukturell traversieren**. Der Kernel
+/// **interpretiert, ordnet, vergleicht** den Zeit-Wert **nicht** und entscheidet
+/// **nicht** „welche Version gilt zum Zeitpunkt T" oder „neueste gewinnt" — eine
+/// „Version" ist eine **Leseregel** (§6.4) der Schicht **darüber** (§8). **Kein**
+/// Verb dieses Moduls nimmt eine Zeit entgegen und liefert „die aktive" zurück;
+/// **keine** Funktion vergleicht zwei Zeit-Werte.
+impl Datum {
+    /// Das eingefrorene **Aufzeichnungszeit**-Achsen-Marker-Atom (§6.2) — ein
+    /// gewöhnliches Blatt-Daten (§2.1) mit fester atomarer Nutzlast. lakearch
+    /// interpretiert die Bytes **nicht** (§1.4); der Wert ist allein eine
+    /// wohlbekannte, föderationsweit gleiche Konvention (gleiche Bytes ⇒ gleiche
+    /// `ContentId`, §5.3/§12.3).
+    pub fn recording_time_marker() -> Self {
+        Datum::leaf(*RECORDING_TIME_MARKER_PAYLOAD)
+    }
+
+    /// Das eingefrorene **Gültigkeitszeit**-Achsen-Marker-Atom (§6.2) — ein
+    /// gewöhnliches Blatt-Daten (§2.1) mit fester atomarer Nutzlast. Bewusst
+    /// **verschieden** vom Aufzeichnungszeit-Marker, sodass die beiden Achsen
+    /// strukturell **distinkt** sind (§6.2: sie dürfen auseinanderfallen).
+    pub fn validity_time_marker() -> Self {
+        Datum::leaf(*VALIDITY_TIME_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt eine **Aufzeichnungszeit-Aussage** (§6.1/§6.2): der Kontext-Knoten
+    /// `{ recording_time_marker, time_value }`, der den **opaken** Zeit-Wert
+    /// `time_value` als Aufzeichnungszeit ausweist.
+    ///
+    /// `time_value` ist die `ContentId` eines **gewöhnlichen** Zeit-Wert-Daten
+    /// (z. B. ein Blatt mit den Zeit-Bytes, [`Datum::leaf`]); der Kernel
+    /// **interpretiert/ordnet/vergleicht** ihn **nicht** (§1.4/§6.4). Die
+    /// schreibende Schicht hängt den zurückgegebenen Kontext an das Daten, dessen
+    /// Aufzeichnungszeit er aussagt.
+    pub fn recording_time(time_value: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::recording_time_marker());
+        Datum::node([marker, time_value])
+            .expect("Zeit-Aussage besitzt stets das Achsen-Marker-Atom (§6.2)")
+    }
+
+    /// Erzeugt eine **Gültigkeitszeit-Aussage** (§6.1/§6.2): der Kontext-Knoten
+    /// `{ validity_time_marker, time_value }`, der den **opaken** Zeit-Wert
+    /// `time_value` als Gültigkeitszeit ausweist. Wie [`Datum::recording_time`]
+    /// ist `time_value` opak (§1.4/§6.4).
+    pub fn validity_time(time_value: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::validity_time_marker());
+        Datum::node([marker, time_value])
+            .expect("Zeit-Aussage besitzt stets das Achsen-Marker-Atom (§6.2)")
+    }
+
+    /// Liest aus einer **Aufzeichnungszeit-Aussage** (§6.2) die `ContentId` des
+    /// **opaken** Zeit-Werts, falls dieser Knoten eine ist — also exakt
+    /// `{ recording_time_marker, time_value }` besitzt; sonst `None`. Reines
+    /// strukturelles Matching (§1.3): „besitzt der Knoten das Achsen-Marker-Atom
+    /// und genau ein weiteres Daten (den Zeit-Wert)?".
+    ///
+    /// Der zurückgegebene Wert ist **nur eine Adresse** (§5.2); der Kernel **parst
+    /// und vergleicht** den Zeit-Wert **nicht** (§1.4/§6.4) — das Ordnen/Vergleichen
+    /// liegt in der Schicht darüber (§8).
+    pub fn recording_time_value(&self) -> Option<ContentId> {
+        let marker = ContentId::of_datum(&Datum::recording_time_marker());
+        self.role_target(marker)
+    }
+
+    /// Liest aus einer **Gültigkeitszeit-Aussage** (§6.2) die `ContentId` des
+    /// **opaken** Zeit-Werts, falls dieser Knoten eine ist; sonst `None`. Wie
+    /// [`Datum::recording_time_value`] reines strukturelles Matching (§1.3); der
+    /// Kernel **parst/vergleicht** den Wert **nicht** (§1.4/§6.4).
+    pub fn validity_time_value(&self) -> Option<ContentId> {
+        let marker = ContentId::of_datum(&Datum::validity_time_marker());
+        self.role_target(marker)
+    }
+}
+
+/// Ersetzung (§6.3) — **append-only**, **rein strukturelle Konvention** (§1.3).
+///
+/// **Ersetzungs-Kontext (§6.3).** Neues Wissen kommt als **neues** Daten hinzu;
+/// ein **Ersetzungs-Kontext** verknüpft ein **NEUERES** Daten mit dem **ÄLTEREN**,
+/// das es überholt — **ohne** das Ältere je zu ändern oder zu löschen (§7.1). Der
+/// Ersetzungs-Kontext ist — analog zur Zugehörigkeit (§11.1) — der Knoten
+/// `{ supersession_marker, older }`, der auf die `ContentId` des überholten
+/// (älteren) Daten zeigt. Das **neuere** Daten **besitzt** diesen Kontext.
+///
+/// **Beide Richtungen traversierbar.** Weil das neuere Daten den Ersetzungs-
+/// Kontext besitzt und dieser auf das ältere zeigt, entstehen über die bestehenden
+/// Indizes (`owner→contexts` / `target→referrers`, §1.2/§10.3) automatisch
+/// **beide** Richtungen: *supersedes* (neuer → älter, vorwärts über den Kontext)
+/// und *superseded-by* (älter → neuer, rückwärts). Der Kernel **verknüpft** und
+/// **traversiert** nur (§1.2/§1.3).
+///
+/// **GRENZE (§6.4/§8).** Welches Daten „aktuell" ist, entscheidet der Kernel
+/// **nicht** — „eine Version ist eine **Leseregel**" (§6.4) der Schicht darüber
+/// (§8). „Neuester Offset gewinnt" gibt es **nicht** (§Append-Order-Semantik); die
+/// Leseseite wählt aus den expliziten Ersetzungs-/Zeit-Kontexten.
+impl Datum {
+    /// Das eingefrorene **Ersetzungs**-Marker-Atom (§6.3) — ein gewöhnliches
+    /// Blatt-Daten (§2.1) mit fester atomarer Nutzlast.
+    pub fn supersession_marker() -> Self {
+        Datum::leaf(*SUPERSESSION_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt einen **Ersetzungs-Kontext** (§6.3): der Knoten
+    /// `{ supersession_marker, older }`, der das überholte (ältere) Daten mit
+    /// `ContentId` `older` benennt. Das **neuere** Daten **besitzt** diesen Kontext
+    /// (die schreibende Schicht hängt ihn an, §7.2) — so wird das Ältere als
+    /// überholt markiert, **ohne** es je zu ändern oder zu löschen (§7.1).
+    ///
+    /// Reine Struktur (§1.3); keine Wertung (§1.4). Der Kernel entscheidet **nicht**,
+    /// welches Daten „aktuell" ist (§6.4/§8).
+    pub fn supersedes(older: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::supersession_marker());
+        Datum::node([marker, older])
+            .expect("Ersetzungs-Kontext besitzt stets das Marker-Atom (§6.3)")
+    }
+
+    /// Liest aus einem **Ersetzungs-Kontext** (§6.3) die `ContentId` des überholten
+    /// (älteren) Daten, falls dieser Knoten ein Ersetzungs-Kontext ist — also exakt
+    /// `{ supersession_marker, older }` besitzt; sonst `None`. Reines strukturelles
+    /// Matching (§1.3): „besitzt der Knoten das Marker-Atom und genau ein weiteres
+    /// Daten?". Keine Wertung (§1.4); **kein** Vergleich/keine Ordnung der Daten.
+    pub fn supersedes_target(&self) -> Option<ContentId> {
+        let marker = ContentId::of_datum(&Datum::supersession_marker());
+        self.role_target(marker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +839,99 @@ mod tests {
             Datum::revocation_marker().payload(),
             Some(&b"lakearch/revocation/v1"[..])
         );
+    }
+
+    // -- Zeit: zwei Achsen (§6.1/§6.2) ---------------------------------------
+
+    #[test]
+    fn time_axis_markers_are_frozen_distinct_leaves() {
+        // §6.2: zwei eingefrorene, VERSCHIEDENE Achsen-Marker.
+        let rec = Datum::recording_time_marker();
+        let val = Datum::validity_time_marker();
+        assert!(rec.is_leaf() && val.is_leaf());
+        assert_eq!(rec.payload(), Some(&b"lakearch/recording-time/v1"[..]));
+        assert_eq!(val.payload(), Some(&b"lakearch/validity-time/v1"[..]));
+        // Die Achsen sind strukturell distinkt (verschiedene ContentIds).
+        assert_ne!(
+            ContentId::of_datum(&rec),
+            ContentId::of_datum(&val),
+            "die zwei Zeitachsen müssen unterscheidbar sein (§6.2)"
+        );
+    }
+
+    #[test]
+    fn recording_and_validity_time_read_back_their_opaque_value() {
+        // §6.1: der Zeit-Wert ist ein opakes Daten; hier nur eine Adresse.
+        let t_rec = cid(0xA1);
+        let t_val = cid(0xB2);
+        let rec_stmt = Datum::recording_time(t_rec);
+        let val_stmt = Datum::validity_time(t_val);
+        assert!(rec_stmt.is_node() && val_stmt.is_node());
+        // Reines strukturelles Ablesen (§1.3) — KEIN Parsen/Vergleichen (§1.4/§6.4).
+        assert_eq!(rec_stmt.recording_time_value(), Some(t_rec));
+        assert_eq!(val_stmt.validity_time_value(), Some(t_val));
+        // Achsen-Kreuz: eine Aufzeichnungszeit-Aussage ist KEINE Gültigkeits-Aussage.
+        assert_eq!(rec_stmt.validity_time_value(), None);
+        assert_eq!(val_stmt.recording_time_value(), None);
+    }
+
+    #[test]
+    fn one_datum_carries_both_axes_distinct_and_independent() {
+        // §6.2: ein Daten DARF beide Achsen tragen; sie dürfen auseinanderfallen.
+        // Verschiedene Zeit-Werte je Achse ⇒ verschiedene Aussage-Kontexte.
+        let t_rec = cid(0x10); // wann erfahren
+        let t_val = cid(0x20); // wann gültig (divergiert)
+        let rec_stmt = Datum::recording_time(t_rec);
+        let val_stmt = Datum::validity_time(t_val);
+        let rec_id = ContentId::of_datum(&rec_stmt);
+        let val_id = ContentId::of_datum(&val_stmt);
+        // Die zwei Aussage-Kontexte sind distinkt und unabhängig.
+        assert_ne!(rec_id, val_id, "die zwei Achsen-Aussagen sind distinkt (§6.2)");
+        // Ein Daten, das BEIDE Aussagen besitzt (plus ein Sachverhalts-Blatt).
+        let fact = ContentId::of_datum(&Datum::leaf(b"sachverhalt".to_vec()));
+        let bitemporal = Datum::node([rec_id, val_id, fact]).expect("Knoten");
+        let owns = bitemporal.owns().expect("Knoten");
+        assert!(owns.contains(&rec_id));
+        assert!(owns.contains(&val_id));
+        // Beide Achsen sind unabhängig wieder ablesbar (über die Aussage-Daten).
+        assert_eq!(rec_stmt.recording_time_value(), Some(t_rec));
+        assert_eq!(val_stmt.validity_time_value(), Some(t_val));
+        // Die divergierten Werte bleiben verschieden — der Kernel ordnet sie NICHT.
+        assert_ne!(t_rec, t_val);
+    }
+
+    // -- Ersetzung (§6.3) ----------------------------------------------------
+
+    #[test]
+    fn supersession_marker_is_a_frozen_leaf() {
+        let m = Datum::supersession_marker();
+        assert!(m.is_leaf());
+        assert_eq!(m.payload(), Some(&b"lakearch/supersedes/v1"[..]));
+    }
+
+    #[test]
+    fn supersession_links_newer_to_older_structurally() {
+        // §6.3: der Ersetzungs-Kontext zeigt vom (besitzenden) NEUEREN auf das
+        // ÄLTERE Daten — strukturell, ohne das Ältere zu ändern (§7.1).
+        let older = ContentId::of_datum(&Datum::leaf(b"alt".to_vec()));
+        let ctx = Datum::supersedes(older);
+        assert!(ctx.is_node());
+        assert_eq!(ctx.supersedes_target(), Some(older));
+
+        // Das neuere Daten BESITZT den Ersetzungs-Kontext (so wird die Kante
+        // beidseitig traversierbar — owner→contexts / target→referrers, §1.2).
+        let ctx_id = ContentId::of_datum(&ctx);
+        let fact = ContentId::of_datum(&Datum::leaf(b"neu".to_vec()));
+        let newer = Datum::node([ctx_id, fact]).expect("Knoten");
+        assert!(newer.owns().unwrap().contains(&ctx_id));
+
+        // Ein gewöhnlicher Knoten / ein Blatt ist KEIN Ersetzungs-Kontext.
+        assert_eq!(Datum::node([cid(0x07)]).unwrap().supersedes_target(), None);
+        assert_eq!(Datum::leaf([0x01]).supersedes_target(), None);
+        // Ein Knoten mit dem Marker, aber drei Kontexten (≠ 2): kein eindeutiges
+        // Ziel ⇒ None (reines Matching, keine Wertung, §1.4).
+        let marker = ContentId::of_datum(&Datum::supersession_marker());
+        let three = Datum::node([marker, cid(0x01), cid(0x02)]).unwrap();
+        assert_eq!(three.supersedes_target(), None);
     }
 }

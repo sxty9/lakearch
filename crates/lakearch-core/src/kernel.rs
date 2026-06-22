@@ -180,6 +180,130 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         Ok(Capability::issue(GrantedScopes::from_scope_ids(areas)))
     }
 
+    /// **resolve_placeholder** (§3.6 + §6.3) — die strukturelle **Auflösung** eines
+    /// Platzhalters über die öffentliche Kernel-Oberfläche: das echte Ziel `real` ist
+    /// eingetroffen und ersetzt den Platzhalter `placeholder` (append-only, §7.1).
+    ///
+    /// Delegiert an [`crate::store::ContentStore::resolve_placeholder`] (Schreib-Lock):
+    /// hängt `real` an, baut den **Ersetzungs-Kontext** [`Datum::supersedes`]`(placeholder)`
+    /// und einen Auflösungs-Knoten, der Platzhalter→real verknüpft (§6.3). Liefert
+    /// `(real_id, resolution_id)`. Der auflösende Pfad ist anschließend über
+    /// [`LakearchKernel::placeholder_resolvers_visible`] (gegatet) erreichbar.
+    ///
+    /// Der Kernel **validiert nicht** (§1.4/§7.2): er prüft **nicht**, ob `placeholder`
+    /// ein Platzhalter ist — die Geschlossenheit erzwingt die schreibende Schicht (§3.6).
+    pub fn resolve_placeholder(
+        &self,
+        placeholder: ContentId,
+        real: &Datum,
+    ) -> Result<(ContentId, ContentId), KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.resolve_placeholder(placeholder, real)
+    }
+
+    /// **Gegateter Zeit-Aussage-Lookup** (§6.1/§6.2/§11.3) — liefert die für die
+    /// `capability` **sichtbaren** Daten, die die Zeit-Aussage `statement` tragen.
+    ///
+    /// `statement` ist die `ContentId` eines **Zeit-Aussage-Kontextes**
+    /// (`{ Achsen-Marker, Zeit-Wert }`, [`Datum::recording_time`]/
+    /// [`Datum::validity_time`]). Der Lookup ist **rein strukturell** (Exakt-Match/
+    /// Mitgliedschaft, §1.3) — er **parst/ordnet/vergleicht** den opaken Zeit-Wert
+    /// **nie** (§1.4/§6.4) und ist **keine** geordnete Bereichs-Abfrage. Welche
+    /// Version zum Zeitpunkt T „gilt", ist eine Leseregel der Schicht darüber (§8).
+    ///
+    /// **Gated (§11.3):** nicht-sichtbare Träger VANISHen (sie erscheinen nicht im
+    /// Ergebnis, ununterscheidbar von „existiert nicht"). Es werden **nur**
+    /// `ContentId`s geliefert; den Inhalt legt erst das Tor frei (§11.5). Fail-closed
+    /// (§11): ein korrupter Bereichs-Index ⇒ [`KernelError::Inconsistent`] (DENY).
+    pub fn time_carriers_visible(
+        &self,
+        statement: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.time_carriers_of(statement);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// **Gegatete Ersetzungs-Traversierung — supersedes** (§6.3/§11.3): die für die
+    /// `capability` **sichtbaren** **älteren** Daten, die `newer` überholt (neuer →
+    /// älter). Reines strukturelles Folgen der Ersetzungs-Kontexte (§1.2/§1.3); der
+    /// Kernel entscheidet **nicht**, welches „aktuell" ist (§6.4/§8).
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbares älteres Daten VANISHt. Nur
+    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    pub fn supersedes_visible(
+        &self,
+        newer: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.supersedes_of(newer);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// **Gegatete Ersetzungs-Traversierung — superseded-by** (§6.3/§11.3): die für
+    /// die `capability` **sichtbaren** **neueren** Daten, die `older` überholen
+    /// (älter → neuer) — die Gegenrichtung zu [`supersedes_visible`](LakearchKernel::supersedes_visible).
+    /// So ist die Ersetzungs-Relation in **beide** Richtungen gegated traversierbar
+    /// (§1.2).
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbares überholendes Daten VANISHt — ein
+    /// nicht-sichtbares ersetzendes Daten ist damit ununterscheidbar von „es gibt
+    /// keines". Nur `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    pub fn superseded_by_visible(
+        &self,
+        older: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.superseded_by_of(older);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// **Gegatete Platzhalter-Auflösung** (§3.6/§6.3/§11.3): die für die `capability`
+    /// **sichtbaren** **echten** Daten, die `placeholder` aufgelöst haben.
+    ///
+    /// Die Auflösung ([`crate::store::ContentStore::resolve_placeholder`]) verknüpft
+    /// Platzhalter→real über einen **Ersetzungs-Kontext** (§6.3): ein Auflösungs-
+    /// Knoten `{ real, supersedes(placeholder) }` überholt den Platzhalter und
+    /// besitzt das echte Daten. Dieser Helfer folgt daher *superseded-by* vom
+    /// Platzhalter zu seinen Auflösungs-Knoten und von dort **vorwärts** zu den
+    /// echten Daten (alles strukturell, §1.2/§1.3) — der auflösende Pfad ist vom
+    /// Platzhalter aus erreichbar (geschlossener Verweis, §3.6).
+    ///
+    /// **Gated (§11.3):** sowohl der Auflösungs-Knoten als auch das echte Daten
+    /// müssen sichtbar sein; nicht-sichtbare VANISHen. Nur `ContentId`s; Inhalt nur
+    /// über das Tor (§11.5). Fail-closed (§11). Der Platzhalter selbst bleibt
+    /// append-only unverändert (§7.1) — dieser Helfer mutiert **nichts**.
+    pub fn placeholder_resolvers_visible(
+        &self,
+        placeholder: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let granted = capability.scopes().scope_ids();
+        // superseded-by(placeholder) = die (sichtbaren) Auflösungs-Knoten.
+        let resolution_nodes =
+            store.visible_filter(&store.superseded_by_of(placeholder), granted)?;
+        // Die `ContentId` des Ersetzungs-Kontextes ist strukturell bestimmt
+        // (`{ supersession_marker, placeholder }`, §6.3): das echte Daten ist der
+        // **übrige** besessene Kontext eines Auflösungs-Knotens, der genau diesen
+        // Ersetzungs-Kontext **und** das echte Daten besitzt. Reines strukturelles
+        // Aussondern (§1.3); keine Wertung (§1.4).
+        let supersedes_ctx_id = ContentId::of_datum(&Datum::supersedes(placeholder));
+        let mut reals: Vec<ContentId> = Vec::new();
+        for node in resolution_nodes {
+            for ctx in store.index().contexts_of(node)? {
+                if ctx == supersedes_ctx_id {
+                    continue; // der Ersetzungs-Kontext selbst — kein echtes Ziel.
+                }
+                reals.push(ctx);
+            }
+        }
+        store.visible_filter(&reals, granted)
+    }
+
     /// Aggregierte **Betriebs-Zähler** (§Betrieb). Liest sowohl die Store- als auch
     /// die Log-Metriken unter dem Lese-Lock zusammen.
     pub fn stats(&self) -> Result<KernelMetrics, KernelError> {
@@ -841,5 +965,196 @@ mod tests {
         // Die Rückgabeform ist in beiden Fällen IDENTISCH — kein Orakel (§11.3).
         assert!(hidden.is_none() && absent.is_none());
         assert_eq!(hidden.is_some(), absent.is_some());
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3: gegatete Ersetzungs-Traversierung in BEIDE Richtungen (§6.3) — eine
+    // Kette überlebt Reopen + Wipe-&-Rebuild und ist von beiden Enden erreichbar.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn supersession_chain_is_gated_traversable_both_directions_and_survives_rebuild() {
+        let dir = tempdir().unwrap();
+        let (v1, v2, v3);
+        {
+            let k = open_kernel(dir.path());
+            v1 = k.append(&Datum::leaf(b"v1".to_vec())).unwrap();
+            k.append(&Datum::supersession_marker()).unwrap();
+            let sup1 = k.append(&Datum::supersedes(v1)).unwrap();
+            let p2 = k.append(&Datum::leaf(b"p2".to_vec())).unwrap();
+            v2 = k.append(&Datum::node([sup1, p2]).unwrap()).unwrap();
+            let sup2 = k.append(&Datum::supersedes(v2)).unwrap();
+            let p3 = k.append(&Datum::leaf(b"p3".to_vec())).unwrap();
+            v3 = k.append(&Datum::node([sup2, p3]).unwrap()).unwrap();
+
+            // Capability für unbeschränkte Daten (keine Bereiche).
+            let snap = k.pin_snapshot().unwrap();
+            let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+            // supersedes (neuer → älter): v3→v2, v2→v1.
+            assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
+            assert_eq!(k.supersedes_visible(v2, &cap).unwrap(), vec![v1]);
+            // superseded-by (älter → neuer): v1→v2, v2→v3.
+            assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
+            assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+            // Das Älteste hat keine Vorgänger; das Neueste keine Nachfolger.
+            assert!(k.supersedes_visible(v1, &cap).unwrap().is_empty());
+            assert!(k.superseded_by_visible(v3, &cap).unwrap().is_empty());
+        }
+        // Reopen: die Ersetzungs-Indizes sind aus dem Log rekonstruiert (§8.4).
+        let k = open_kernel(dir.path());
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3: ein NICHT-SICHTBARES überholendes Daten VANISHt (§11.3) — der
+    // gegatete superseded-by-Helfer leakt es nicht.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn non_visible_superseding_datum_vanishes() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Bereich + Zugehörigkeits-Kontext für ein „geheimes" neueres Daten.
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+
+        // older ist unbeschränkt; das überholende newer gehört dem Bereich an.
+        let older = k.append(&Datum::leaf(b"old".to_vec())).unwrap();
+        k.append(&Datum::supersession_marker()).unwrap();
+        let sup = k.append(&Datum::supersedes(older)).unwrap();
+        // newer besitzt den Ersetzungs-Kontext UND den Zugehörigkeits-Kontext ⇒
+        // bereichs-beschränkt.
+        let newer = k.append(&Datum::node([sup, membership]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        // Rechtloser Leser: das überholende (geheime) Daten VANISHt.
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(
+            k.superseded_by_visible(older, &denied).unwrap().is_empty(),
+            "nicht-sichtbares überholendes Daten VANISHt (§11.3)"
+        );
+        // Mit dem Bereich wird es sichtbar.
+        let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+        assert_eq!(k.superseded_by_visible(older, &granted).unwrap(), vec![newer]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3: gegateter Zeit-Aussage-Lookup (§6.1/§6.2) liefert die Träger;
+    // nicht-sichtbare Träger VANISHen (§11.3).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn gated_time_lookup_returns_visible_carriers() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+
+        let t = k.append(&Datum::leaf(b"T".to_vec())).unwrap();
+        k.append(&Datum::recording_time_marker()).unwrap();
+        let stmt = k.append(&Datum::recording_time(t)).unwrap();
+
+        // Ein öffentlicher Träger und ein geheimer Träger derselben Zeit-Aussage.
+        let public_carrier = k.append(&Datum::node([stmt]).unwrap()).unwrap();
+        let secret_carrier = k.append(&Datum::node([stmt, membership]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        // Rechtloser Leser: nur der öffentliche Träger; der geheime VANISHt.
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert_eq!(
+            k.time_carriers_visible(stmt, &denied).unwrap(),
+            vec![public_carrier],
+            "geheimer Träger VANISHt (§11.3)"
+        );
+        // Mit dem Bereich: beide.
+        let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+        let mut both = k.time_carriers_visible(stmt, &granted).unwrap();
+        both.sort_unstable();
+        let mut expected = vec![public_carrier, secret_carrier];
+        expected.sort_unstable();
+        assert_eq!(both, expected);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3: vom Platzhalter ist das auflösende echte Daten über die gegatete
+    // Traversierung erreichbar (§3.6/§6.3); der Platzhalter bleibt unverändert.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn placeholder_resolver_is_reachable_via_gated_traversal() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Einen Platzhalter anhängen (§3.6) und dann über die öffentliche Kernel-
+        // Oberfläche auflösen (§6.3).
+        let placeholder_id = k.append(&Datum::placeholder([])).unwrap();
+        let real = Datum::leaf(b"echtes-ziel".to_vec());
+        let (real_id, _res) = k.resolve_placeholder(placeholder_id, &real).unwrap();
+        // Plausibilität: real_id ist die ContentId des echten Daten.
+        assert_eq!(real_id, ContentId::of_datum(&Datum::leaf(b"echtes-ziel".to_vec())));
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        // Vom Platzhalter zum auflösenden echten Daten (gegatet).
+        let resolvers = k.placeholder_resolvers_visible(placeholder_id, &cap).unwrap();
+        let real_id = ContentId::of_datum(&Datum::leaf(b"echtes-ziel".to_vec()));
+        assert_eq!(resolvers, vec![real_id], "Platzhalter → Auflöser erreichbar (§3.6)");
+
+        // Append-only: der Platzhalter ist über das Tor unverändert lesbar (§7.1).
+        let sealed = k.get_by_content_id(placeholder_id, &cap, snap).unwrap().unwrap();
+        let visible = open(&sealed, &cap).unwrap();
+        let decoded = strict_decode(visible.canonical_bytes()).unwrap();
+        assert!(decoded.is_placeholder(), "Platzhalter bleibt ein Platzhalter (§7.1)");
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3 / §1.4/§6.4: es gibt KEIN Kernel-Verb, das Zeit ordnet oder „die
+    // aktive" Version nach Zeit auswählt. Dieser Test friert die Negativ-Garantie
+    // ein: die Zeit-/Ersetzungs-Helfer liefern reine Mengen (Vec<ContentId>) ohne
+    // Ordnungs-/Auswahl-Semantik, und sie ignorieren die opaken Zeit-Werte.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn no_kernel_verb_orders_or_selects_by_time() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Zwei verschiedene Zeit-Werte (opak); zwei Aussagen, je ein Träger.
+        let t_early = k.append(&Datum::leaf(b"0001".to_vec())).unwrap();
+        let t_late = k.append(&Datum::leaf(b"9999".to_vec())).unwrap();
+        k.append(&Datum::recording_time_marker()).unwrap();
+        let stmt_early = k.append(&Datum::recording_time(t_early)).unwrap();
+        let stmt_late = k.append(&Datum::recording_time(t_late)).unwrap();
+        let carrier_early = k.append(&Datum::node([stmt_early]).unwrap()).unwrap();
+        let carrier_late = k.append(&Datum::node([stmt_late]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+        // Der Lookup liefert je AUSSAGE GENAU ihre Träger — er kombiniert/ordnet die
+        // beiden Zeit-Werte NICHT (kein „neuester gewinnt", kein Bereich). Es gibt
+        // keinen Verb-Aufruf der Gestalt `active_at(time) -> the_one`.
+        assert_eq!(k.time_carriers_visible(stmt_early, &cap).unwrap(), vec![carrier_early]);
+        assert_eq!(k.time_carriers_visible(stmt_late, &cap).unwrap(), vec![carrier_late]);
+
+        // Das Ergebnis ist eine Adress-sortierte Menge (deterministisch, §5.2/§1.4) —
+        // ihre Reihenfolge spiegelt die ContentId-Adressen, NICHT die Zeit-Werte:
+        // selbst wenn t_early „kleiner" als t_late ist, hängt die Lookup-Ausgabe
+        // allein an der jeweils abgefragten Aussage, nicht an einem Zeit-Vergleich.
+        // (Der Kernel besitzt keinen Pfad, der die zwei opaken Werte vergleicht.)
+        let early_addr_first = ContentId::of_datum(&Datum::leaf(b"0001".to_vec()))
+            < ContentId::of_datum(&Datum::leaf(b"9999".to_vec()));
+        // Adress-Ordnung ist von der „chronologischen" Ordnung der Bytes entkoppelt;
+        // wir belegen nur, dass kein Zeit-Vergleich stattfindet (beide Lookups sind
+        // unabhängig und je-Aussage exakt).
+        let _ = early_addr_first;
     }
 }

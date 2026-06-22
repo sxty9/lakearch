@@ -676,3 +676,104 @@ Drei blockierende Review-Findings adressiert; **alle drei warranted ⇒ behoben*
   speicher-sichere Schranke; bestehende Budget-/Knoten-Tests bleiben grün. Falls ein
   **getrenntes** Schritt-Budget (unabhängig von `max_nodes`) gewünscht ist, ist das
   eine billige additive Erweiterung der `TraversalParams` (nicht-blockierend).
+
+### Phase 3 — Bitemporal + Platzhalter (Branch `kernel-impl`)
+
+Zeit als Daten (§6), der Ersetzungs-Kontext (§6.3) und die volle Platzhalter-
+Behandlung (§3.6). **Die spec-kritische Grenze: „Zeit speichern + indizieren,
+NIE ordnen/vergleichen."** **Grün:** `cargo build --all-targets`, `cargo test`
+(158 lib + 12 Kanonik + 10 Kernel-E2E + 5 Store = **185 Tests**),
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Zeit IST Daten (§6.1), rein strukturelle Konvention (§1.3) — `model.rs`:**
+  Zeitpunkte/Zeiträume sind **gewöhnliche** Daten; eine **Zeit-Aussage** ist ein
+  **besonderer Kontext** `{ Achsen-Marker, opaker Zeit-Wert }` (analog zur
+  Zugehörigkeit §11.1 und zum Ersetzungs-Kontext §6.3). Der **Zeit-Wert** ist ein
+  **opakes** Daten (z. B. ein Blatt mit den Zeit-Bytes); der Kernel sieht ihn als
+  Bytes (§1.4) und **parst/ordnet/vergleicht ihn nie**.
+- **Zwei eingefrorene, VERSCHIEDENE Achsen-Marker (§6.2)** — analog zu allen
+  bestehenden Marker-Atomen (Platzhalter §3.6, Bereichs-Zugehörigkeit §11.1,
+  Berechtigung/Entzug §11.1/§11.4), **versioniert**, **niemals ändern** (verschöbe
+  alle Aussagen): `lakearch/recording-time/v1` (Aufzeichnungszeit, 26 Byte ASCII) und
+  `lakearch/validity-time/v1` (Gültigkeitszeit, 25 Byte ASCII). Bewusst distinkt ⇒
+  die zwei Achsen sind strukturell unterscheidbar (verschiedene Kontext-`ContentId`s);
+  ein Daten **darf beide** tragen, sie **dürfen auseinanderfallen** (§6.2). Methoden
+  `Datum::recording_time(value)`/`validity_time(value)` (Aussage bauen) und
+  `recording_time_value()`/`validity_time_value()` (strukturell ablesen, nur die
+  Adresse — kein Parsen/Vergleichen).
+- **Ersetzungs-Marker eingefroren (§6.3):** `lakearch/supersedes/v1` (22 Byte ASCII).
+  Ein **Ersetzungs-Kontext** ist der Knoten `{ supersedes-Marker, älteres }`, der auf
+  die `ContentId` des überholten ÄLTEREN zeigt; das **NEUERE** Daten **besitzt** diesen
+  Kontext. Append-only — das Ältere wird **nie** geändert/gelöscht (§7.1).
+  `Datum::supersedes(older)` / `supersedes_target()`.
+- **HARTE GRENZE (§1.4/§6.4/§8.2) — im Code festgehalten:** der Kernel stellt
+  **ausschließlich** bereit: Zeit **als Daten speichern**, Zeit-Aussage-Kontexte für
+  **strukturellen LOOKUP** indizieren (Exakt-Match/Mitgliedschaft §1.3, **KEINE**
+  geordnete Bereichs-Abfrage) und **strukturell traversieren**. Es gibt **kein** Verb,
+  das eine Zeit entgegennimmt und „die aktive" zurückgibt; **keine** Funktion
+  vergleicht zwei Zeit-Werte. „Eine Version ist eine **Leseregel**" (§6.4) der Schicht
+  darüber (§8). Negativ-Test `no_kernel_verb_orders_or_selects_by_time` friert die
+  Garantie ein.
+- **Zwei weitere reine, neu-baubare in-memory Derivate (§8.4) — `store.rs`** (genau
+  wie Bereichs-/Berechtigungs-/Entzugs-Index, beim Öffnen aus dem Log rekonstruiert
+  und in `rebuild_index_from_log` mit-gewipt/-neu-gebaut):
+  - **Zeit-Aussage-Mitgliedschafts-Index** `time_carriers: Zeit-Aussage-Kontext-ID →
+    { Daten, die ihn tragen }` — beantwortet **nur** „welche Daten tragen GENAU diese
+    Aussage?" (Mitgliedschaft §1.3), **nicht** „T zwischen A und B" (das wäre Ordnung →
+    §1.4-Verstoß).
+  - **Ersetzungs-Index in BEIDE Richtungen** `supersedes: neuer → { ältere }` und
+    `superseded_by: älter → { neuere }` ⇒ die Ersetzungs-Relation ist vor- **und**
+    rückwärts traversierbar (§1.2). Der Kernel **verknüpft und indiziert** nur — er
+    **ordnet nicht** und entscheidet **nicht**, welches „aktuell" ist (§6.4/§8);
+    „neuester Offset gewinnt" gibt es **nicht** (§Append-Order-Semantik;
+    reihenfolge-unabhängig getestet).
+  - **Designwahl:** bewusst **nicht** in die redb-`EdgeIndex`-Engine/das Schema
+    gegossen (wie schon der Bereichs-/Berechtigungs-Index) — klein, schnell aus dem
+    Log rekonstruierbar, hält die Engine-Abstraktion schmal. Verlagerung in einen
+    persistenten Index ist eine billige spätere Änderung (Log = Wahrheit). Beachte:
+    die Ersetzungs-/Zeit-**Kanten** existieren ohnehin als gewöhnliche redb-Kanten
+    (`owner→contexts`/`target→referrers`), sodass die rohe Vor-/Rückwärts-Traversierung
+    auch ohne diese Komfort-Indizes möglich ist; die in-memory Karten sind nur der
+    direkte Mitgliedschafts-/Richtungs-Lookup.
+- **Volle Platzhalter-Behandlung (§3.6) — `ContentStore::resolve_placeholder` /
+  `LakearchKernel::resolve_placeholder`:** die strukturelle **Auflösung**. Trifft das
+  echte Ziel ein, (1) wird es angehängt (Dedup §5.3), (2) ein Ersetzungs-Kontext
+  `supersedes(placeholder)` gebaut + angehängt, (3) ein Auflösungs-Knoten
+  `{ real, supersedes_ctx }` angehängt, der Platzhalter→real über den Ersetzungs-
+  Kontext verknüpft (§6.3). **Append-only:** der Platzhalter wird **nie** geändert/
+  gelöscht (§7.1) und bleibt unverändert über das Tor lesbar. Der auflösende Pfad ist
+  vom Platzhalter aus über die bestehenden Kanten-Indizes erreichbar
+  (`superseded_by` → Auflösungs-Knoten → vorwärts zum echten Daten). Der Kernel
+  **validiert keine Geschlossenheit** (§1.4/§7.2) — er prüft **nicht**, ob `placeholder`
+  ein Platzhalter ist; er stellt nur die **Primitive** (Platzhalter + Auflösung +
+  Traversierung Platzhalter→Auflöser).
+- **Gegatete Lese-Helfer (§11.3) — `kernel.rs`:** `time_carriers_visible`,
+  `supersedes_visible`, `superseded_by_visible`, `placeholder_resolvers_visible`. Alle
+  reichen **nur** für die Capability **sichtbare** `ContentId`s heraus (VANISH:
+  nicht-sichtbares/nicht-vorhandenes Daten ununterscheidbar weg, §11.3) und
+  **materialisieren keinen Inhalt** (den legt erst das Tor frei, §11.5). Gemeinsamer
+  Pfad `ContentStore::visible_filter` (VANISH + fail-closed §11 bei korruptem
+  Bereichs-Index). Keine Capability-tragende Trait-Form nötig — diese Phase-3-Verben
+  sind **konkrete** `LakearchKernel`-Methoden (wie `traverse_with`/`authorize_subject`
+  in Phase 2), die eingefrorene Phase-0.5-Trait-Form bleibt unangetastet.
+- **`#![forbid(unsafe_code)]`** bleibt auf `model.rs`/`store.rs`/`kernel.rs`/
+  `gate.rs`/`traverse.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`.
+
+**Neue Tests (Phase 3, alle grün):** Marker-Atome eingefroren + distinkt; beide
+Achsen lesbar + Achsen-Kreuz (eine Aufzeichnungszeit ist keine Gültigkeitszeit);
+ein Daten trägt beide Achsen divergent; Ersetzungs-Kontext verknüpft neuer→älter
+strukturell; Zeit-Achsen als gewöhnliche Kanten; Zeit-Mitgliedschafts-Lookup liefert
+Träger (keine Ordnung); Ersetzungs-Index beide Richtungen + Kette; Platzhalter
+auflösbar + beidseitig traversierbar + append-only unverändert; **Wipe-&-Rebuild +
+Reopen identisch** für Zeit-/Ersetzungs-Index (§8.4); gegatete Helfer mit VANISH
+(geheimer Träger/überholendes Daten VANISHt); Negativ-Garantie „kein Verb ordnet/
+wählt nach Zeit"; öffentliche E2E-Tests für Ersetzungs-Kette, Zeit-Lookup und
+Platzhalter-Auflösung über die `pub`-API.
+
+**Vertagte, nicht-blockierende Punkte (Phase 3+):**
+- **§13-Aktiv-Marker / volle Snapshot-Epoche:** der `SnapshotToken` pinnt weiterhin
+  nur die committete Watermark `W`; die volle „strukturell-aktiv-im-Snapshot"-Semantik
+  (§13) bleibt **Phase 5**. Die Zeit-/Ersetzungs-Lookups sind davon unberührt (rein
+  strukturell, snapshot-agnostisch in dieser Phase).
+- **Anker / referenzielle Identität (§9):** Phase 4 — die Phase-3-Ersetzung (§6.3) ist
+  davon getrennt (Fortschreibung §5.7 a vs. Repräsentantensystem §9).

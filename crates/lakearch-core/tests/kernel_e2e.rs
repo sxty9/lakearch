@@ -234,3 +234,124 @@ fn gated_traverse_over_public_api() {
     expected.sort();
     assert_eq!(tos, expected, "Forward-Nachbarn von A, aufsteigend (§5.2/§1.4)");
 }
+
+/// §6.3: eine Ersetzungs-Kette ist über die öffentliche Oberfläche in BEIDE
+/// Richtungen gegated traversierbar (supersedes / superseded-by) und überlebt einen
+/// Reopen (reines Derivat aus dem Log, §8.4). Der Kernel verknüpft nur — er ordnet
+/// die Versionen NICHT (§6.4/§8): das Ergebnis ist je Knoten eine reine Menge.
+#[test]
+fn supersession_chain_traversable_both_directions_over_public_api() {
+    let dir = tempdir().unwrap();
+    let (v1, v2, v3);
+    {
+        let k = LakearchKernel::open(dir.path()).expect("open kernel");
+        v1 = k.append(&Datum::leaf(b"v1".to_vec())).unwrap();
+        k.append(&Datum::supersession_marker()).unwrap();
+        let sup1 = k.append(&Datum::supersedes(v1)).unwrap();
+        let p2 = k.append(&Datum::leaf(b"p2".to_vec())).unwrap();
+        v2 = k.append(&Datum::node([sup1, p2]).unwrap()).unwrap();
+        let sup2 = k.append(&Datum::supersedes(v2)).unwrap();
+        let p3 = k.append(&Datum::leaf(b"p3".to_vec())).unwrap();
+        v3 = k.append(&Datum::node([sup2, p3]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        // Vorwärts (neuer→älter) und rückwärts (älter→neuer).
+        assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+    }
+    // Reopen: die Indizes sind aus dem Log rekonstruiert (§8.4).
+    let k = LakearchKernel::open(dir.path()).expect("reopen kernel");
+    let snap = k.pin_snapshot().unwrap();
+    let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+    assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
+    assert_eq!(k.supersedes_visible(v2, &cap).unwrap(), vec![v1]);
+    assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
+    assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+}
+
+/// §11.3 VANISH über die öffentliche Oberfläche: ein NICHT-SICHTBARES überholendes
+/// Daten erscheint nicht im gegateten superseded-by-Ergebnis (ununterscheidbar von
+/// „es gibt kein überholendes Daten").
+#[test]
+fn non_visible_superseding_datum_vanishes_over_public_api() {
+    let dir = tempdir().unwrap();
+    let k = LakearchKernel::open(dir.path()).expect("open kernel");
+
+    let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+    let _am = k.append(&Datum::area_membership_marker()).unwrap();
+    let membership = k.append(&Datum::area_membership(area)).unwrap();
+
+    let older = k.append(&Datum::leaf(b"old".to_vec())).unwrap();
+    k.append(&Datum::supersession_marker()).unwrap();
+    let sup = k.append(&Datum::supersedes(older)).unwrap();
+    // Das überholende Daten gehört dem Bereich an (beschränkt).
+    let newer = k.append(&Datum::node([sup, membership]).unwrap()).unwrap();
+
+    let snap = k.pin_snapshot().unwrap();
+    let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+    assert!(
+        k.superseded_by_visible(older, &denied).unwrap().is_empty(),
+        "nicht-sichtbares überholendes Daten VANISHt (§11.3)"
+    );
+    let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+    assert_eq!(k.superseded_by_visible(older, &granted).unwrap(), vec![newer]);
+}
+
+/// §6.1/§6.2: der gegatete Zeit-Aussage-Lookup liefert über die öffentliche
+/// Oberfläche die Träger einer Zeit-Aussage (Exakt-Match/Mitgliedschaft, §1.3) —
+/// nicht-sichtbare Träger VANISHen (§11.3). Es ist KEINE geordnete Bereichs-Abfrage.
+#[test]
+fn time_statement_lookup_over_public_api() {
+    let dir = tempdir().unwrap();
+    let k = LakearchKernel::open(dir.path()).expect("open kernel");
+
+    let t = k.append(&Datum::leaf(b"2026-06-22".to_vec())).unwrap();
+    k.append(&Datum::recording_time_marker()).unwrap();
+    let stmt = k.append(&Datum::recording_time(t)).unwrap();
+    let carrier = k.append(&Datum::node([stmt]).unwrap()).unwrap();
+
+    let snap = k.pin_snapshot().unwrap();
+    let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+    assert_eq!(
+        k.time_carriers_visible(stmt, &cap).unwrap(),
+        vec![carrier],
+        "der Träger der Zeit-Aussage wird strukturell gefunden (§1.3)"
+    );
+    // Eine nie getragene Aussage ⇒ leer (kein „nächstgelegener Zeitpunkt", §6.4).
+    let other_stmt = ContentId::of_datum(&Datum::validity_time(t));
+    assert!(k.time_carriers_visible(other_stmt, &cap).unwrap().is_empty());
+}
+
+/// §3.6 + §6.3: ein Platzhalter wird über die öffentliche Oberfläche aufgelöst, und
+/// das auflösende echte Daten ist vom Platzhalter aus gegated erreichbar. Der
+/// Platzhalter bleibt append-only unverändert lesbar (§7.1).
+#[test]
+fn placeholder_resolution_reachable_over_public_api() {
+    let dir = tempdir().unwrap();
+    let k = LakearchKernel::open(dir.path()).expect("open kernel");
+
+    let placeholder_id = k.append(&Datum::placeholder([])).unwrap();
+    let real = Datum::leaf(b"das-echte-ziel".to_vec());
+    let (real_id, _resolution_id) = k.resolve_placeholder(placeholder_id, &real).unwrap();
+
+    let snap = k.pin_snapshot().unwrap();
+    let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+    // Platzhalter → Auflöser (gegatet).
+    assert_eq!(
+        k.placeholder_resolvers_visible(placeholder_id, &cap).unwrap(),
+        vec![real_id],
+        "der Platzhalter führt zum auflösenden echten Daten (§3.6/§6.3)"
+    );
+
+    // §7.1: der Platzhalter ist über das Tor unverändert lesbar.
+    let sealed = k
+        .get_by_content_id(placeholder_id, &cap, snap)
+        .unwrap()
+        .expect("Platzhalter durabel");
+    let visible = open(&sealed, &cap).unwrap();
+    let decoded = lakearch_core::strict_decode(visible.canonical_bytes()).unwrap();
+    assert!(decoded.is_placeholder(), "Platzhalter bleibt ein Platzhalter (§7.1)");
+}

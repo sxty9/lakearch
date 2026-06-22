@@ -104,6 +104,29 @@ pub struct ContentStore<I: EdgeIndex> {
     /// Eine Berechtigung ist **aktiv** (für das Tor wirksam), wenn sie hier **nicht**
     /// enthalten ist (strukturell-aktiv-im-Snapshot, §11.5).
     revoked: HashSet<ContentId>,
+    /// In-memory **Zeit-Aussage-Mitgliedschafts-Index** (§6.1/§6.2):
+    /// `Zeit-Aussage-Kontext-ContentId → { Daten, die diesen Kontext tragen }`. Der
+    /// Schlüssel ist die `ContentId` eines **Zeit-Aussage-Kontextes**
+    /// (`{ Achsen-Marker, Zeit-Wert }`, [`Datum::recording_time`]/
+    /// [`Datum::validity_time`]); der Wert sind die Daten, die ihn als besessenen
+    /// Kontext **tragen**. Das erlaubt den **strukturellen LOOKUP** (Exakt-Match/
+    /// Mitgliedschaft, §1.3): „welche Daten tragen diese Zeit-Aussage?" — **ohne**
+    /// den opaken Zeit-Wert je zu parsen/ordnen/vergleichen (§1.4/§6.4). Reines,
+    /// neu-baubares Derivat aus dem Log (§8.4). **Keine** geordnete Bereichs-Abfrage:
+    /// der Index kennt nur Mengen-Zugehörigkeit, **kein** „T liegt zwischen A und B"
+    /// (das wäre Ordnung → §1.4-Verstoß; es ist eine Leseregel der Schicht darüber,
+    /// §6.4/§8).
+    time_carriers: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Ersetzungs-Index — Vorwärts** (§6.3): `neueres Daten → { ältere
+    /// Daten, die es überholt }`. Ein Daten N überholt O, wenn N einen **Ersetzungs-
+    /// Kontext** `{ supersession_marker, O }` ([`Datum::supersedes`]) besitzt. Reines,
+    /// neu-baubares Derivat (§8.4) — *supersedes* (neuer → älter).
+    supersedes: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Ersetzungs-Index — Rückwärts** (§6.3): `älteres Daten → { neuere
+    /// Daten, die es überholen }`. Die Umkehrung von [`supersedes`](ContentStore::supersedes)
+    /// — *superseded-by* (älter → neuer). Damit ist die Ersetzungs-Relation in
+    /// **beide** Richtungen traversierbar (§1.2). Reines, neu-baubares Derivat (§8.4).
+    superseded_by: HashMap<ContentId, Vec<ContentId>>,
     /// Betriebs-Zähler (§Betrieb).
     metrics: StoreMetrics,
     /// **Fail-closed-Zähler** als Atomic (§11): er wird auch auf `&self`-Lese-/
@@ -124,12 +147,16 @@ impl<I: EdgeIndex> ContentStore<I> {
             areas: HashMap::new(),
             permissions: HashMap::new(),
             revoked: HashSet::new(),
+            time_carriers: HashMap::new(),
+            supersedes: HashMap::new(),
+            superseded_by: HashMap::new(),
             metrics: StoreMetrics::default(),
             fail_closed: AtomicU64::new(0),
         };
         store.rebuild_dedup_from_log()?;
         store.rebuild_areas_from_log()?;
         store.rebuild_permissions_from_log()?;
+        store.rebuild_time_and_supersession_from_log()?;
         store.reconcile_index_with_log()?;
         Ok(store)
     }
@@ -179,8 +206,52 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.index_area_memberships_of(id, datum)?;
         // Berechtigungs-/Entzugs-Index (§11.1/§11.4) nachziehen.
         self.index_permission_or_revocation_of(id, datum)?;
+        // Zeit-Aussage-Mitgliedschafts- und Ersetzungs-Index (§6.1–§6.3) nachziehen.
+        self.index_time_and_supersession_of(id, datum)?;
 
         Ok(id)
+    }
+
+    /// **resolve_placeholder** (§3.6 + §6.3) — die strukturelle **Auflösung** eines
+    /// Platzhalters: das echte Ziel ist eingetroffen.
+    ///
+    /// Ein Verweis zeigt **stets auf ein vorhandenes Daten**; ein noch nicht
+    /// eingetroffenes Ziel ist ein **Platzhalter-Daten** ([`Datum::placeholder`],
+    /// §3.6). Trifft das echte Daten ein, **ersetzt** es den Platzhalter (§6.3):
+    /// diese Operation
+    ///
+    /// 1. hängt das echte Daten `real` an (§7.1, Dedup §5.3) → `real_id`,
+    /// 2. baut den **Ersetzungs-Kontext** [`Datum::supersedes`]`(placeholder)`
+    ///    (zeigt auf den älteren Platzhalter) und hängt ihn an,
+    /// 3. hängt einen **Auflösungs-Knoten** `{ real_id, supersedes_ctx }` an, der den
+    ///    Platzhalter (älter) per Ersetzungs-Kontext mit dem echten Daten (neuer)
+    ///    **verknüpft** (§6.3) — append-only, der Platzhalter wird **nie** geändert
+    ///    oder gelöscht (§7.1).
+    ///
+    /// So ist der Verweis **geschlossen**: vom Platzhalter ist über die bestehenden
+    /// Indizes (`target→referrers` rückwärts: Platzhalter → Ersetzungs-Kontext →
+    /// Auflösungs-Knoten → `real`; §1.2/§10.3) das auflösende echte Daten
+    /// traversierbar, und vorwärts (`owner→contexts`) der umgekehrte Weg.
+    ///
+    /// Liefert `(real_id, resolution_id)`. Der Kernel **validiert nicht** (§1.4/§7.2):
+    /// er prüft **nicht**, ob `placeholder` tatsächlich ein Platzhalter ist oder
+    /// durabel vorliegt — die Geschlossenheit erzwingt die **schreibende Schicht**
+    /// (§3.6). Er **verknüpft und traversiert** nur (§1.2/§1.3); welches Daten
+    /// „aktuell" ist, ist eine Leseregel der Schicht darüber (§6.4/§8).
+    pub fn resolve_placeholder(
+        &mut self,
+        placeholder: ContentId,
+        real: &Datum,
+    ) -> Result<(ContentId, ContentId), KernelError> {
+        let real_id = self.append_datum(real)?;
+        let supersedes_ctx = Datum::supersedes(placeholder);
+        let supersedes_ctx_id = self.append_datum(&supersedes_ctx)?;
+        // Der Auflösungs-Knoten besitzt das echte Daten UND den Ersetzungs-Kontext;
+        // `node` kanonisiert (sortiert/dedupliziert, §K2.3).
+        let resolution = Datum::node([real_id, supersedes_ctx_id])
+            .ok_or(KernelError::Inconsistent)?;
+        let resolution_id = self.append_datum(&resolution)?;
+        Ok((real_id, resolution_id))
     }
 
     /// **get_canonical_bytes** (§5.2-Fetch, **un-gated**) — liefert die **kanonischen
@@ -360,6 +431,73 @@ impl<I: EdgeIndex> ContentStore<I> {
         areas
     }
 
+    /// Die **Daten, die eine bestimmte Zeit-Aussage tragen** (§6.1/§6.2) — reiner
+    /// **struktureller LOOKUP** (Exakt-Match/Mitgliedschaft, §1.3). `statement` ist
+    /// die `ContentId` eines **Zeit-Aussage-Kontextes** (`{ Achsen-Marker, Zeit-Wert }`,
+    /// [`Datum::recording_time`]/[`Datum::validity_time`]); zurück kommen die Daten,
+    /// die diesen Kontext besitzen — owned, aufsteigend in 32-Byte-`ContentId`-Order
+    /// (deterministisch, **kein** Wert-Sort §1.4).
+    ///
+    /// Der Kernel **parst/ordnet/vergleicht** den opaken Zeit-Wert **nicht**
+    /// (§1.4/§6.4): dies ist **keine** geordnete Bereichs-Abfrage („T zwischen A und
+    /// B"), sondern reine Mengen-Zugehörigkeit zu **genau** dieser Aussage. „Welche
+    /// Version gilt zum Zeitpunkt T" ist eine Leseregel der Schicht darüber (§6.4/§8).
+    ///
+    /// **Ungated** (`pub(crate)`): die Sichtbarkeit (VANISH) setzt die gegatete
+    /// Kernel-Schicht durch ([`crate::kernel::LakearchKernel::time_carriers_visible`]),
+    /// nicht dieser rohe Index-Lookup.
+    pub(crate) fn time_carriers_of(&self, statement: ContentId) -> Vec<ContentId> {
+        self.time_carriers.get(&statement).cloned().unwrap_or_default()
+    }
+
+    /// Die **älteren Daten, die `newer` überholt** (§6.3) — *supersedes* (neuer →
+    /// älter). `newer` besitzt je einen Ersetzungs-Kontext, der auf ein überholtes
+    /// `older` zeigt. Owned, aufsteigend in 32-Byte-`ContentId`-Order (kein
+    /// Wert-Sort §1.4). Reines strukturelles Lesen (§1.3); der Kernel entscheidet
+    /// **nicht**, welches „aktuell" ist (§6.4/§8). **Ungated** (`pub(crate)`).
+    pub(crate) fn supersedes_of(&self, newer: ContentId) -> Vec<ContentId> {
+        self.supersedes.get(&newer).cloned().unwrap_or_default()
+    }
+
+    /// Die **neueren Daten, die `older` überholen** (§6.3) — *superseded-by* (älter →
+    /// neuer), die Umkehrung von [`supersedes_of`](ContentStore::supersedes_of). So
+    /// ist die Ersetzungs-Relation in **beide** Richtungen traversierbar (§1.2).
+    /// Owned, aufsteigend (kein Wert-Sort §1.4). **Ungated** (`pub(crate)`).
+    pub(crate) fn superseded_by_of(&self, older: ContentId) -> Vec<ContentId> {
+        self.superseded_by.get(&older).cloned().unwrap_or_default()
+    }
+
+    /// **Sichtbarkeits-geprüfte** Variante eines Lookup-Ergebnisses (§11.3): filtert
+    /// die Kandidaten-IDs auf die für `granted` **sichtbaren** (VANISH). Ein nicht
+    /// vorhandenes Daten ist ununterscheidbar verborgen (§3.6/§11.3). Fail-closed
+    /// (§11): ein korrupter Bereichs-Index ⇒ [`KernelError::Inconsistent`] (DENY).
+    ///
+    /// Das ist der **gegatete** Pfad für die Zeit-/Ersetzungs-Lookups: er reicht
+    /// **nur** sichtbare `ContentId`s heraus, materialisiert aber **keinen** Inhalt
+    /// (den legt erst das Tor frei, §11.5). Owned, aufsteigend (kein Wert-Sort §1.4).
+    pub fn visible_filter(
+        &self,
+        candidates: &[ContentId],
+        granted: &[ContentId],
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let mut out = Vec::new();
+        for &id in candidates {
+            // VANISH: ein nicht vorhandenes Daten ist kein sichtbarer Knoten.
+            if !self.contains(id) {
+                continue;
+            }
+            // Fail-closed (§11): Bereiche gegen die durable Wahrheit geprüft.
+            let areas = self.areas_of_checked(id)?;
+            if crate::gate::is_visible(&areas, granted) {
+                out.push(id);
+            }
+        }
+        // Der Index liefert bereits aufsteigend; defensiv erzwingen wir es (§5.2/§1.4).
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
     /// `true`, wenn die `ContentId` durabel im Store vorhanden ist (§5.2). Reines
     /// Adress-Matching (§1.3); keine Wertung.
     pub fn contains(&self, id: ContentId) -> bool {
@@ -412,6 +550,13 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// Der Neu-Bau ist der Beleg dafür, dass der Index ein **reines Derivat** ist:
     /// ein gewipter, neu gebauter Index hat **denselben** Inhalt wie der zuvor
     /// inkrementell gepflegte (Test `wipe_and_rebuild_is_identical`).
+    ///
+    /// **Mit-Neu-Bau aller reinen Derivate (§8.4).** Neben den persistenten redb-
+    /// Kanten werden auch die in-memory Derivate (Bereichs-, Berechtigungs-/Entzugs-,
+    /// **Zeit-Aussage-Mitgliedschafts-** und **Ersetzungs-Index**) verworfen und aus
+    /// dem Log neu gebaut — so ist „wipe & rebuild" für **alle** Derivate identisch
+    /// (operationalisiert „Log = alleinige Wahrheit"). Die Dedup-Karte bleibt
+    /// unangetastet (sie ist die Offset-Auflösung, die der Neu-Bau selbst nutzt).
     pub fn rebuild_index_from_log(&mut self) -> Result<(), KernelError> {
         self.index.wipe()?;
         let records = self.log.read_all()?;
@@ -428,6 +573,11 @@ impl<I: EdgeIndex> ContentStore<I> {
         // edge_count zählt nur inkrementelle Appends; ein Rebuild setzt ihn nicht
         // zurück (Mechanik-Zähler, §1.4) — wir vermerken die neu committeten Kanten.
         self.metrics.edge_count = self.metrics.edge_count.saturating_add(edges.len() as u64);
+        // Auch die in-memory Derivate verwerfen und aus dem Log neu bauen (§8.4):
+        // Bereichs-, Berechtigungs-/Entzugs-, Zeit-Aussage- und Ersetzungs-Index.
+        self.rebuild_areas_from_log()?;
+        self.rebuild_permissions_from_log()?;
+        self.rebuild_time_and_supersession_from_log()?;
         Ok(())
     }
 
@@ -577,6 +727,74 @@ impl<I: EdgeIndex> ContentStore<I> {
         Ok(())
     }
 
+    /// Baut den in-memory **Zeit-Aussage-Mitgliedschafts-Index** und **beide
+    /// Richtungen des Ersetzungs-Index** (§6.1–§6.3) vollständig aus dem Log neu
+    /// (§8.4: Log = Wahrheit). Idempotent. Setzt voraus, dass die Dedup-Karte bereits
+    /// gebaut ist (sie löst die besessenen Kontexte zu deren Inhalt auf).
+    fn rebuild_time_and_supersession_from_log(&mut self) -> Result<(), KernelError> {
+        self.time_carriers.clear();
+        self.supersedes.clear();
+        self.superseded_by.clear();
+        let records = self.log.read_all()?;
+        for rec in &records {
+            let datum = strict_decode(&rec.payload)?;
+            let id = ContentId::of_datum(&datum);
+            self.index_time_and_supersession_of(id, &datum)?;
+        }
+        Ok(())
+    }
+
+    /// Trägt die **Zeit-Aussagen** (§6.1/§6.2) und **Ersetzungs-Verknüpfungen**
+    /// (§6.3) eines Daten `id` (mit Inhalt `datum`) in die jeweiligen Indizes ein —
+    /// rein **mechanisch** (§1.4): für jeden besessenen Kontext `K` wird `K`s durabler
+    /// Inhalt aufgelöst; ist `K`
+    ///
+    /// - eine **Zeit-Aussage** (`{ Achsen-Marker, Zeit-Wert }`,
+    ///   [`Datum::recording_time_value`]/[`Datum::validity_time_value`]), trägt `id`
+    ///   diese Zeit-Aussage → `time_carriers[K]` += `id` (Mitgliedschafts-Lookup,
+    ///   §1.3); der opake Zeit-Wert wird **nie** geparst/geordnet (§1.4/§6.4).
+    /// - ein **Ersetzungs-Kontext** (`{ supersession_marker, O }`,
+    ///   [`Datum::supersedes_target`]), so überholt `id` (das **neuere**) das benannte
+    ///   `O` (das **ältere**, §6.3) → `supersedes[id]` += `O` **und**
+    ///   `superseded_by[O]` += `id` (beide Richtungen traversierbar, §1.2).
+    ///
+    /// Ein Blatt oder ein Knoten ohne solche Kontexte trägt nichts ein. Ein noch
+    /// nicht vorhandener Kontext (Geschlossenheit erzwingt die schreibende Schicht,
+    /// §3.6/§7.2) wird übersprungen — der Kernel **validiert nicht** (§1.4). Die
+    /// eingetragenen Listen sind aufsteigend sortiert + dedupliziert (deterministisch,
+    /// kein Wert-Sort §1.4). Der Kernel entscheidet **nicht**, welches Daten „aktuell"
+    /// ist (§6.4/§8) — er **verknüpft und indiziert** nur.
+    fn index_time_and_supersession_of(
+        &mut self,
+        id: ContentId,
+        datum: &Datum,
+    ) -> Result<(), KernelError> {
+        let owns = match datum.owns() {
+            Some(o) => o,
+            None => return Ok(()), // Blatt: keine Kontexte.
+        };
+        for ctx_id in owns {
+            // Den besessenen Kontext auflösen; fehlt er (§3.6 Schreibschicht),
+            // überspringen — keine Wertung (§1.4).
+            let bytes = match self.get_canonical_bytes(*ctx_id)? {
+                Some(b) => b,
+                None => continue,
+            };
+            let ctx = strict_decode(&bytes)?;
+            // Zeit-Aussage (beide Achsen sind strukturell distinkt, §6.2): trägt der
+            // Kontext eine Achsen-Aussage, ist `id` ein Träger dieser Aussage.
+            if ctx.recording_time_value().is_some() || ctx.validity_time_value().is_some() {
+                push_sorted_dedup(self.time_carriers.entry(*ctx_id).or_default(), id);
+            }
+            // Ersetzungs-Kontext (§6.3): `id` (neuer) überholt das benannte `older`.
+            if let Some(older) = ctx.supersedes_target() {
+                push_sorted_dedup(self.supersedes.entry(id).or_default(), older);
+                push_sorted_dedup(self.superseded_by.entry(older).or_default(), id);
+            }
+        }
+        Ok(())
+    }
+
     /// **Versöhnt** den Index mit dem durablen Log-Tail (§8.4-Recovery-
     /// Reconciliation). Watermark `W` vs. committed Log-Offset `T`:
     /// - `W == T` ⇒ in sync, nichts zu tun.
@@ -608,6 +826,16 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.index.commit_edges(&edges, t)?;
         self.metrics.edge_count = self.metrics.edge_count.saturating_add(edges.len() as u64);
         Ok(())
+    }
+}
+
+/// Fügt `id` in eine aufsteigend sortierte, duplikat-freie `ContentId`-Liste ein
+/// (Adress-Order, **kein** Wert-Sort §1.4) — die Invariante der in-memory
+/// Lookup-Indizes (deterministischer, föderationsstabiler Tiebreak; §5.2). Ein
+/// bereits vorhandenes `id` lässt die Liste unverändert (Mengen-Semantik).
+fn push_sorted_dedup(list: &mut Vec<ContentId>, id: ContentId) {
+    if let Err(pos) = list.binary_search(&id) {
+        list.insert(pos, id);
     }
 }
 
@@ -1045,5 +1273,242 @@ mod tests {
         assert!(store.index().contexts_of(id).unwrap().is_empty());
         assert!(store.index().referrers_of(id).unwrap().is_empty());
         assert_eq!(store.metrics().edge_count, 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Platzhalter-Auflösung (§3.6 + §6.3): das echte Daten ersetzt den
+    // Platzhalter; die Verknüpfung Platzhalter↔real ist über die bestehenden
+    // Indizes in BEIDE Richtungen traversierbar (append-only, der Platzhalter
+    // bleibt unverändert lesbar, §7.1).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn placeholder_is_resolvable_and_traversable_both_directions() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Ein Platzhalter wird angehängt (er ist als unaufgelöst markiert, §3.6).
+        let placeholder = Datum::placeholder([]);
+        let placeholder_id = store.append_datum(&placeholder).unwrap();
+        // Der Platzhalter ist strukturell als solcher erkennbar.
+        assert!(store
+            .get_by_content_id(placeholder_id)
+            .unwrap()
+            .unwrap()
+            .is_placeholder());
+
+        // Das echte Ziel trifft ein und löst den Platzhalter auf (§6.3).
+        let real = Datum::leaf(b"echtes-ziel".to_vec());
+        let (real_id, resolution_id) =
+            store.resolve_placeholder(placeholder_id, &real).unwrap();
+        assert_eq!(real_id, ContentId::of_datum(&real));
+
+        // Append-only: der Platzhalter ist NIE geändert/gelöscht (§7.1) — weiterhin
+        // unverändert lesbar.
+        assert_eq!(
+            store.get_by_content_id(placeholder_id).unwrap(),
+            Some(placeholder)
+        );
+
+        // Der Ersetzungs-Kontext zeigt vom Auflösungs-Knoten auf den Platzhalter.
+        let supersedes_ctx = Datum::supersedes(placeholder_id);
+        let supersedes_ctx_id = ContentId::of_datum(&supersedes_ctx);
+        let supersession_marker_id = ContentId::of_datum(&Datum::supersession_marker());
+        // Der Ersetzungs-Kontext liest strukturell den Platzhalter (das ÄLTERE) ab.
+        assert_eq!(supersedes_ctx.supersedes_target(), Some(placeholder_id));
+
+        // BEIDE Richtungen über die bestehenden Indizes (§1.2/§10.3):
+        // Vorwärts: Auflösungs-Knoten besitzt { real, supersedes_ctx }.
+        let mut fwd = store.index().contexts_of(resolution_id).unwrap();
+        fwd.sort_unstable();
+        let mut expected = vec![real_id, supersedes_ctx_id];
+        expected.sort_unstable();
+        assert_eq!(fwd, expected);
+        // supersedes_ctx besitzt { supersession_marker, placeholder } (vorwärts);
+        // der strukturell bedeutsame Verweis ist der Platzhalter (s. o.).
+        let mut sup_fwd = store.index().contexts_of(supersedes_ctx_id).unwrap();
+        sup_fwd.sort_unstable();
+        let mut sup_expected = vec![supersession_marker_id, placeholder_id];
+        sup_expected.sort_unstable();
+        assert_eq!(sup_fwd, sup_expected);
+        // Rückwärts vom Platzhalter: Platzhalter ← supersedes_ctx ← Auflösungs-Knoten
+        // → real. So ist der auflösende Pfad vom Platzhalter erreichbar (§3.6).
+        assert_eq!(
+            store.index().referrers_of(placeholder_id).unwrap(),
+            vec![supersedes_ctx_id]
+        );
+        assert_eq!(
+            store.index().referrers_of(supersedes_ctx_id).unwrap(),
+            vec![resolution_id]
+        );
+
+        // Wipe-&-Rebuild (§8.4): die Ersetzungs-/Zeit-Verknüpfungen sind reine
+        // Derivate über die Kanten-Indizes — neu gebaut identisch.
+        let before_fwd = store.index().contexts_of(resolution_id).unwrap();
+        let before_bwd = store.index().referrers_of(placeholder_id).unwrap();
+        store.rebuild_index_from_log().unwrap();
+        assert_eq!(store.index().contexts_of(resolution_id).unwrap(), before_fwd);
+        assert_eq!(
+            store.index().referrers_of(placeholder_id).unwrap(),
+            before_bwd
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Zeit als Daten (§6.1/§6.2): die zwei Achsen-Aussagen eines Daten werden als
+    // gewöhnliche Kanten indiziert (reine Derivate, §8.4) — der Kernel ordnet/
+    // vergleicht den opaken Zeit-Wert NIE (§1.4/§6.4).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn both_time_axes_round_trip_as_ordinary_edges() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Zwei opake Zeit-Werte (gewöhnliche Blätter); divergierende Achsen (§6.2).
+        let t_rec = store.append_datum(&Datum::leaf(b"erfahren@T1".to_vec())).unwrap();
+        let t_val = store.append_datum(&Datum::leaf(b"gilt@T0".to_vec())).unwrap();
+        store.append_datum(&Datum::recording_time_marker()).unwrap();
+        store.append_datum(&Datum::validity_time_marker()).unwrap();
+        let rec_stmt = store.append_datum(&Datum::recording_time(t_rec)).unwrap();
+        let val_stmt = store.append_datum(&Datum::validity_time(t_val)).unwrap();
+
+        // Ein Daten, das BEIDE Achsen trägt.
+        let fact = store
+            .append_datum(&Datum::node([rec_stmt, val_stmt]).unwrap())
+            .unwrap();
+
+        // Beide Aussagen sind als Vorwärts-Kanten am Daten vorhanden.
+        let mut ctxs = store.index().contexts_of(fact).unwrap();
+        ctxs.sort_unstable();
+        let mut expected = vec![rec_stmt, val_stmt];
+        expected.sort_unstable();
+        assert_eq!(ctxs, expected, "beide Zeitachsen als gewöhnliche Kanten (§6.2)");
+
+        // Die Aussage-Daten zeigen strukturell auf ihre opaken Zeit-Werte — der
+        // Kernel parst/vergleicht sie NICHT (§1.4/§6.4).
+        let rec = store.get_by_content_id(rec_stmt).unwrap().unwrap();
+        let val = store.get_by_content_id(val_stmt).unwrap().unwrap();
+        assert_eq!(rec.recording_time_value(), Some(t_rec));
+        assert_eq!(val.validity_time_value(), Some(t_val));
+        // Die Achsen sind distinkt/unabhängig (verschiedene Werte, §6.2).
+        assert_ne!(t_rec, t_val);
+        assert_ne!(rec_stmt, val_stmt);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zeit-Aussage-Mitgliedschafts-Index (§6.1/§6.2, §8.4): der LOOKUP liefert die
+    // Daten, die eine gegebene Zeit-Aussage tragen — Exakt-Match/Mitgliedschaft
+    // (§1.3), KEINE Ordnung (§1.4/§6.4).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn time_statement_membership_lookup_returns_carriers() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        let t1 = store.append_datum(&Datum::leaf(b"t1".to_vec())).unwrap();
+        let t2 = store.append_datum(&Datum::leaf(b"t2".to_vec())).unwrap();
+        store.append_datum(&Datum::recording_time_marker()).unwrap();
+        store.append_datum(&Datum::validity_time_marker()).unwrap();
+        let rec_t1 = store.append_datum(&Datum::recording_time(t1)).unwrap();
+        let val_t2 = store.append_datum(&Datum::validity_time(t2)).unwrap();
+
+        // Zwei Daten tragen dieselbe Aufzeichnungszeit-Aussage (rec_t1).
+        let a = store.append_datum(&Datum::node([rec_t1]).unwrap()).unwrap();
+        let payload_b = store.append_datum(&Datum::leaf(b"b-fact".to_vec())).unwrap();
+        let b = store.append_datum(&Datum::node([rec_t1, payload_b]).unwrap()).unwrap();
+        // Ein drittes trägt die Gültigkeitszeit-Aussage (val_t2).
+        let c = store.append_datum(&Datum::node([val_t2]).unwrap()).unwrap();
+
+        // Lookup nach der Aussage rec_t1 ⇒ genau {a, b} (Exakt-Match, §1.3).
+        let mut carriers = store.time_carriers_of(rec_t1);
+        carriers.sort_unstable();
+        let mut expected = vec![a, b];
+        expected.sort_unstable();
+        assert_eq!(carriers, expected, "Träger der Aufzeichnungszeit-Aussage");
+        // Lookup nach val_t2 ⇒ {c}; die Achsen sind distinkt (§6.2).
+        assert_eq!(store.time_carriers_of(val_t2), vec![c]);
+        // Eine nie getragene Aussage ⇒ leer (keine Ordnung, kein „nächstgelegen").
+        let unused_stmt = ContentId::of_datum(&Datum::recording_time(t2));
+        assert!(store.time_carriers_of(unused_stmt).is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // Ersetzungs-Index in BEIDE Richtungen (§6.3, §8.4): supersedes (neuer→älter)
+    // und superseded-by (älter→neuer); der Kernel verknüpft nur, ordnet nicht.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn supersession_index_is_traversable_both_directions() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        let older = store.append_datum(&Datum::leaf(b"v1".to_vec())).unwrap();
+        store.append_datum(&Datum::supersession_marker()).unwrap();
+        let sup_ctx = store.append_datum(&Datum::supersedes(older)).unwrap();
+        let payload = store.append_datum(&Datum::leaf(b"v2".to_vec())).unwrap();
+        // Das neuere Daten besitzt den Ersetzungs-Kontext (§6.3).
+        let newer = store.append_datum(&Datum::node([sup_ctx, payload]).unwrap()).unwrap();
+
+        // Vorwärts: newer supersedes older.
+        assert_eq!(store.supersedes_of(newer), vec![older]);
+        // Rückwärts: older superseded-by newer.
+        assert_eq!(store.superseded_by_of(older), vec![newer]);
+        // Eine Kette: newer2 überholt newer.
+        let sup_ctx2 = store.append_datum(&Datum::supersedes(newer)).unwrap();
+        let p2 = store.append_datum(&Datum::leaf(b"v3".to_vec())).unwrap();
+        let newer2 = store.append_datum(&Datum::node([sup_ctx2, p2]).unwrap()).unwrap();
+        assert_eq!(store.supersedes_of(newer2), vec![newer]);
+        assert_eq!(store.superseded_by_of(newer), vec![newer2]);
+        // Append-only: das Älteste bleibt unverändert lesbar (§7.1).
+        assert_eq!(
+            store.get_by_content_id(older).unwrap(),
+            Some(Datum::leaf(b"v1".to_vec()))
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // WIPE-AND-REBUILD der Zeit-/Ersetzungs-Indizes (§8.4): nach Wipe + Neu-Bau aus
+    // dem Log sind beide reine Derivate identisch — UND sie überstehen einen Reopen.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn time_and_supersession_survive_wipe_rebuild_and_reopen() {
+        let dir = tempdir().unwrap();
+        let (rec_stmt, carrier, older, newer);
+        {
+            let mut store = open_store(dir.path());
+            let t = store.append_datum(&Datum::leaf(b"T".to_vec())).unwrap();
+            store.append_datum(&Datum::recording_time_marker()).unwrap();
+            rec_stmt = store.append_datum(&Datum::recording_time(t)).unwrap();
+            carrier = store.append_datum(&Datum::node([rec_stmt]).unwrap()).unwrap();
+
+            older = store.append_datum(&Datum::leaf(b"alt".to_vec())).unwrap();
+            store.append_datum(&Datum::supersession_marker()).unwrap();
+            let sup = store.append_datum(&Datum::supersedes(older)).unwrap();
+            let p = store.append_datum(&Datum::leaf(b"neu".to_vec())).unwrap();
+            newer = store.append_datum(&Datum::node([sup, p]).unwrap()).unwrap();
+
+            // Schnappschuss vor dem Wipe.
+            let tc_before = store.time_carriers_of(rec_stmt);
+            let sup_before = store.supersedes_of(newer);
+            let supby_before = store.superseded_by_of(older);
+
+            // Wipe + Neu-Bau aller Derivate aus dem Log (§8.4).
+            store.rebuild_index_from_log().unwrap();
+
+            assert_eq!(store.time_carriers_of(rec_stmt), tc_before, "Zeit-Index identisch");
+            assert_eq!(store.supersedes_of(newer), sup_before, "supersedes identisch");
+            assert_eq!(store.superseded_by_of(older), supby_before, "superseded-by identisch");
+            assert_eq!(tc_before, vec![carrier]);
+            assert_eq!(sup_before, vec![older]);
+            assert_eq!(supby_before, vec![newer]);
+        }
+        // Reopen von Platte: die Indizes werden aus dem Log rekonstruiert (§8.4).
+        let store = open_store(dir.path());
+        assert_eq!(store.time_carriers_of(rec_stmt), vec![carrier]);
+        assert_eq!(store.supersedes_of(newer), vec![older]);
+        assert_eq!(store.superseded_by_of(older), vec![newer]);
     }
 }

@@ -70,7 +70,34 @@
 //! - [`error`] — [`error::KernelError`] (rein **mechanische** Zustände, §1.4).
 //! - Platzhalter-Konvention (§3.6) auf [`Datum`]
 //!   ([`Datum::placeholder`]/[`Datum::unresolved_marker`]): geschlossene
-//!   Verweise ohne baumelnde Ziele; volle Behandlung Phase 3.
+//!   Verweise ohne baumelnde Ziele. **Volle Behandlung (Phase 3):** die
+//!   strukturelle **Auflösung** ([`ContentStore::resolve_placeholder`]) hängt das
+//!   echte Daten an und verknüpft Platzhalter→real über einen Ersetzungs-Kontext
+//!   (§6.3); der auflösende Pfad ist über die bestehenden Kanten-Indizes in beide
+//!   Richtungen traversierbar.
+//! - **Zeit als Daten (Phase 3, §6)** auf [`Datum`]: die **zwei Zeitachsen** (§6.2)
+//!   — Aufzeichnungszeit ([`Datum::recording_time`]) und Gültigkeitszeit
+//!   ([`Datum::validity_time`]) — sind besondere **Kontexte** `{ Achsen-Marker,
+//!   opaker Zeit-Wert }`; ein Daten darf beide tragen, die Achsen dürfen
+//!   auseinanderfallen. Der **Ersetzungs-Kontext** ([`Datum::supersedes`], §6.3)
+//!   verknüpft ein neueres mit dem überholten älteren Daten (append-only). Der
+//!   Kernel **speichert, indiziert (Exakt-Match/Mitgliedschaft) und traversiert**
+//!   Zeit nur — er **interpretiert/ordnet/vergleicht** den Zeit-Wert **nie**
+//!   (§1.4/§6.4); „welche Version gilt zum Zeitpunkt T" ist eine Leseregel der
+//!   Schicht darüber (§8).
+//! - **Bitemporale & Ersetzungs-Indizes (Phase 3, §6, §8.4)** im [`ContentStore`]:
+//!   zwei weitere **reine, neu-baubare Derivate** (wie der Bereichs-/Berechtigungs-
+//!   Index) — (a) der **Zeit-Aussage-Mitgliedschafts-Index** (welche Daten tragen
+//!   eine gegebene Zeit-Aussage; **nur** Exakt-Match/Mitgliedschaft §1.3, **keine**
+//!   geordnete Bereichs-Abfrage §1.4/§6.4) und (b) der **Ersetzungs-Index** in
+//!   beide Richtungen (*supersedes* / *superseded-by*, §6.3). Beim Öffnen aus dem
+//!   Log rekonstruiert und in `rebuild_index_from_log` mit-gewipt/-neu-gebaut (§8.4).
+//!   Die **gegateten** Lese-Helfer ([`LakearchKernel::supersedes_visible`]/
+//!   [`LakearchKernel::superseded_by_visible`]/[`LakearchKernel::time_carriers_visible`]/
+//!   [`LakearchKernel::placeholder_resolvers_visible`]) reichen **nur sichtbare**
+//!   `ContentId`s heraus (VANISH, §11.3; Inhalt nur übers Tor) und ordnen/vergleichen
+//!   Zeit **nie** — es gibt **kein** Verb, das nach Zeit ordnet oder „die aktive"
+//!   auswählt (§1.4/§6.4).
 
 mod model;
 mod serialize;
