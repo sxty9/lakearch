@@ -1100,3 +1100,95 @@ zweiter Epochenzähler — `activation_epoch` bleibt Audit-only. Drei blockieren
 Review-Findings sind behoben (siehe Abschnitt „Phase 5 — Review-Härtung").
 `#![forbid(unsafe_code)]` bleibt auf `store.rs`/`kernel.rs`/`gate.rs`/`traverse.rs`/
 `model.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`.
+
+### Phase 6 — Materialisierung & Invalidierung (§10) — Entscheidungen
+
+**Spec-kritische Grenze (§1.5/§10.3): der Kernel FINDET Abhängige, BERECHNET aber
+NIE neu.** Dies ist die zentrale, einzuhaltende Trennlinie der Phase. Alle Verben
+sind reine **Finde-/Lese-Pfade**; es gibt **kein** Verb, das ein Ergebnis ableitet,
+neu berechnet, als stale markiert oder auto-invalidiert. „Als-stale-markieren" und
+„neu-berechnen" sind ein **weiterer Append / eine Ersetzung der Schicht darüber**
+(§7.1/§6.3) — außerhalb des Kernels. Der Negativ-Test
+`find_dependents_only_finds_and_never_recomputes_or_marks_stale` friert dies ein:
+`find_dependents` ist `&self` (kein `&mut`), liefert nur `ContentId`s, und ein
+wiederholter Aufruf nach einem erneuten Lauf liefert **identisch** dieselben
+Abhängigen (kein Seiteneffekt, keine erzeugten Daten).
+
+1. **Herkunft als Kontext, gespiegelt aus den bestehenden Markern (§10.2).** Ein
+   **eingefrorenes** Herkunft-Marker-Atom `lakearch/origin/v1` (18 Bytes ASCII,
+   `niemals ändern`) und ein **Herkunfts-Kontext** `{ origin_marker, input }` —
+   exakt dieselbe Marker+Ziel-Konvention wie Zugehörigkeit (§11.1), Ersetzung
+   (§6.3), Zeit (§6.2) und Mitgliedschaft (§9.3). Bewusst **distinkt** von allen
+   bestehenden Markern (paarweise-Distinktheits-Test); gleiche Byte-LÄNGE wie der
+   Anker-Marker, aber andere Bytes ⇒ andere `ContentId`. Ein berechnetes Ergebnis
+   **besitzt** je Eingabe einen Herkunfts-Kontext; **mehrere Herkunfts-Links** für
+   mehrere Eingaben sind nativ (§10.2). `Datum::computed_result(payload, inputs)`
+   bindet das **fertige** Ergebnis (`payload` = das von der Schicht darüber
+   Gerechnete, §1.5) nur strukturell an seine Eingaben — der Konstruktor rechnet
+   nichts.
+
+2. **Invalidierung = Rückwärts-Traversierung über die schon vorhandenen Indizes
+   (§10.3/§8.4).** Statt eines neuen Spezial-Index werden — analog zum Ersetzungs-
+   Index der Phase 3 — **zwei** reine, neu-baubare in-memory Derivate gehalten:
+   `origin_of` (Ergebnis→Eingaben, *origin*) und `derived_from` (Eingabe→Ergebnisse,
+   *derived-from* = die **Invalidierungs-Rückwärts-Kante**). Beide werden in
+   `index_edges_for` aus dem Herkunfts-Kontext beidseitig befüllt und in
+   `rebuild_index_from_log` mit-gewipt; Wipe-&-Rebuild **und** Reopen liefern den
+   identischen Index (§8.4, Test
+   `origin_index_both_directions_materialize_and_survive_rebuild`). Die
+   `target→referrers`-Kante allein hätte zwar das Ergebnis von der Eingabe aus
+   erreichbar gemacht, aber gemischt mit allen anderen Verweisern; der dünne,
+   typ-getaggte `derived_from`-Index liefert die Abhängigen **direkt** und
+   sichtbarkeits-blind — eine bewusste, billige Derivat-Entscheidung (§Indexierung,
+   §15).
+
+3. **Eine mechanische `provenance_walk` für beide Richtungen (§1.7 a).** Sowohl
+   `find_dependents` (transitiv, *derived-from*, alle Stufen) als auch
+   `traverse_provenance_backward` (*origin*, `max_depth`/`max_nodes`-beschränkt)
+   laufen über **eine** private BFS: **deterministisch** (aufsteigende
+   `(from,edge_ctx,to,depth)`-Adress-Order, §5.2/§1.4), **Visited-Set-zyklensicher**
+   (§1.6 — ein Knoten wird nie zweimal expandiert), **budget-beschränkt**
+   (`max_nodes==0` ⇒ `TraversalBudgetExceeded`, nie unbeschränkter Speicher),
+   **gegatet** (VANISH/fail-closed §11.3) und **§13-aktiv** unter dem am
+   `SnapshotToken` gepinnten `W`. Tests `provenance_is_cycle_safe_and_budget_bounded`
+   (selbst bei einem Herkunfts-Zyklus terminiert der Lauf) und der Reopen-/Rebuild-
+   Test decken dies ab.
+
+4. **Frozen-Form ohne Capability ⇒ fail-safe leere Bereiche.** Wie bei der Phase-2-
+   `traverse` tragen die Trait-Verben `find_dependents`/`traverse_provenance_backward`
+   keine Capability; sie laufen daher mit **leersten** gewährten Bereichen (nur
+   unbeschränkte Daten sichtbar, bereichs-beschränkte VANISHen). Die voll-gegateten
+   Einstiege mit vorgelegter Capability sind die Helfer `dependents_visible` /
+   `origin_inputs_visible` (je **eine** Stufe) — analog zur Helfer/Trait-Aufteilung
+   der Vorphasen.
+
+5. **Materialisierung ersetzt append-only (§10.1/§6.3).** `materialize(result,
+   replaces)` hängt das fertige Ergebnis an (§7.1, Dedup §5.3); ist `replaces =
+   Some(older)`, baut es den Phase-3-**Ersetzungs-Kontext** `supersedes(older)` und
+   einen **Verknüpfungs-Knoten** `{ result_id, supersedes_ctx }`, der das neuere
+   Ergebnis über den Ersetzungs-Kontext auf das ältere zeigen lässt — beide
+   Richtungen über die bestehenden `supersedes`/`superseded_by`-Indizes traversierbar
+   (§1.2). Das **ältere** Ergebnis wird **nie** mutiert/gelöscht (Test
+   `newer_materialized_result_supersedes_older_without_mutating_it`). Der Kernel
+   **validiert nicht** (§1.4/§7.2): er prüft **nicht**, ob `older` durabel vorliegt
+   oder ob `result` überhaupt eine Herkunft trägt — das ist Sache der schreibenden
+   Schicht.
+
+### Phase 6 — Abschluss & Commit (Branch `kernel-impl`)
+
+Phase 6 ist **fertig und grün** und wird als ein Commit eingefroren (Politik: ein
+Commit pro grüner Phase). **Grün verifiziert** (`source $HOME/.cargo/env`, in
+`/home/nanu/lakearch`):
+- `cargo build --all-targets` — sauber (Exit 0).
+- `cargo test` — **242 Tests** grün: 214 lib-Unit + 12 Kanonik-Vektoren
+  (`tests/canonical_vectors.rs`) + 11 Kernel-E2E (`tests/kernel_e2e.rs`) + 5
+  Store-Integration (`tests/store_index.rs`); 0 fehlgeschlagen, 0 ignoriert
+  (+10 Tests gegenüber Phase 5, alle im lib-Unit-Block: model §10, store §10,
+  kernel §10).
+- `cargo clippy --all-targets -- -D warnings` — sauber (Exit 0, nach erzwungenem
+  Neu-Lauf verifiziert).
+
+`#![forbid(unsafe_code)]` bleibt auf `store.rs`/`kernel.rs`/`gate.rs`/`traverse.rs`/
+`model.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`. Kein neues Verb
+berechnet/invalidiert — die spec-kritische Grenze (§1.5/§10.3) ist eingehalten und
+durch einen Negativ-Test eingefroren.

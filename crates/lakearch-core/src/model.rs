@@ -296,6 +296,12 @@ const CURATION_UNHIDE_MARKER_PAYLOAD: &[u8; 27] = b"lakearch/curation/unhide/v1"
 /// (§9.5). Exakt 28 Bytes ASCII; **niemals** ändern.
 const CURATION_REPLACE_MARKER_PAYLOAD: &[u8; 28] = b"lakearch/curation/replace/v1";
 
+/// Eingefrorene atomare Nutzlast des **Herkunft**-Marker-Atoms (§10.2:
+/// Herkunft-als-Kontext eines berechneten Ergebnisses). Exakt 18 Bytes ASCII;
+/// **niemals** ändern (verschöbe die Erkennbarkeit aller Herkunfts-Kontexte und
+/// damit die Invalidierungs-Rückwärts-Traversierung §10.3).
+const ORIGIN_MARKER_PAYLOAD: &[u8; 18] = b"lakearch/origin/v1";
+
 /// Eingefrorene atomare Nutzlast des **Aktiv-Marker**-Atoms (§13): das
 /// abschließende „Aktiv-Schreiben", das einen Mehr-Daten-Umbau gemeinsam sichtbar
 /// macht (§13.1). Exakt 25 Bytes ASCII; **niemals** ändern. lakearch interpretiert
@@ -1147,6 +1153,160 @@ impl Datum {
     }
 }
 
+/// Materialisierung & Herkunft (§10) — **append-only**, **rein strukturelle
+/// Konvention** (§1.3), die der Kernel **niemals** berechnet.
+///
+/// **HARTE GRENZE (§1.5/§7.2/§10.1).** Der Kernel **berechnet das Ergebnis
+/// nicht** — die **Schicht darüber** rechnet und reicht das fertige Ergebnis als
+/// gewöhnliches Daten ein (§1.5: „Alles Rechnen … liegt in einer Schicht über
+/// lakearch. Sie liest per Traversierung und schreibt ihre Ergebnisse als Daten
+/// zurück"). Dieses Modul stellt **nur** die Konvention bereit: wie ein
+/// berechnetes Daten seine **Herkunft als Kontext** trägt (§10.2). Es gibt
+/// **kein** Verb, das eine Berechnung ausführt, ein Ergebnis ableitet oder es
+/// neu berechnet (das läge außerhalb des Kernels, §1.5/§10.3).
+///
+/// **Herkunft-als-Kontext (§10.2).** Ein berechnetes Daten trägt seine
+/// **Herkunft** als Kontext — die Bindung an die **Eingaben**, aus denen es
+/// entstand. Ein **Herkunfts-Kontext** ist — analog zur Zugehörigkeit (§11.1) und
+/// zum Ersetzungs-Kontext (§6.3) — der Knoten `{ origin_marker, input }`, der auf
+/// die `ContentId` einer **Eingabe** zeigt. Ein berechnetes Ergebnis **besitzt**
+/// einen solchen Kontext **je Eingabe**: es darf **mehrere** Herkunfts-Links
+/// tragen (mehrere Eingaben, §10.2).
+///
+/// **Invalidierung = Rückwärts-Traversierung (§10.3).** Weil das Ergebnis die
+/// Herkunfts-Kontexte besitzt und diese auf die Eingaben zeigen, entstehen über
+/// die bestehenden Indizes (`owner→contexts` / `target→referrers`, §1.2/§10.3)
+/// **beide** Richtungen: vom Ergebnis zu seinen Eingaben (vorwärts) und — für die
+/// Invalidierung — von einer **geänderten Eingabe** zu den abhängigen Ergebnissen
+/// (rückwärts). Das **Neu-Berechnen** liegt **außerhalb** (§1.5): der Kernel
+/// **findet** nur die Abhängigen; „als-stale-markieren"/neu-berechnen ist ein
+/// weiterer Append/eine Ersetzung der Schicht darüber (§7.1/§6.3).
+///
+/// **Materialisierung (§10.1).** Ein berechnetes Ergebnis **darf** als Daten
+/// gespeichert werden; ein **neueres** ersetzt das ältere über den Phase-3-
+/// Ersetzungs-Kontext (§6.3) — append-only, das ältere wird **nie** geändert
+/// (siehe [`Datum::supersedes`] und
+/// [`crate::store::ContentStore::materialize`]).
+impl Datum {
+    /// Das eingefrorene **Herkunft**-Marker-Atom (§10.2) — ein gewöhnliches
+    /// Blatt-Daten (§2.1) mit fester atomarer Nutzlast `lakearch/origin/v1`
+    /// (eingefroren — eine Änderung verschöbe die Marker-`ContentId` und damit die
+    /// Erkennbarkeit aller Herkunfts-Kontexte und die Invalidierung §10.3).
+    /// lakearch interpretiert die Bytes **nicht** (§1.4); der Wert ist eine
+    /// wohlbekannte, föderationsweit gleiche Konvention (gleiche Bytes ⇒ gleiche
+    /// `ContentId`, §5.3/§12.3).
+    pub fn origin_marker() -> Self {
+        Datum::leaf(*ORIGIN_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt einen **Herkunfts-Kontext** (§10.2): der Knoten
+    /// `{ origin_marker, input }`, der die **Eingabe** mit `ContentId` `input`
+    /// benennt, aus der ein berechnetes Ergebnis (mit) entstand. Das **berechnete
+    /// Ergebnis besitzt** diesen Kontext (die schreibende Schicht hängt ihn an,
+    /// §7.2) — so bindet das Ergebnis sich an seine Eingabe.
+    ///
+    /// Reine Struktur (§1.3); keine Wertung (§1.4). Der Kernel **berechnet das
+    /// Ergebnis nicht** (§1.5/§10.1) — er hält nur den Herkunfts-Kontext und
+    /// traversiert ihn (vorwärts/rückwärts, §10.3).
+    pub fn origin(input: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::origin_marker());
+        Datum::node([marker, input]).expect("Herkunfts-Kontext besitzt stets das Marker-Atom (§10.2)")
+    }
+
+    /// Liest aus einem **Herkunfts-Kontext** (§10.2) die `ContentId` der **Eingabe**,
+    /// falls dieser Knoten ein Herkunfts-Kontext ist — also exakt
+    /// `{ origin_marker, input }` besitzt; sonst `None`. Reines strukturelles
+    /// Matching (§1.3): „besitzt der Knoten das Marker-Atom und genau ein weiteres
+    /// Daten?". Keine Wertung (§1.4); **kein** Berechnen/Ordnen.
+    pub fn origin_target(&self) -> Option<ContentId> {
+        let marker = ContentId::of_datum(&Datum::origin_marker());
+        self.role_target(marker)
+    }
+
+    /// Erzeugt ein **berechnetes Ergebnis-Daten** (§10.1/§10.2): ein Knoten, der
+    /// die beliebigen `payload`-Kontexte (das eigentliche, **von der Schicht
+    /// darüber berechnete** Ergebnis, §1.5) **und** je einen **Herkunfts-Kontext**
+    /// [`Datum::origin`] **pro Eingabe** aus `inputs` besitzt (§10.2: mehrere
+    /// Herkunfts-Links sind erlaubt).
+    ///
+    /// **Wichtig (§1.5/§10.1).** Der Kernel **berechnet nichts** — `payload` ist
+    /// das **fertige** Ergebnis, das die schreibende Schicht einreicht; dieser
+    /// Konstruktor bindet es nur **strukturell** an seine Eingaben (Herkunft-als-
+    /// Kontext, §10.2). Die `ContentId`s der Herkunfts-Kontexte ergeben sich aus
+    /// [`Datum::origin`]; die schreibende Schicht hängt diese besessenen Kontext-
+    /// Daten ebenfalls an (sie sind eigene Daten, §3.1).
+    ///
+    /// Gibt **immer** `Some` zurück, wenn mindestens ein Kontext entsteht; ist
+    /// **sowohl** `payload` **als auch** `inputs` leer, gäbe es keinen Kontext —
+    /// ein Knoten ohne Kontexte ist nicht wohlgeformt (§K2.1) ⇒ `None`. (Der
+    /// Kernel **validiert** keine fachliche Eingabe, §1.4; dies ist allein die
+    /// Wahrung der Konstruktions-Invariante.)
+    pub fn computed_result(
+        payload: impl IntoIterator<Item = ContentId>,
+        inputs: impl IntoIterator<Item = ContentId>,
+    ) -> Option<Self> {
+        let origins = inputs
+            .into_iter()
+            .map(|input| ContentId::of_datum(&Datum::origin(input)));
+        let owns = payload.into_iter().chain(origins);
+        Datum::node(owns)
+    }
+
+    /// Die `ContentId`s der **Herkunfts-Kontexte**, die dieser Knoten besitzt
+    /// (§10.2) — also der besessenen Kontexte, die strukturell ein Herkunfts-
+    /// Kontext `{ origin_marker, input }` sind. Owned, in kanonischer (aufsteigender)
+    /// Adress-Order (§5.2/§1.4). `None`, wenn dies kein Knoten ist.
+    ///
+    /// Reines strukturelles Matching (§1.3): es genügt, die besessenen Kontexte
+    /// gegen die strukturell bestimmten Herkunfts-Kontext-`ContentId`s ihrer Ziele
+    /// zu prüfen — der `resolve`-Closure löst jeden besessenen Kontext zu seinem
+    /// Inhalt auf, um zu erkennen, ob er ein Herkunfts-Kontext ist (und welche
+    /// Eingabe er benennt). Der Kernel **berechnet/wertet nichts** (§1.4/§1.5).
+    pub fn origin_contexts<F>(&self, mut resolve: F) -> Option<Vec<ContentId>>
+    where
+        F: FnMut(ContentId) -> Option<Datum>,
+    {
+        let owns = self.owns()?;
+        let mut out = Vec::new();
+        for ctx_id in owns {
+            if let Some(ctx) = resolve(*ctx_id) {
+                if ctx.origin_target().is_some() {
+                    out.push(*ctx_id);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Die **Eingaben** (`ContentId`s), aus denen dieses berechnete Ergebnis
+    /// entstand (§10.2) — strukturell aus den besessenen Herkunfts-Kontexten
+    /// abgelesen. Owned, in kanonischer (aufsteigender) Adress-Order (§5.2/§1.4).
+    /// `None`, wenn dies kein Knoten ist.
+    ///
+    /// Der `resolve`-Closure löst jeden besessenen Kontext zu seinem Inhalt auf
+    /// (der Store liefert ihn); ein Herkunfts-Kontext `{ origin_marker, input }`
+    /// trägt seine Eingabe über [`Datum::origin_target`]. Reines strukturelles
+    /// Matching (§1.3); der Kernel **berechnet nichts** und entscheidet **nicht**,
+    /// welches Ergebnis „aktuell" ist (§1.5/§10.1).
+    pub fn origin_inputs<F>(&self, mut resolve: F) -> Option<Vec<ContentId>>
+    where
+        F: FnMut(ContentId) -> Option<Datum>,
+    {
+        let owns = self.owns()?;
+        let mut out = Vec::new();
+        for ctx_id in owns {
+            if let Some(ctx) = resolve(*ctx_id) {
+                if let Some(input) = ctx.origin_target() {
+                    out.push(input);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+}
+
 /// Aktiv-Marker (§13) — das abschließende „Aktiv-Schreiben" eines Mehr-Daten-Umbaus.
 ///
 /// **Konvention (§13.1/§1.3).** Ein Umbau, der **mehrere Daten** betrifft, wird durch
@@ -1740,5 +1900,93 @@ mod tests {
         // Ein gewöhnlicher Knoten / ein Blatt ist KEIN Aktiv-Marker.
         assert!(!Datum::node([c1]).unwrap().is_active_marker());
         assert!(!Datum::leaf([0x01]).is_active_marker());
+    }
+
+    // -- Materialisierung & Herkunft (§10) -----------------------------------
+
+    #[test]
+    fn origin_marker_is_a_frozen_distinct_leaf_of_documented_length() {
+        // §10.2: das Herkunft-Marker-Atom ist ein gewöhnliches Blatt (§2.1) mit
+        // fester, eingefrorener Nutzlast der dokumentierten Länge (18 Bytes) — und
+        // distinkt von allen anderen Marker-Atomen.
+        let m = Datum::origin_marker();
+        assert!(m.is_leaf());
+        assert_eq!(m.payload(), Some(&b"lakearch/origin/v1"[..]));
+        assert_eq!(m.payload().unwrap().len(), 18, "dokumentierte Länge");
+        // Distinkt von einer Auswahl bestehender Marker (verschiedene ContentIds) —
+        // auch von `anchor` (gleiche Byte-LÄNGE, aber andere Bytes ⇒ andere CID).
+        let origin = ContentId::of_datum(&m);
+        for other in [
+            Datum::anchor_marker(),
+            Datum::supersession_marker(),
+            Datum::active_marker(),
+            Datum::area_membership_marker(),
+            Datum::membership_marker(),
+        ] {
+            assert_ne!(origin, ContentId::of_datum(&other), "Herkunft-Marker distinkt (§10.2)");
+        }
+    }
+
+    #[test]
+    fn origin_context_points_to_its_input_structurally() {
+        // §10.2: ein Herkunfts-Kontext { origin_marker, input } benennt eine Eingabe.
+        let input = ContentId::of_datum(&Datum::leaf(b"eingabe".to_vec()));
+        let ctx = Datum::origin(input);
+        assert!(ctx.is_node());
+        assert_eq!(ctx.origin_target(), Some(input));
+        // Ein gewöhnlicher Knoten / ein Blatt ist KEIN Herkunfts-Kontext.
+        assert_eq!(Datum::node([cid(0x07)]).unwrap().origin_target(), None);
+        assert_eq!(Datum::leaf([0x01]).origin_target(), None);
+        // Ein Knoten mit dem Marker, aber drei Kontexten (≠ 2): kein eindeutiges
+        // Ziel ⇒ None (reines Matching, keine Wertung, §1.4).
+        let marker = ContentId::of_datum(&Datum::origin_marker());
+        let three = Datum::node([marker, cid(0x01), cid(0x02)]).unwrap();
+        assert_eq!(three.origin_target(), None);
+    }
+
+    #[test]
+    fn computed_result_records_all_its_origin_inputs_structurally() {
+        // §10.2: ein berechnetes Daten trägt JE Eingabe einen Herkunfts-Kontext;
+        // mehrere Eingaben ⇒ mehrere Herkunfts-Links. Der Kernel BERECHNET nichts —
+        // `payload` ist das fertige, von der Schicht darüber gerechnete Ergebnis.
+        let in_a = ContentId::of_datum(&Datum::leaf(b"a".to_vec()));
+        let in_b = ContentId::of_datum(&Datum::leaf(b"b".to_vec()));
+        let result_payload = ContentId::of_datum(&Datum::leaf(b"ergebnis".to_vec()));
+
+        let result = Datum::computed_result([result_payload], [in_a, in_b]).expect("Knoten");
+        assert!(result.is_node());
+
+        // Resolver kennt die Herkunfts-Kontexte (besessene Daten des Ergebnisses).
+        let origin_a = Datum::origin(in_a);
+        let origin_b = Datum::origin(in_b);
+        let known = [origin_a.clone(), origin_b.clone()];
+
+        // ALLE Eingaben sind strukturell ablesbar (§10.2) — reines Matching (§1.3).
+        let inputs = result.origin_inputs(resolver(&known)).expect("Knoten");
+        assert!(inputs.contains(&in_a));
+        assert!(inputs.contains(&in_b));
+        assert_eq!(inputs.len(), 2, "beide Eingaben strukturell erfasst");
+
+        // Die Herkunfts-Kontext-IDs sind ablesbar (für die Rückwärts-Traversierung).
+        let octxs = result.origin_contexts(resolver(&known)).expect("Knoten");
+        assert!(octxs.contains(&ContentId::of_datum(&origin_a)));
+        assert!(octxs.contains(&ContentId::of_datum(&origin_b)));
+
+        // Das berechnete Ergebnis BESITZT die Herkunfts-Kontexte (so wird die Kante
+        // rückwärts traversierbar: input ← origin_ctx ← result, §1.2/§10.3).
+        let owns = result.owns().expect("Knoten");
+        assert!(owns.contains(&ContentId::of_datum(&origin_a)));
+        assert!(owns.contains(&ContentId::of_datum(&origin_b)));
+        // Das eigentliche Ergebnis-Payload ist ebenfalls ein besessener Kontext.
+        assert!(owns.contains(&result_payload));
+
+        // Ein Ergebnis OHNE Eingaben (nur payload) trägt keine Herkunft (leer, aber
+        // wohlgeformt, solange payload nicht leer ist).
+        let no_inputs = Datum::computed_result([result_payload], []).expect("Knoten");
+        assert_eq!(no_inputs.origin_inputs(resolver(&[])).unwrap().len(), 0);
+
+        // Weder payload noch Eingaben ⇒ kein wohlgeformter Knoten (§K2.1).
+        let empties: [ContentId; 0] = [];
+        assert!(Datum::computed_result(empties, empties).is_none());
     }
 }

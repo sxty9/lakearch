@@ -163,6 +163,21 @@ pub struct ContentStore<I: EdgeIndex> {
     /// — *superseded-by* (älter → neuer). Damit ist die Ersetzungs-Relation in
     /// **beide** Richtungen traversierbar (§1.2). Reines, neu-baubares Derivat (§8.4).
     superseded_by: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Herkunfts-Index — Vorwärts** (§10.2): `berechnetes Ergebnis →
+    /// { Eingaben, aus denen es entstand }`. Ein Ergebnis R hat die Eingabe E als
+    /// Herkunft, wenn R einen **Herkunfts-Kontext** `{ origin_marker, E }`
+    /// ([`Datum::origin`]) besitzt. Reines, neu-baubares Derivat (§8.4) — *origin*
+    /// (Ergebnis → Eingaben). Der Kernel **berechnet das Ergebnis nicht** (§1.5);
+    /// er hält und traversiert nur die Herkunft (§10.3).
+    origin_of: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Herkunfts-Index — Rückwärts** (§10.3): `Eingabe → { Ergebnisse,
+    /// die aus ihr (mit) entstanden }`. Die Umkehrung von
+    /// [`origin_of`](ContentStore::origin_of) — *derived-from* (Eingabe → Ergebnisse).
+    /// Dies ist die **Invalidierungs-Rückwärts-Kante** (§10.3): ändert sich eine
+    /// Eingabe, finden sich die abhängigen Ergebnisse durch Rückwärts-Lookup
+    /// (mechanisch, §1.7 a). Das **Neu-Berechnen** liegt außerhalb (§1.5). Reines,
+    /// neu-baubares Derivat (§8.4).
+    derived_from: HashMap<ContentId, Vec<ContentId>>,
     /// In-memory **Anker-Mitgliedschafts-Index — Anker→Repräsentanten** (§9.1/§9.3):
     /// `Anker-ContentId → { Repräsentanten, die per Mitgliedschafts-Kontext auf ihn
     /// verweisen }`. Ein Repräsentant R verweist auf den Anker A, wenn R einen
@@ -233,6 +248,8 @@ impl<I: EdgeIndex> ContentStore<I> {
             time_carriers: HashMap::new(),
             supersedes: HashMap::new(),
             superseded_by: HashMap::new(),
+            origin_of: HashMap::new(),
+            derived_from: HashMap::new(),
             anchor_to_reps: HashMap::new(),
             rep_to_anchors: HashMap::new(),
             anchor_id_of: HashMap::new(),
@@ -346,6 +363,55 @@ impl<I: EdgeIndex> ContentStore<I> {
             .ok_or(KernelError::Inconsistent)?;
         let resolution_id = self.append_datum(&resolution)?;
         Ok((real_id, resolution_id))
+    }
+
+    /// **materialize** (§10.1) — ein **berechnetes Ergebnis** als gewöhnliches Daten
+    /// speichern und, wenn es ein **älteres** Ergebnis ersetzt, es per Phase-3-
+    /// Ersetzungs-Kontext (§6.3) damit verknüpfen — **append-only**, das ältere wird
+    /// **nie** geändert oder gelöscht (§7.1).
+    ///
+    /// **HARTE GRENZE (§1.5/§10.1).** Der Kernel **berechnet das Ergebnis nicht** —
+    /// die **Schicht darüber** rechnet und reicht das fertige `result`-Daten ein
+    /// (§1.5: „Sie liest per Traversierung und schreibt ihre Ergebnisse als Daten
+    /// zurück"; §7.2: lakearch nimmt das fertige Ergebnis auf). Dieses Verb **hängt
+    /// nur an** (§7.1) und **verknüpft strukturell** (§1.3) — es leitet **nichts**
+    /// ab, wählt **nichts** aus und berechnet **nichts** neu. Das `result`-Daten
+    /// trägt seine **Herkunft als Kontext** bereits selbst ([`Datum::computed_result`]/
+    /// [`Datum::origin`], §10.2); dieses Verb wertet die Herkunft **nicht** (§1.4).
+    ///
+    /// Ablauf:
+    /// 1. hängt das `result`-Daten an (§7.1, Dedup §5.3) → `result_id`,
+    /// 2. wenn `replaces == Some(older)`: baut den **Ersetzungs-Kontext**
+    ///    [`Datum::supersedes`]`(older)`, hängt ihn an, und hängt einen
+    ///    **Verknüpfungs-Knoten** `{ result_id, supersedes_ctx }` an, der das neuere
+    ///    Ergebnis (besitzt `result_id`) über den Ersetzungs-Kontext auf das ältere
+    ///    `older` zeigen lässt (§6.3 — neuer überholt älter, beide Richtungen
+    ///    traversierbar §1.2). Das **ältere** Ergebnis bleibt unverändert (§7.1).
+    ///
+    /// Liefert `(result_id, Option<link_id>)`: die `ContentId` des materialisierten
+    /// Ergebnisses und — falls es ein älteres ersetzt — die des Verknüpfungs-Knotens.
+    /// Der Kernel **validiert nicht** (§1.4/§7.2): er prüft **nicht**, ob `older`
+    /// durabel vorliegt oder ob `result` überhaupt eine Herkunft trägt — das ist
+    /// Sache der schreibenden Schicht (§3.6/§7.2).
+    pub fn materialize(
+        &mut self,
+        result: &Datum,
+        replaces: Option<ContentId>,
+    ) -> Result<(ContentId, Option<ContentId>), KernelError> {
+        let result_id = self.append_datum(result)?;
+        let link_id = match replaces {
+            None => None,
+            Some(older) => {
+                let supersedes_ctx = Datum::supersedes(older);
+                let supersedes_ctx_id = self.append_datum(&supersedes_ctx)?;
+                // Der Verknüpfungs-Knoten besitzt das neuere Ergebnis UND den
+                // Ersetzungs-Kontext (zeigt auf das ältere); `node` kanonisiert.
+                let link = Datum::node([result_id, supersedes_ctx_id])
+                    .ok_or(KernelError::Inconsistent)?;
+                Some(self.append_datum(&link)?)
+            }
+        };
+        Ok((result_id, link_id))
     }
 
     /// **append_restructuring** (§13) — die §7.1/§13-„Änderung", die **mehrere Daten**
@@ -760,6 +826,26 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.superseded_by.get(&older).cloned().unwrap_or_default()
     }
 
+    /// Die **Eingaben, aus denen das berechnete Ergebnis `result` entstand** (§10.2)
+    /// — *origin* (Ergebnis → Eingaben). `result` besitzt je Eingabe einen
+    /// Herkunfts-Kontext, der auf sie zeigt. Owned, aufsteigend in 32-Byte-
+    /// `ContentId`-Order (kein Wert-Sort §1.4). Reines strukturelles Lesen (§1.3);
+    /// der Kernel **berechnet nichts** (§1.5/§10.1). **Ungated** (`pub(crate)`).
+    pub(crate) fn origin_inputs_of(&self, result: ContentId) -> Vec<ContentId> {
+        self.origin_of.get(&result).cloned().unwrap_or_default()
+    }
+
+    /// Die **abhängigen Ergebnisse einer Eingabe `input`** (§10.3) — *derived-from*
+    /// (Eingabe → Ergebnisse), die Umkehrung von
+    /// [`origin_inputs_of`](ContentStore::origin_inputs_of). Dies ist die
+    /// **Invalidierungs-Rückwärts-Kante** (§10.3): ändert sich `input`, sind das die
+    /// (direkt) betroffenen materialisierten Ergebnisse. Der Kernel **findet** sie nur
+    /// (mechanisch, §1.7 a); das **Neu-Berechnen** liegt außerhalb (§1.5). Owned,
+    /// aufsteigend (kein Wert-Sort §1.4). **Ungated** (`pub(crate)`).
+    pub(crate) fn dependents_of(&self, input: ContentId) -> Vec<ContentId> {
+        self.derived_from.get(&input).cloned().unwrap_or_default()
+    }
+
     /// **Sichtbarkeits-geprüfte** Variante eines Lookup-Ergebnisses (§11.3): filtert
     /// die Kandidaten-IDs auf die für `granted` **sichtbaren** (VANISH). Ein nicht
     /// vorhandenes Daten ist ununterscheidbar verborgen (§3.6/§11.3). Fail-closed
@@ -1109,6 +1195,8 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.time_carriers.clear();
         self.supersedes.clear();
         self.superseded_by.clear();
+        self.origin_of.clear();
+        self.derived_from.clear();
         let records = self.log.read_all()?;
         for rec in &records {
             let datum = strict_decode(&rec.payload)?;
@@ -1131,6 +1219,11 @@ impl<I: EdgeIndex> ContentStore<I> {
     ///   [`Datum::supersedes_target`]), so überholt `id` (das **neuere**) das benannte
     ///   `O` (das **ältere**, §6.3) → `supersedes[id]` += `O` **und**
     ///   `superseded_by[O]` += `id` (beide Richtungen traversierbar, §1.2).
+    /// - ein **Herkunfts-Kontext** (`{ origin_marker, E }`,
+    ///   [`Datum::origin_target`]), so entstand `id` (das **berechnete Ergebnis**) (mit)
+    ///   aus der Eingabe `E` (§10.2) → `origin_of[id]` += `E` **und** `derived_from[E]`
+    ///   += `id` (beide Richtungen, §1.2/§10.3 — `derived_from` ist die
+    ///   Invalidierungs-Rückwärts-Kante). Der Kernel **berechnet nichts** (§1.5).
     ///
     /// Ein Blatt oder ein Knoten ohne solche Kontexte trägt nichts ein. Ein noch
     /// nicht vorhandener Kontext (Geschlossenheit erzwingt die schreibende Schicht,
@@ -1164,6 +1257,14 @@ impl<I: EdgeIndex> ContentStore<I> {
             if let Some(older) = ctx.supersedes_target() {
                 push_sorted_dedup(self.supersedes.entry(id).or_default(), older);
                 push_sorted_dedup(self.superseded_by.entry(older).or_default(), id);
+            }
+            // Herkunfts-Kontext (§10.2): `id` (berechnetes Ergebnis) entstand (mit)
+            // aus der benannten Eingabe `input` → beide Richtungen indizieren. Die
+            // Rückwärts-Kante (`derived_from`) ist die Invalidierungs-Kante (§10.3);
+            // der Kernel BERECHNET nichts (§1.5).
+            if let Some(input) = ctx.origin_target() {
+                push_sorted_dedup(self.origin_of.entry(id).or_default(), input);
+                push_sorted_dedup(self.derived_from.entry(input).or_default(), id);
             }
         }
         Ok(())
@@ -2380,6 +2481,71 @@ mod tests {
         assert_eq!(store.time_carriers_of(rec_stmt), vec![carrier]);
         assert_eq!(store.supersedes_of(newer), vec![older]);
         assert_eq!(store.superseded_by_of(older), vec![newer]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 6: Herkunfts-Index (§10.2/§10.3) — beide Richtungen, `materialize`
+    // ersetzt append-only, und der Index übersteht Wipe-&-Rebuild + Reopen (§8.4).
+    // Der Store BERECHNET NICHTS — die Schicht darüber reicht das Ergebnis ein (§1.5).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn origin_index_both_directions_materialize_and_survive_rebuild() {
+        let dir = tempdir().unwrap();
+        let (in_a, in_b, old_id, new_id, link_id);
+        {
+            let mut store = open_store(dir.path());
+            in_a = store.append_datum(&Datum::leaf(b"a".to_vec())).unwrap();
+            in_b = store.append_datum(&Datum::leaf(b"b".to_vec())).unwrap();
+            store.append_datum(&Datum::origin_marker()).unwrap();
+            store.append_datum(&Datum::origin(in_a)).unwrap();
+            store.append_datum(&Datum::origin(in_b)).unwrap();
+            store.append_datum(&Datum::supersession_marker()).unwrap();
+
+            // Älteres Ergebnis aus (a, b).
+            let p_old = store.append_datum(&Datum::leaf(b"r1".to_vec())).unwrap();
+            let old = Datum::computed_result([p_old], [in_a, in_b]).unwrap();
+            let (oid, olink) = store.materialize(&old, None).unwrap();
+            old_id = oid;
+            assert!(olink.is_none());
+
+            // §10.2: das Ergebnis trägt BEIDE Eingaben (origin: Ergebnis → Eingaben).
+            let mut origins = store.origin_inputs_of(old_id);
+            origins.sort_unstable();
+            let mut want = [in_a, in_b];
+            want.sort_unstable();
+            assert_eq!(origins, want);
+            // §10.3: derived-from (Eingabe → Ergebnisse) — die Rückwärts-Kante.
+            assert_eq!(store.dependents_of(in_a), vec![old_id]);
+            assert_eq!(store.dependents_of(in_b), vec![old_id]);
+
+            // Neueres Ergebnis ersetzt das ältere (§10.1/§6.3), append-only.
+            let p_new = store.append_datum(&Datum::leaf(b"r2".to_vec())).unwrap();
+            let new = Datum::computed_result([p_new], [in_a]).unwrap();
+            let (nid, nlink) = store.materialize(&new, Some(old_id)).unwrap();
+            new_id = nid;
+            link_id = nlink.expect("Verknüpfungs-Knoten (§6.3)");
+            // Das Ältere wird NICHT mutiert: es ist unverändert lesbar (§7.1).
+            assert_eq!(
+                store.get_by_content_id(old_id).unwrap(),
+                Some(old)
+            );
+            // Der Verknüpfungs-Knoten überholt das ältere Ergebnis (beide Richtungen).
+            assert_eq!(store.supersedes_of(link_id), vec![old_id]);
+            assert_eq!(store.superseded_by_of(old_id), vec![link_id]);
+
+            // Wipe + Neu-Bau: der Herkunfts-Index ist identisch (§8.4).
+            let dep_a_before = store.dependents_of(in_a);
+            store.rebuild_index_from_log().unwrap();
+            assert_eq!(store.dependents_of(in_a), dep_a_before, "derived-from identisch (§8.4)");
+            assert_eq!(store.origin_inputs_of(old_id), want, "origin identisch (§8.4)");
+        }
+        // Reopen: aus dem Log rekonstruiert (§8.4).
+        let store = open_store(dir.path());
+        let mut deps = store.dependents_of(in_a);
+        deps.sort_unstable();
+        assert!(deps.contains(&old_id) && deps.contains(&new_id), "beide Ergebnisse abhängig von a");
+        assert_eq!(store.supersedes_of(link_id), vec![old_id]);
     }
 
     // ------------------------------------------------------------------------

@@ -390,6 +390,72 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         store.visible_filter(&reals, granted, w)
     }
 
+    /// **materialize** (§10.1) — ein **berechnetes Ergebnis** als gewöhnliches Daten
+    /// speichern (die Schicht darüber reicht es ein, §1.5/§7.2) und, wenn es ein
+    /// **älteres** Ergebnis ersetzt (`replaces = Some(older)`), es per Phase-3-
+    /// Ersetzungs-Kontext (§6.3) damit verknüpfen — **append-only**, das ältere wird
+    /// **nie** geändert/gelöscht (§7.1).
+    ///
+    /// **Der Kernel BERECHNET das Ergebnis NICHT** (§1.5/§10.1): `result` ist das
+    /// fertige Daten der schreibenden Schicht; dieses Verb hängt nur an (§7.1) und
+    /// verknüpft strukturell (§1.3). Delegiert an
+    /// [`crate::store::ContentStore::materialize`] (Schreib-Lock; der Store ist der
+    /// eine Append-Pfad). Liefert `(result_id, Option<link_id>)`.
+    pub fn materialize(
+        &self,
+        result: &Datum,
+        replaces: Option<ContentId>,
+    ) -> Result<(ContentId, Option<ContentId>), KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.materialize(result, replaces)
+    }
+
+    /// **Gegatete Herkunft — Ergebnis→Eingaben** (§10.2/§11.3): die für die
+    /// `capability` **sichtbaren** Eingaben, aus denen das berechnete Ergebnis
+    /// `result` entstand. Reines strukturelles Folgen der Herkunfts-Kontexte
+    /// (§1.2/§1.3); der Kernel **berechnet nichts** und entscheidet **nicht**, welches
+    /// Ergebnis „aktuell" ist (§1.5/§10.1).
+    ///
+    /// **Gated (§11.3):** eine nicht-sichtbare Eingabe VANISHt. Nur `ContentId`s;
+    /// Inhalt nur über das Tor (§11.5). Fail-closed (§11). Der `snapshot`-Token pinnt
+    /// das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
+    pub fn origin_inputs_visible(
+        &self,
+        result: ContentId,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.origin_inputs_of(result);
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+    }
+
+    /// **Gegatete Invalidierung — find_dependents (eine Stufe)** (§10.3/§11.3): die
+    /// für die `capability` **sichtbaren** materialisierten Ergebnisse, die (direkt)
+    /// von der Eingabe `input` abhängen — die Invalidierungs-Rückwärts-Kante (§10.3,
+    /// *derived-from*). Der Kernel **findet** sie nur (mechanisch, §1.7 a); das
+    /// **Als-stale-markieren/Neu-Berechnen** liegt **außerhalb** (§1.5/§7.1) — es gibt
+    /// **kein** Verb, das hier neu berechnet oder auto-invalidiert.
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbares abhängiges Ergebnis VANISHt. Nur
+    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11). Der
+    /// `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
+    ///
+    /// Für die **mehrstufige** (transitive) Rückwärts-Traversierung der Herkunft —
+    /// beschränkt, zyklensicher — siehe die Trait-Verben
+    /// [`crate::api::Kernel::find_dependents`] /
+    /// [`crate::api::Kernel::traverse_provenance_backward`].
+    pub fn dependents_visible(
+        &self,
+        input: ContentId,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.dependents_of(input);
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+    }
+
     /// **Gegatete Anker-Mitgliedschaft — Anker→Repräsentanten** (§9.1/§9.3/§11.3):
     /// die für die `capability` **sichtbaren** Repräsentanten, die per Mitgliedschafts-
     /// Kontext auf den Anker `anchor` verweisen (§9.2). Reines strukturelles Folgen der
@@ -711,6 +777,148 @@ impl<I: EdgeIndex> Kernel for LakearchKernel<I> {
         let steps = run_traversal(&store, &capability, &params, &CancelFlag::new(), w);
         Ok(Box::new(steps.into_iter()))
     }
+
+    /// **find_dependents** (§10.2/§10.3) — findet die von `input` abhängigen
+    /// materialisierten Ergebnisse durch **Rückwärts-Traversierung** der Herkunfts-
+    /// Kontexte (*derived-from*: Eingabe → Ergebnisse), **transitiv** (ein Ergebnis
+    /// kann selbst Eingabe eines weiteren sein) und **mechanisch** (§1.7 a):
+    /// **deterministisch**, durch eine **Besuchsmenge beschränkt** und damit
+    /// **zyklensicher** (§1.6/§1.7 a). Der Kernel **läuft nur rückwärts** und matcht
+    /// (§1.3); das **Als-stale-markieren** und **Neu-Berechnen** liegt **außerhalb**
+    /// (§1.5/§7.1) — dieses Verb fügt **kein** Verb hinzu, das neu berechnet oder
+    /// auto-invalidiert.
+    ///
+    /// Jeder [`crate::api::Step`] ist eine durchschrittene Herkunfts-Kante: `from`
+    /// (die geänderte Eingabe / ein abhängiges Zwischen-Ergebnis), `edge_ctx` (die
+    /// `ContentId` des Herkunfts-Kontextes [`Datum::origin`]`(from)`, den das
+    /// abhängige Ergebnis besitzt) und `to` (das abhängige Ergebnis). **Gegated**
+    /// (§11.3, VANISH/fail-closed) und **§13-aktiv** über das am `snapshot` gepinnte
+    /// Watermark `W`. **Frozen-Form ohne Capability** ⇒ fail-safe leere gewährte
+    /// Bereiche (nur unbeschränkte Daten sichtbar, beschränkte VANISHen, §11.3); der
+    /// volle gegatete Einstieg ist [`LakearchKernel::dependents_visible`] (eine Stufe).
+    fn find_dependents<'a>(
+        &'a self,
+        input: ContentId,
+        snapshot: SnapshotToken,
+    ) -> Result<StepStream<'a>, KernelError> {
+        let capability = Capability::issue(GrantedScopes::from_scope_ids([]));
+        let steps = self.provenance_walk(input, ProvenanceDir::Dependents, u32::MAX, u64::MAX, &capability, snapshot)?;
+        Ok(Box::new(steps.into_iter().map(Ok)))
+    }
+
+    /// **traverse_provenance_backward** (§10.2/§10.3) — die allgemeine **Rückwärts-
+    /// Traversierung der Herkunfts-Kontexte** ab `result` (*origin*: Ergebnis →
+    /// Eingaben → deren Eingaben …), beschränkt durch `max_depth`/`max_nodes` und
+    /// **zyklensicher** über eine Besuchsmenge (§10.3/§1.7 a). Mechanisch (§1.4);
+    /// **kein** Neu-Berechnen (§1.5).
+    ///
+    /// Jeder [`crate::api::Step`] ist eine durchschrittene Herkunfts-Kante: `from`
+    /// (das Ergebnis / ein Zwischen-Ergebnis), `edge_ctx` (die `ContentId` des
+    /// Herkunfts-Kontextes [`Datum::origin`]`(to)`, den `from` besitzt) und `to` (eine
+    /// Eingabe). **Gegated** (§11.3, VANISH/fail-closed) und **§13-aktiv** über das am
+    /// `snapshot` gepinnte Watermark `W`; **frozen-Form ohne Capability** ⇒ fail-safe
+    /// leere gewährte Bereiche (§11.3).
+    fn traverse_provenance_backward<'a>(
+        &'a self,
+        result: ContentId,
+        max_depth: u32,
+        max_nodes: u64,
+        snapshot: SnapshotToken,
+    ) -> Result<StepStream<'a>, KernelError> {
+        let capability = Capability::issue(GrantedScopes::from_scope_ids([]));
+        let steps = self.provenance_walk(result, ProvenanceDir::Origins, max_depth, max_nodes, &capability, snapshot)?;
+        Ok(Box::new(steps.into_iter().map(Ok)))
+    }
+}
+
+/// Richtung der **Herkunfts-Traversierung** (§10) — beide rein **mechanisch**
+/// (§1.7 a), über die rebuildbaren Herkunfts-Indizes des Stores.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProvenanceDir {
+    /// **Rückwärts** ab einem Ergebnis zu seinen **Eingaben** (*origin*; §10.2) —
+    /// `traverse_provenance_backward`.
+    Origins,
+    /// Von einer **Eingabe** zu den **abhängigen Ergebnissen** (*derived-from*;
+    /// die Invalidierungs-Rückwärts-Kante §10.3) — `find_dependents`.
+    Dependents,
+}
+
+impl<I: EdgeIndex> LakearchKernel<I> {
+    /// Gemeinsame **mechanische Herkunfts-Traversierung** (§10.2/§10.3/§1.7 a):
+    /// **deterministisch** (aufsteigende `ContentId`-Adress-Order, §5.2/§1.4),
+    /// durch eine **Besuchsmenge beschränkt** und damit **zyklensicher** (§1.6),
+    /// **budget-beschränkt** (`max_depth`/`max_nodes` ⇒ definierter
+    /// [`KernelError::TraversalBudgetExceeded`], nie unbeschränkter Speicher) und
+    /// **gegated** (§11.3: VANISH/fail-closed; §13: aktiv unter dem gepinnten `W`).
+    /// Der Kernel **matcht nur** (§1.3) und **berechnet nichts** (§1.5).
+    ///
+    /// Liefert die durchschrittenen [`crate::api::Step`]s als owned `Vec` (server-
+    /// seitig vollständig materialisiert, aber durch `max_nodes` speicher-beschränkt).
+    fn provenance_walk(
+        &self,
+        start: ContentId,
+        dir: ProvenanceDir,
+        max_depth: u32,
+        max_nodes: u64,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+    ) -> Result<Vec<crate::api::Step>, KernelError> {
+        use crate::api::Step;
+        use std::collections::HashSet;
+
+        let w = snapshot.watermark();
+        let granted = capability.scopes().scope_ids();
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+
+        let mut steps: Vec<Step> = Vec::new();
+        let mut visited: HashSet<ContentId> = HashSet::new();
+        visited.insert(start);
+        // BFS-Front: (Knoten, Tiefe). Die Front-Reihenfolge ist deterministisch, weil
+        // die Nachbar-Listen aufsteigend adress-sortiert sind (§5.2/§1.4).
+        let mut frontier: Vec<(ContentId, u32)> = vec![(start, 0)];
+
+        while let Some((node, depth)) = frontier.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+            // Nachbarn = die (sichtbaren, §13-aktiven) Daten, zu denen die Herkunfts-
+            // Kante führt. Der `edge_ctx` ist strukturell der Herkunfts-Kontext, der
+            // die beiden verbindet (§10.2) — je nach Richtung `origin(neighbor)` (ein
+            // Ergebnis besitzt `origin(input)`) bzw. `origin(node)` (ein abhängiges
+            // Ergebnis besitzt `origin(input=node)`).
+            let raw = match dir {
+                ProvenanceDir::Origins => store.origin_inputs_of(node),
+                ProvenanceDir::Dependents => store.dependents_of(node),
+            };
+            let neighbors = store.visible_filter(&raw, granted, w)?;
+            for neighbor in neighbors {
+                let edge_ctx = match dir {
+                    // node (Ergebnis) → neighbor (Eingabe): node besitzt origin(neighbor).
+                    ProvenanceDir::Origins => ContentId::of_datum(&Datum::origin(neighbor)),
+                    // node (Eingabe) → neighbor (abhängiges Ergebnis): neighbor besitzt origin(node).
+                    ProvenanceDir::Dependents => ContentId::of_datum(&Datum::origin(node)),
+                };
+                if steps.len() as u64 >= max_nodes {
+                    return Err(KernelError::TraversalBudgetExceeded);
+                }
+                steps.push(Step {
+                    from: node,
+                    edge_ctx,
+                    to: neighbor,
+                    depth: depth + 1,
+                });
+                // Zyklensicher (§1.6/§1.7 a): einen Knoten nie zweimal expandieren.
+                if visited.insert(neighbor) {
+                    frontier.push((neighbor, depth + 1));
+                }
+            }
+        }
+        // Deterministische Emission (§5.2/§1.4): aufsteigend nach (from, edge_ctx, to).
+        steps.sort_unstable_by(|a, b| {
+            (a.from, a.edge_ctx, a.to, a.depth).cmp(&(b.from, b.edge_ctx, b.to, b.depth))
+        });
+        Ok(steps)
+    }
 }
 
 #[cfg(test)]
@@ -883,9 +1091,10 @@ mod tests {
 
     #[test]
     fn unwired_verbs_still_report_their_phase() {
-        // Nach Phase 2 sind Matching + Traversierung verdrahtet; die noch
-        // unverdrahteten Verben (Aktiv-Marker = Phase 5, Provenance = Phase 6)
-        // melden weiterhin ihre Phase, kein Verb panickt.
+        // Nach Phase 6 sind Matching + Traversierung (Phase 2) und die Provenance-
+        // Verben (Phase 6) verdrahtet; die noch unverdrahtete frozen-Form
+        // `set_active_marker` (Phase 5 nutzt den konkreten `append_restructuring`)
+        // meldet weiterhin ihre Phase, kein Verb panickt.
         let dir = tempdir().unwrap();
         let k = open_kernel(dir.path());
         let snap = k.pin_snapshot().unwrap();
@@ -896,14 +1105,14 @@ mod tests {
             k.set_active_marker(&[a, b]),
             Err(KernelError::NotYetImplemented(5))
         ));
-        assert!(matches!(
-            k.find_dependents(a, snap).err(),
-            Some(KernelError::NotYetImplemented(6))
-        ));
-        assert!(matches!(
-            k.traverse_provenance_backward(a, 4, 100, snap).err(),
-            Some(KernelError::NotYetImplemented(6))
-        ));
+        // Phase 6 verdrahtet: die Provenance-Verben laufen (rückwärts, §10.3); für
+        // ein unbekanntes Daten ist der Step-Strom leer (kein Fehler, kein Panic).
+        let deps = k.find_dependents(a, snap).expect("find_dependents verdrahtet (Phase 6)");
+        assert_eq!(deps.count(), 0, "unbekannte Eingabe ⇒ leerer Strom");
+        let prov = k
+            .traverse_provenance_backward(a, 4, 100, snap)
+            .expect("traverse_provenance_backward verdrahtet (Phase 6)");
+        assert_eq!(prov.count(), 0, "unbekanntes Ergebnis ⇒ leerer Strom");
     }
 
     // ------------------------------------------------------------------------
@@ -1948,5 +2157,307 @@ mod tests {
         // Mitgliedschaft überholt die alte.
         assert_eq!(k.supersedes_visible(rep_new_id, &cap_d, snap_d).unwrap(), vec![m_old]);
         assert_eq!(k.superseded_by_visible(m_old, &cap_d, snap_d).unwrap(), vec![rep_new_id]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 6: Materialisierung & Herkunft (§10). Der Kernel BERECHNET NICHTS —
+    // die Schicht darüber reicht das fertige Ergebnis ein; der Kernel hält die
+    // Herkunft als Kontext (§10.2), findet die Abhängigen rückwärts (§10.3) und
+    // verknüpft ein neueres Ergebnis per Ersetzung (§6.3/§10.1).
+    // ------------------------------------------------------------------------
+
+    /// Sammelt die `to`-Knoten eines Step-Stroms (deterministisch geordnet).
+    fn collect_to(stream: StepStream<'_>) -> Vec<ContentId> {
+        stream.map(|s| s.expect("step").to).collect()
+    }
+
+    #[test]
+    fn computed_result_records_origins_and_find_dependents_runs_backward() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Die schreibende Schicht reicht zwei Eingaben + das fertige Ergebnis ein.
+        let in_a = k.append(&Datum::leaf(b"input-a".to_vec())).unwrap();
+        let in_b = k.append(&Datum::leaf(b"input-b".to_vec())).unwrap();
+        // Die Herkunfts-Kontexte MÜSSEN durabel sein, bevor das Ergebnis indiziert
+        // wird (§3.6: Geschlossenheit erzwingt die schreibende Schicht).
+        k.append(&Datum::origin_marker()).unwrap();
+        k.append(&Datum::origin(in_a)).unwrap();
+        k.append(&Datum::origin(in_b)).unwrap();
+        let payload = k.append(&Datum::leaf(b"ergebnis".to_vec())).unwrap();
+        let result = Datum::computed_result([payload], [in_a, in_b]).unwrap();
+        // `materialize` ohne Ersetzung: nur anhängen (der Kernel berechnet nichts).
+        let (result_id, link) = k.materialize(&result, None).unwrap();
+        assert!(link.is_none(), "kein älteres Ergebnis ⇒ kein Verknüpfungs-Knoten");
+
+        let snap = k.pin_snapshot().unwrap();
+
+        // §10.2: das Ergebnis trägt strukturell BEIDE Eingaben (gegateter Vorwärts-Helfer).
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        let mut inputs = k.origin_inputs_visible(result_id, &cap, snap).unwrap();
+        inputs.sort_unstable();
+        let mut want = [in_a, in_b];
+        want.sort_unstable();
+        assert_eq!(inputs, want, "alle Herkunfts-Eingaben strukturell erfasst (§10.2)");
+
+        // §10.3: find_dependents(input) läuft RÜCKWÄRTS zu den abhängigen Ergebnissen.
+        let deps_a = collect_to(k.find_dependents(in_a, snap).unwrap());
+        assert_eq!(deps_a, vec![result_id], "in_a → abhängiges Ergebnis (§10.3)");
+        let deps_b = collect_to(k.find_dependents(in_b, snap).unwrap());
+        assert_eq!(deps_b, vec![result_id], "in_b → abhängiges Ergebnis (§10.3)");
+        // Ein Daten, das keine Eingabe ist, hat keine Abhängigen.
+        assert!(collect_to(k.find_dependents(result_id, snap).unwrap()).is_empty());
+
+        // traverse_provenance_backward(result) läuft zu den Eingaben (§10.2).
+        let mut origins = collect_to(k.traverse_provenance_backward(result_id, 8, 100, snap).unwrap());
+        origins.sort_unstable();
+        assert_eq!(origins, want, "Provenance rückwärts: Ergebnis → Eingaben (§10.2)");
+
+        // Die EINGABEN sind UNVERÄNDERT/immutabel (append-only §7.1): dieselbe ID,
+        // dieselben Bytes — die Materialisierung mutiert nichts Bestehendes.
+        let ca = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        let sealed_a = k.get_by_content_id(in_a, &ca, snap).unwrap().expect("in_a vorhanden");
+        let opened = open(&sealed_a, &ca).expect("sichtbar");
+        let decoded = strict_decode(opened.canonical_bytes()).unwrap();
+        assert_eq!(decoded, Datum::leaf(b"input-a".to_vec()), "Eingabe unverändert (§7.1)");
+        assert_eq!(ContentId::of_datum(&decoded), in_a, "Eingabe-ID stabil (§5.2)");
+    }
+
+    #[test]
+    fn newer_materialized_result_supersedes_older_without_mutating_it() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let input = k.append(&Datum::leaf(b"quelle".to_vec())).unwrap();
+        k.append(&Datum::origin_marker()).unwrap();
+        k.append(&Datum::origin(input)).unwrap();
+        k.append(&Datum::supersession_marker()).unwrap();
+
+        // Erstes (älteres) berechnetes Ergebnis.
+        let p_old = k.append(&Datum::leaf(b"ergebnis-v1".to_vec())).unwrap();
+        let old_result = Datum::computed_result([p_old], [input]).unwrap();
+        let (old_id, old_link) = k.materialize(&old_result, None).unwrap();
+        assert!(old_link.is_none());
+
+        // Neueres Ergebnis ERSETZT das ältere (§10.1/§6.3) — append-only.
+        let p_new = k.append(&Datum::leaf(b"ergebnis-v2".to_vec())).unwrap();
+        let new_result = Datum::computed_result([p_new], [input]).unwrap();
+        let (new_id, new_link) = k.materialize(&new_result, Some(old_id)).unwrap();
+        let link_id = new_link.expect("Verknüpfungs-Knoten verknüpft neu→alt (§6.3)");
+        assert_ne!(new_id, old_id);
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+        // Die Ersetzung ist beidseitig traversierbar (§6.3): der Verknüpfungs-Knoten
+        // (das Neuere besitzt den Ersetzungs-Kontext) überholt das ältere Ergebnis.
+        assert_eq!(k.supersedes_visible(link_id, &cap, snap).unwrap(), vec![old_id]);
+        assert_eq!(k.superseded_by_visible(old_id, &cap, snap).unwrap(), vec![link_id]);
+
+        // Das ÄLTERE Ergebnis bleibt UNVERÄNDERT und über das Tor lesbar (§7.1) —
+        // die Ersetzung LÖSCHT/MUTIERT es nicht.
+        let sealed = k.get_by_content_id(old_id, &cap, snap).unwrap().expect("alt bleibt");
+        let opened = open(&sealed, &cap).expect("sichtbar");
+        let decoded = strict_decode(opened.canonical_bytes()).unwrap();
+        assert_eq!(ContentId::of_datum(&decoded), old_id, "altes Ergebnis unverändert (§7.1)");
+
+        // Beide Ergebnisse hängen weiterhin an derselben Eingabe (§10.2) — der Kernel
+        // entscheidet NICHT, welches „aktuell" ist (§6.4/§8); beide sind Abhängige.
+        let mut deps = collect_to(k.find_dependents(input, snap).unwrap());
+        deps.sort_unstable();
+        assert!(deps.contains(&old_id) && deps.contains(&new_id), "beide Ergebnisse abhängig (§10.3)");
+    }
+
+    #[test]
+    fn provenance_is_cycle_safe_and_budget_bounded() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        k.append(&Datum::origin_marker()).unwrap();
+
+        // Konstruiere einen ZYKLUS über Herkunfts-Kontexte: A entstand aus B, B aus A.
+        // (Zyklen sind erlaubt §1.6; die mechanische Traversierung terminiert über die
+        // Besuchsmenge §1.7 a.) Wir bauen zwei Daten, die einander als Eingabe nennen.
+        let a_payload = ContentId::of_datum(&Datum::leaf(b"A".to_vec()));
+        let b_payload = ContentId::of_datum(&Datum::leaf(b"B".to_vec()));
+        // Vorab die IDs berechnen, um die wechselseitige Herkunft zu schließen.
+        let a = Datum::computed_result([a_payload], [b_payload]).unwrap();
+        let a_id = ContentId::of_datum(&a);
+        let b = Datum::computed_result([b_payload], [a_id]).unwrap();
+        let b_id = ContentId::of_datum(&b);
+        // Schließe den Zyklus: A entsteht aus B (B existiert als Verweis-Ziel über die
+        // schreibende Schicht; der Kernel validiert die Geschlossenheit nicht, §3.6).
+        let a2 = Datum::computed_result([a_payload], [b_id]).unwrap();
+
+        // Alle Herkunfts-Kontexte + Daten anhängen.
+        k.append(&Datum::leaf(b"A".to_vec())).unwrap();
+        k.append(&Datum::leaf(b"B".to_vec())).unwrap();
+        k.append(&Datum::origin(b_payload)).unwrap();
+        k.append(&b).unwrap();
+        k.append(&Datum::origin(a_id)).unwrap();
+        k.append(&Datum::origin(b_id)).unwrap();
+        k.append(&a2).unwrap();
+        let a2_id = ContentId::of_datum(&a2);
+
+        let snap = k.pin_snapshot().unwrap();
+        // Die Traversierung TERMINIERT trotz Zyklus (Besuchsmenge, §1.7 a).
+        let steps = collect_to(k.traverse_provenance_backward(a2_id, u32::MAX, 1000, snap).unwrap());
+        assert!(!steps.is_empty(), "Zyklus terminiert, liefert Schritte (§1.7 a)");
+
+        // Budget: max_nodes = 0 ⇒ definierter Budget-Fehler, sobald ein Schritt
+        // entstünde (kein unbeschränkter Speicher, §1.7 a).
+        let r = k.traverse_provenance_backward(a2_id, u32::MAX, 0, snap);
+        assert!(matches!(r, Err(KernelError::TraversalBudgetExceeded)));
+    }
+
+    #[test]
+    fn non_visible_origin_input_vanishes() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Eine bereichs-beschränkte (geheime) Eingabe; das Ergebnis ist unbeschränkt.
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        let _am = k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+        let secret_input = k.append(&Datum::node([membership]).unwrap()).unwrap();
+
+        k.append(&Datum::origin_marker()).unwrap();
+        k.append(&Datum::origin(secret_input)).unwrap();
+        let payload = k.append(&Datum::leaf(b"erg".to_vec())).unwrap();
+        let result = Datum::computed_result([payload], [secret_input]).unwrap();
+        let (result_id, _) = k.materialize(&result, None).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        // Rechtloser Leser: die geheime Eingabe VANISHt aus der Herkunft (§11.3).
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(
+            k.origin_inputs_visible(result_id, &denied, snap).unwrap().is_empty(),
+            "geheime Eingabe VANISHt (§11.3)"
+        );
+        // Auch die rückwärtige Provenance-Traversierung leakt sie nicht.
+        assert!(collect_to(k.traverse_provenance_backward(result_id, 8, 100, snap).unwrap()).is_empty());
+
+        // Mit gewährtem Bereich wird die Eingabe sichtbar.
+        let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+        assert_eq!(
+            k.origin_inputs_visible(result_id, &granted, snap).unwrap(),
+            vec![secret_input]
+        );
+    }
+
+    #[test]
+    fn origin_index_survives_reopen_and_wipe_and_rebuild() {
+        let dir = tempdir().unwrap();
+        let in_a;
+        let result_id;
+        {
+            let k = open_kernel(dir.path());
+            in_a = k.append(&Datum::leaf(b"in".to_vec())).unwrap();
+            k.append(&Datum::origin_marker()).unwrap();
+            k.append(&Datum::origin(in_a)).unwrap();
+            let p = k.append(&Datum::leaf(b"out".to_vec())).unwrap();
+            let result = Datum::computed_result([p], [in_a]).unwrap();
+            result_id = k.materialize(&result, None).unwrap().0;
+
+            let snap = k.pin_snapshot().unwrap();
+            assert_eq!(collect_to(k.find_dependents(in_a, snap).unwrap()), vec![result_id]);
+        }
+        // Reopen: der Herkunfts-Index ist ein reines, neu-baubares Derivat (§8.4) —
+        // beim Öffnen aus dem Log rekonstruiert.
+        {
+            let k = open_kernel(dir.path());
+            let snap = k.pin_snapshot().unwrap();
+            assert_eq!(collect_to(k.find_dependents(in_a, snap).unwrap()), vec![result_id],
+                "Herkunfts-Index nach Reopen identisch (§8.4)");
+
+            // Wipe & rebuild: explizit den Index verwerfen und aus dem Log neu bauen.
+            {
+                let mut store = k.store.write().unwrap();
+                store.rebuild_index_from_log().unwrap();
+            }
+            let snap2 = k.pin_snapshot().unwrap();
+            assert_eq!(collect_to(k.find_dependents(in_a, snap2).unwrap()), vec![result_id],
+                "Wipe-&-Rebuild rekonstruiert den Herkunfts-Index identisch (§8.4)");
+            let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap2).unwrap();
+            let mut origins = collect_to(k.traverse_provenance_backward(result_id, 8, 100, snap2).unwrap());
+            origins.sort_unstable();
+            assert_eq!(origins, vec![in_a]);
+            let _ = cap;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 6 / HARTE GRENZE (§1.5/§10.3): der Kernel FINDET die Abhängigen, aber
+    // er BERECHNET NIE NEU und MARKIERT NIE selbst als stale/invalide. Dieser Test
+    // friert die Negativ-Garantie ein:
+    //   - `find_dependents` ist ein reiner LESE-Pfad (`&self`, liefert einen
+    //     Step-Strom) — er mutiert NICHTS (kein neuer Record, kein Ersetzungs-
+    //     Kontext, keine §13-Epoche entsteht durch das bloße Finden);
+    //   - es existiert KEIN Verb der Gestalt `recompute(input)` /
+    //     `invalidate(input)` / `mark_stale(result)` auf dem Kernel — die einzige
+    //     Antwort des Kernels auf eine geänderte Eingabe ist das FINDEN der
+    //     Abhängigen; das Neu-Berechnen ist ein WEITERER Append der Schicht darüber
+    //     (§1.5/§7.1), den der Test hier exemplarisch selbst vollzieht.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn find_dependents_only_finds_and_never_recomputes_or_marks_stale() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Eine Eingabe + ein berechnetes Ergebnis (die Schicht darüber reicht es ein).
+        let input = k.append(&Datum::leaf(b"eingabe".to_vec())).unwrap();
+        k.append(&Datum::origin_marker()).unwrap();
+        k.append(&Datum::origin(input)).unwrap();
+        let payload = k.append(&Datum::leaf(b"erg".to_vec())).unwrap();
+        let result = Datum::computed_result([payload], [input]).unwrap();
+        let (result_id, _) = k.materialize(&result, None).unwrap();
+
+        // Vollständige Mechanik-Zähler VOR dem Finden festhalten (append_count,
+        // committed_bytes, edge_count): das bloße FINDEN darf KEINEN davon bewegen.
+        let before = k.stats().unwrap();
+
+        // §10.3: die Eingabe „ändert sich" — der Kernel FINDET die Abhängigen. Wir
+        // rufen den Lese-Pfad MEHRFACH auf; er ist idempotent und mutationsfrei.
+        let snap = k.pin_snapshot().unwrap();
+        for _ in 0..3 {
+            let deps = collect_to(k.find_dependents(input, snap).unwrap());
+            assert_eq!(deps, vec![result_id], "find_dependents FINDET nur (§10.3)");
+        }
+        // Auch die transitive Rückwärts-Traversierung ist reines Lesen.
+        let _ = collect_to(k.traverse_provenance_backward(result_id, 8, 100, snap).unwrap());
+
+        // KEINE Mutation durch das Finden (§1.5/§7.1): die Mechanik-Zähler sind
+        // unverändert — kein neuer Record, keine neue Kante, keine neuen Log-Bytes.
+        let after = k.stats().unwrap();
+        assert_eq!(after.append_count, before.append_count, "kein neuer Record durch Finden");
+        assert_eq!(after.committed_bytes, before.committed_bytes, "keine neuen Log-Bytes");
+        assert_eq!(after.edge_count, before.edge_count, "keine neue Kante");
+
+        // Das abhängige Ergebnis ist NICHT als stale markiert worden: der Kernel hat
+        // KEINEN Ersetzungs-Kontext angehängt (§6.3) — `superseded_by(result)` ist
+        // leer. Hätte der Kernel auto-invalidiert, läge hier eine Ersetzung.
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(
+            k.superseded_by_visible(result_id, &cap, snap).unwrap().is_empty(),
+            "der Kernel markiert NICHTS selbst als stale (kein Auto-Invalidate, §1.5)"
+        );
+
+        // Das Neu-Berechnen liegt AUSSERHALB (§1.5): die Schicht darüber reagiert auf
+        // den gefundenen Abhängigen mit einem WEITEREN Append/Ersetzung — NICHT der
+        // Kernel. Hier exemplarisch: ein neues Ergebnis ersetzt das alte (§10.1/§6.3).
+        let p2 = k.append(&Datum::leaf(b"erg-v2".to_vec())).unwrap();
+        k.append(&Datum::supersession_marker()).unwrap();
+        let result2 = Datum::computed_result([p2], [input]).unwrap();
+        let (_r2, link) = k.materialize(&result2, Some(result_id)).unwrap();
+        let link_id = link.expect("die SCHICHT DARÜBER ersetzt — per Append (§7.1)");
+        // Erst JETZT — durch den Append der Schicht darüber, NICHT durch den Kernel —
+        // ist das alte Ergebnis ersetzt; und das alte bleibt append-only erhalten (§7.1).
+        let snap2 = k.pin_snapshot().unwrap();
+        let cap2 = k.authorize(GrantedScopes::from_scope_ids([]), snap2).unwrap();
+        assert_eq!(k.superseded_by_visible(result_id, &cap2, snap2).unwrap(), vec![link_id]);
+        assert!(
+            k.get_by_content_id(result_id, &cap2, snap2).unwrap().is_some(),
+            "altes Ergebnis bleibt durabel erhalten (append-only §7.1)"
+        );
     }
 }
