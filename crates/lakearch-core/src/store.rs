@@ -1466,6 +1466,17 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.anchor_cid_of.get(&anchor_id).copied()
     }
 
+    /// Alle **Anker-`ContentId`s** dieses Bestands (§9.1) — owned, aufsteigend in
+    /// 32-Byte-Adress-Order (deterministisch, **kein** Wert-Sort §1.4). Die Schicht
+    /// darüber nutzt sie, um Versöhnungs-Kandidaten für die Föderation (§12.4) zu
+    /// finden (sie **entscheidet** die referenzielle Identität, nicht der Kernel,
+    /// §9-Präambel/§5.7 b). Reine Karten-Auflösung; **kein** Inhalts-Read.
+    pub fn anchor_cids(&self) -> Vec<ContentId> {
+        let mut out: Vec<ContentId> = self.anchor_id_of.keys().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Die **gradierten Identitäts-Kontexte, die `datum` erwähnen** (§5.5) — owned,
     /// aufsteigend (kein Wert-Sort §1.4). Reines strukturelles Lesen (§1.3); der
     /// Kernel **vergleicht/schwellt Konfidenz nie** (§1.4/§5.5). **Ungated**.
@@ -1479,6 +1490,31 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// **nichts** gelöscht (§7.1). Reines Mengen-Matching (§1.3).
     pub fn is_curation_hidden(&self, id: ContentId) -> bool {
         self.curation_hidden.contains(&id)
+    }
+
+    /// Die `ContentId`s **aller** kuratorisch **verborgenen** Daten (§9.5) — owned,
+    /// aufsteigend in Adress-Order (deterministisch §5.2/§1.4). **Compaction-Eingabe**
+    /// (§15): verborgene Daten sind Kandidaten zum **physischen** Fallenlassen (das
+    /// logische Verbergen war reversibel; Compaction macht es endgültig — sofern kein
+    /// retained Daten sie noch referenziert, Refcount-Schutz §5.3).
+    pub fn curation_hidden_ids(&self) -> Vec<ContentId> {
+        let mut out: Vec<ContentId> = self.curation_hidden.iter().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Die `ContentId`s **aller überholten (älteren)** Daten (§6.3) — also der Daten,
+    /// die als `older` in **mindestens einer** Ersetzungs-Relation auftreten (*es gibt
+    /// ein neueres, das sie überholt*). Owned, aufsteigend (deterministisch §5.2/§1.4).
+    /// **Compaction-Eingabe** (§15): ein überholtes Daten ist ein Kandidat zum
+    /// physischen Fallenlassen — der Kernel **entscheidet aber nicht**, welche „Version
+    /// gilt" (§6.4/§8); welche überholten tatsächlich entfernt werden, bestimmt die
+    /// Schicht darüber/der Daemon (hier nur das mechanische Auflisten, §1.4). Der
+    /// Refcount-Schutz (§5.3) bewahrt referenzierte überholte Daten.
+    pub fn superseded_ids(&self) -> Vec<ContentId> {
+        let mut out: Vec<ContentId> = self.superseded_by.keys().copied().collect();
+        out.sort_unstable();
+        out
     }
 
     /// **Versöhnt** den Index mit dem durablen Log-Tail (§8.4-Recovery-
@@ -1512,6 +1548,183 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.index.commit_edges(&edges, t)?;
         self.metrics.edge_count = self.metrics.edge_count.saturating_add(edges.len() as u64);
         Ok(())
+    }
+
+    // -- Föderation (§12) ----------------------------------------------------
+
+    /// **iter_active_data** (§12.3) — alle durabel-vorhandenen **aktiven** (§13)
+    /// Daten dieses Bestands als `(ContentId, Datum)`-Paare, in **Abhängigkeits-
+    /// Reihenfolge**: jeder besessene Kontext eines Knotens erscheint **vor** dem
+    /// Knoten, der ihn besitzt (topologisch über die `owns`-Mengen).
+    ///
+    /// Die Reihenfolge ist **deterministisch** und **föderationsstabil**: Wurzeln
+    /// werden in aufsteigender `ContentId`-Adress-Order (§5.2/§1.4, **kein**
+    /// Wert-Sort) besucht und ein Knoten erst nach all seinen besessenen Kontexten
+    /// emittiert. So kann ein Aufnehmer (`ingest_foreign`) jedes Daten anhängen,
+    /// **nachdem** seine Kontexte bereits lokal vorliegen — die abgeleiteten Indizes
+    /// (Bereich §11.1, Berechtigung §11.1, Zeit §6, Anker/Identität §9/§5.5)
+    /// resolven dann jeden besessenen Kontext (§3.6: Geschlossenheit).
+    ///
+    /// **Nur aktive Daten (§13.2):** ein **inaktiver** Konstituent eines noch nicht
+    /// freigegebenen Umbaus wird **nicht** emittiert — ein halb-vollzogener Umbau
+    /// leckt nicht über die Föderation (er ist über jeden Lesepfad unsichtbar). Der
+    /// Snapshot ist das aktuelle durable Watermark `W`.
+    pub fn iter_active_data(&self) -> Result<Vec<(ContentId, Datum)>, KernelError> {
+        let w = self.current_watermark();
+        // Alle aktiven IDs, deterministisch aufsteigend (§5.2/§1.4).
+        let mut active: Vec<ContentId> = self
+            .dedup
+            .keys()
+            .copied()
+            .filter(|id| self.is_active(*id, w))
+            .collect();
+        active.sort_unstable();
+
+        // Topologische Emission: ein Knoten erst NACH seinen besessenen Kontexten
+        // (§3.6 — der Aufnehmer braucht die Kontexte lokal, bevor er den Knoten
+        // indiziert). Iterative DFS mit Visited-Set (zyklensicher §1.6: ein Daten,
+        // dessen ContentId seine Kontext-IDs einschließt, kann nicht mittelbar sich
+        // selbst besitzen — der Graph der `owns`-Referenzen ist hash-azyklisch; das
+        // Visited-Set ist dennoch die mechanische Terminierungs-Garantie, §1.7 a).
+        let mut out: Vec<(ContentId, Datum)> = Vec::new();
+        let mut emitted: HashSet<ContentId> = HashSet::new();
+        // Stack-Einträge: (id, datum, children_pushed?).
+        let mut stack: Vec<(ContentId, Datum, bool)> = Vec::new();
+        let mut on_stack: HashSet<ContentId> = HashSet::new();
+        for root in active {
+            if emitted.contains(&root) {
+                continue;
+            }
+            let root_datum = match self.get_active_datum(root, w)? {
+                Some(d) => d,
+                None => continue,
+            };
+            stack.push((root, root_datum, false));
+            on_stack.insert(root);
+            while let Some((id, datum, children_pushed)) = stack.pop() {
+                if children_pushed {
+                    // Nachbesuch: alle Kinder sind emittiert ⇒ jetzt diesen Knoten.
+                    on_stack.remove(&id);
+                    if emitted.insert(id) {
+                        out.push((id, datum));
+                    }
+                    continue;
+                }
+                if emitted.contains(&id) {
+                    on_stack.remove(&id);
+                    continue;
+                }
+                // Diesen Knoten nach seinen Kindern wieder besuchen.
+                let owns: Vec<ContentId> = datum.owns().map(|o| o.to_vec()).unwrap_or_default();
+                stack.push((id, datum, true));
+                for ctx in owns {
+                    if emitted.contains(&ctx) || on_stack.contains(&ctx) {
+                        // schon emittiert ODER bereits auf dem Pfad (hash-azyklisch,
+                        // §1.6): kein erneutes Aufschieben nötig.
+                        continue;
+                    }
+                    if let Some(child) = self.get_active_datum(ctx, w)? {
+                        stack.push((ctx, child, false));
+                        on_stack.insert(ctx);
+                    }
+                    // Fehlt der Kontext lokal (sollte für ein konsistentes durable
+                    // Log nicht vorkommen), wird er übersprungen — keine Wertung (§1.4).
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Liest das strikt dekodierte [`Datum`] zu `id`, **falls** es unter `w` aktiv
+    /// (§13) und durabel vorhanden ist; sonst `None`. Crate-intern für die
+    /// Föderations-Iteration (kein Tor nötig: das Ergebnis wird re-kanonisiert und
+    /// über den lokalen Append-Pfad — der seinerseits gegated liest — aufgenommen).
+    fn get_active_datum(&self, id: ContentId, w: u64) -> Result<Option<Datum>, KernelError> {
+        if !self.is_active(id, w) {
+            return Ok(None);
+        }
+        let bytes = match self.get_canonical_bytes(id)? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let datum = strict_decode(&bytes)?;
+        if ContentId::of_datum(&datum) != id {
+            return Err(KernelError::Inconsistent);
+        }
+        Ok(Some(datum))
+    }
+
+    /// **ingest_foreign** (§12.3/§12.5) — nimmt einen **fremden** Bestand in diesen
+    /// auf. **Kein Sonderfall** (§12.5): jedes aktive fremde Daten wird über den
+    /// **einen** lokalen Append-Pfad ([`append_datum`](ContentStore::append_datum))
+    /// angehängt; **inhaltsgleiche** Daten kollabieren **automatisch** über ihre
+    /// `ContentId` (Dedup §5.3/§12.3) — sie schreiben **nichts** und verbrauchen
+    /// **keine** seq.
+    ///
+    /// Die Aufnahme folgt der **Abhängigkeits-Reihenfolge** von
+    /// [`iter_active_data`](ContentStore::iter_active_data) (Kontexte vor Besitzern),
+    /// damit die abgeleiteten Indizes jeden besessenen Kontext lokal resolven können
+    /// (§3.6). Liefert `(new_count, dedup_count)`: wie viele fremde Daten **neu**
+    /// geschrieben wurden bzw. per Dedup **kollabierten**.
+    ///
+    /// **Anker-Versöhnung (§12.4) ist NICHT Teil dieses Schritts.** Inhalts-IDs sind
+    /// bestand-unabhängig (§12.3) und kollabieren hier automatisch; **Anker-IDs sind
+    /// bestand-lokal** (§9.1/§12.4) und werden über
+    /// [`reconcile_anchor`](ContentStore::reconcile_anchor) als **deterministische**
+    /// gradierte-Identitäts-Kontexte versöhnt — die Schicht darüber legt fest,
+    /// **welche** fremden und lokalen Anker „dasselbe Ding" sind (Korrelations-Pfad
+    /// §5.7 b; der Kernel **entscheidet keine Identität**, §9-Präambel/§1.4).
+    pub fn ingest_foreign<J: EdgeIndex>(
+        &mut self,
+        foreign: &ContentStore<J>,
+    ) -> Result<(u64, u64), KernelError> {
+        let foreign_data = foreign.iter_active_data()?;
+        let mut new_count: u64 = 0;
+        let mut dedup_count: u64 = 0;
+        for (id, datum) in &foreign_data {
+            // Vor dem Append feststellen, ob es ein Dedup-Treffer wird (§5.3/§12.3):
+            // existiert die ContentId lokal bereits, kollabiert das fremde Daten.
+            let collapses = self.contains(*id);
+            self.append_datum(datum)?;
+            if collapses {
+                dedup_count += 1;
+            } else {
+                new_count += 1;
+            }
+        }
+        Ok((new_count, dedup_count))
+    }
+
+    /// **reconcile_anchor** (§12.4) — versöhnt einen **fremden** Anker mit einem
+    /// **lokalen** über einen **gradierten Identitäts-Kontext** (§5.5), dessen Bytes
+    /// eine **reine, deterministische** Funktion von `(foreign_anchor, local_anchor,
+    /// rule)` sind ([`Datum::reconcile_anchors`]). **Keine** Wall-Clock, **kein**
+    /// Random ⇒ ein erneuter Aufruf erzeugt einen **byte-gleichen** Kontext, der per
+    /// Hash kollabiert (§5.3) — Doppel-/Concurrent-Ingest sind **idempotent** (§12.4).
+    ///
+    /// Der Versöhnungs-Kontext wird über den **einen** lokalen Append-Pfad serialisiert
+    /// (§7.1) — wie jede andere Aussage. Auch der **opake** Regel-Wert `rule` und der
+    /// `reconcile_rule`-Kontext werden angehängt (geschlossene Verweise §3.6), damit
+    /// die abgeleiteten Indizes (Gradierte-Identitäts-Links §5.5) sie auflösen.
+    /// Liefert die `ContentId` des Versöhnungs-Kontextes.
+    ///
+    /// Der Kernel **entscheidet keine Identität** (§9-Präambel/§1.4): er nimmt die von
+    /// der Schicht darüber bestimmte Korrelation (`foreign_anchor`, `local_anchor`,
+    /// `rule`) auf und **verlinkt** sie — er rankt/wertet/schwellt **nichts**.
+    pub fn reconcile_anchor(
+        &mut self,
+        foreign_anchor: ContentId,
+        local_anchor: ContentId,
+        rule: &Datum,
+    ) -> Result<ContentId, KernelError> {
+        // Den opaken Regel-Wert und seinen Rollen-Kontext anhängen (§3.6 Geschlossen-
+        // heit; Dedup §5.3 macht Wiederholung idempotent).
+        let rule_id = self.append_datum(rule)?;
+        let rule_ctx = Datum::reconcile_rule(rule_id);
+        self.append_datum(&rule_ctx)?;
+        // Der Versöhnungs-Kontext selbst — deterministisch in (foreign, local, rule).
+        let reconcile = Datum::reconcile_anchors(foreign_anchor, local_anchor, rule_id);
+        self.append_datum(&reconcile)
     }
 }
 
@@ -2890,5 +3103,88 @@ mod tests {
         // Auch nach Reopen (Neu-Aufbau aus dem Log) bleibt es reversiert.
         let store = open_store(dir.path());
         assert!(!store.is_curation_hidden(target));
+    }
+
+    // -- Föderation (§12) ----------------------------------------------------
+
+    #[test]
+    fn iter_active_data_emits_contexts_before_owners() {
+        // §12.3: die Föderations-Iteration emittiert jeden besessenen Kontext VOR dem
+        // Knoten, der ihn besitzt (Abhängigkeits-Reihenfolge), damit der Aufnehmer die
+        // Kontexte lokal hat, bevor er den Knoten indiziert (§3.6).
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let a = store.append_datum(&Datum::leaf(b"a".to_vec())).unwrap();
+        let b = store.append_datum(&Datum::leaf(b"b".to_vec())).unwrap();
+        let node = Datum::node([a, b]).unwrap();
+        let node_id = store.append_datum(&node).unwrap();
+
+        let data = store.iter_active_data().unwrap();
+        let pos = |needle: ContentId| data.iter().position(|(id, _)| *id == needle).unwrap();
+        assert!(pos(a) < pos(node_id), "Kontext a vor dem Besitzer (§3.6)");
+        assert!(pos(b) < pos(node_id), "Kontext b vor dem Besitzer (§3.6)");
+        // Alle drei sind enthalten.
+        assert_eq!(data.len(), 3);
+    }
+
+    #[test]
+    fn iter_active_data_excludes_inactive_constituents() {
+        // §12.3/§13.2: ein noch nicht freigegebener (inaktiver) Konstituent eines
+        // gestageten Umbaus wird NICHT iteriert — ein halb-vollzogener Umbau leckt
+        // nicht über die Föderation.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let visible = store.append_datum(&Datum::leaf(b"sichtbar".to_vec())).unwrap();
+        // Einen genuin neuen Konstituenten stagen (inaktiv, kein Marker committet).
+        let staged = store.stage_restructuring(&[Datum::leaf(b"gestaget".to_vec())]).unwrap();
+        let hidden = staged.constituent_ids()[0];
+
+        let ids: Vec<ContentId> = store.iter_active_data().unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&visible), "aktives Daten wird iteriert");
+        assert!(!ids.contains(&hidden), "inaktiver Konstituent VANISHt aus der Föderation (§13.2)");
+    }
+
+    #[test]
+    fn ingest_foreign_collapses_content_equal_and_carries_new() {
+        // §12.3/§12.5: inhaltsgleiche Daten kollabieren via ContentId (Dedup §5.3);
+        // bestand-exklusive werden neu geschrieben. Kein Sonderfall (§12.5).
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let mut s1 = open_store(d1.path());
+        let s2 = {
+            let mut s = open_store(d2.path());
+            s.append_datum(&Datum::leaf(b"gemeinsam".to_vec())).unwrap();
+            s.append_datum(&Datum::leaf(b"nur-s2".to_vec())).unwrap();
+            s
+        };
+        // S1 hat das gemeinsame Daten bereits.
+        s1.append_datum(&Datum::leaf(b"gemeinsam".to_vec())).unwrap();
+
+        let (new_count, dedup_count) = s1.ingest_foreign(&s2).unwrap();
+        assert_eq!(dedup_count, 1, "das gemeinsame Daten kollabiert (§12.3)");
+        assert_eq!(new_count, 1, "nur das s2-exklusive Daten ist neu");
+        // Idempotent: ein zweiter Ingest schreibt nichts (§12.4).
+        let (n2, d2c) = s1.ingest_foreign(&s2).unwrap();
+        assert_eq!(n2, 0, "zweiter Ingest schreibt nichts (idempotent §12.4)");
+        assert_eq!(d2c, 2, "alle fremden Daten kollabieren beim zweiten Mal");
+    }
+
+    #[test]
+    fn reconcile_anchor_is_deterministic_and_idempotent() {
+        // §12.4: die Versöhnung ist eine reine Funktion von (foreign, local, rule);
+        // ein zweiter Aufruf erzeugt einen byte-gleichen Kontext (Dedup-Kollaps §5.3).
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let foreign = ContentId::of_datum(&Datum::anchor([store.append_datum(&Datum::leaf(b"f".to_vec())).unwrap()]));
+        let local = ContentId::of_datum(&Datum::anchor([store.append_datum(&Datum::leaf(b"l".to_vec())).unwrap()]));
+        let rule = Datum::leaf(b"regel".to_vec());
+        let before = store.len();
+        let r1 = store.reconcile_anchor(foreign, local, &rule).unwrap();
+        let mid = store.len();
+        let r2 = store.reconcile_anchor(foreign, local, &rule).unwrap();
+        let after = store.len();
+        assert_eq!(r1, r2, "deterministischer Versöhnungs-Kontext (§12.4)");
+        assert!(mid > before, "erster Aufruf schreibt den Kontext");
+        assert_eq!(after, mid, "zweiter Aufruf schreibt NICHTS (Dedup §5.3 ⇒ idempotent)");
     }
 }

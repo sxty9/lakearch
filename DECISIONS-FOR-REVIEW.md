@@ -1404,3 +1404,230 @@ staticlib** (+ rlib für den Rust-Integrationstest) exponiert. **Grün:**
 
 `crates/lakearch-core` und `crates/lakearchd` sind **verhaltens-unverändert** (keine
 Bearbeitung). Workspace-Member `crates/lakearch-ffi` ergänzt.
+
+### Phase 8 (Teil) — Föderation (§12), nur bestehende Primitive (Branch `kernel-impl`)
+
+Föderation = einen **fremden** Bestand in einen lokalen aufnehmen, **kein Sonderfall**
+(§12.5): jedes aktive fremde Daten läuft über den **einen** lokalen Append-Pfad
+(§7.1), inhaltsgleiche Daten kollabieren **automatisch** über ihre `ContentId`
+(Dedup §5.3/§12.3), und bestand-lokale Anker werden über **deterministische**
+gradierte-Identitäts-Versöhnungs-Kontexte versöhnt (§12.4 / Korrelations-Pfad §5.7 b).
+**Grün:** `cargo build --all-targets`, `cargo test` (lakearch-core: 221 lib + 12
+Kanonik + **5 federation** + 11 kernel_e2e + 5 store; Workspace inkl. ffi/daemon),
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Versöhnungs-Kontext = gradierter Identitäts-Kontext (`model.rs`, §12.4/§12.5).**
+  Eingefrorenes Rollen-Marker-Atom `lakearch/reconcile-anchor/rule1` (31 Byte ASCII,
+  **niemals** ändern), distinkt von allen bestehenden Markern (Negativ-Test).
+  `Datum::reconcile_rule(rule)` = `{ reconcile_rule_marker, rule }` (der **opake**
+  Regel-Sub-Kontext §3.4); `Datum::reconcile_anchors(foreign, local, rule)` =
+  `graded_identity(foreign, local, Deckungsgleich, [reconcile_rule_ctx])` — Föderation
+  nutzt damit **allein** das Phase-4-Primitiv (gradierte Identität §5.5), **kein** neues
+  Speicher-/Match-Primitiv (§14.2). **IDEMPOTENZ (§12.4):** die Bytes sind eine **reine
+  Funktion** von `(foreign, local, rule)` — **keine** Wall-Clock, **kein** Random;
+  `node` sortiert/dedupliziert die owns-Menge kanonisch (§K2.3). Re-Run ⇒ byte-gleiche
+  `ContentId` ⇒ Dedup-Kollaps (§5.3). Tests: Marker eingefroren+distinkt, Versöhnung ist
+  ein Deckungsgleich-Kontext, der beide Anker erwähnt, **reine Determiniertheit**
+  (zweimal gleich; andere Regel ⇒ andere ID; Anker-**Menge** symmetrisch §5.1/§5.5/§K2.3).
+
+- **`ContentStore::iter_active_data` (`store.rs`, §12.3).** Alle durabel-vorhandenen
+  **aktiven** (§13) Daten als `(ContentId, Datum)` in **Abhängigkeits-Reihenfolge**
+  (jeder besessene Kontext **vor** seinem Besitzer, iterative DFS mit Visited-Set,
+  zyklensicher §1.6/§1.7 a; Wurzeln aufsteigend in Adress-Order §5.2/§1.4). So kann der
+  Aufnehmer jedes Daten anhängen, **nachdem** seine Kontexte lokal vorliegen (§3.6), und
+  die abgeleiteten Indizes (Bereich §11.1, Berechtigung §11.1, Zeit §6, Anker/Identität
+  §9/§5.5) resolven jeden Kontext. **Inaktive Konstituenten (§13.2) werden NICHT
+  iteriert** — ein halb-vollzogener Umbau leckt **nicht** über die Föderation (Test
+  `iter_active_data_excludes_inactive_constituents`).
+
+- **`ContentStore::ingest_foreign` / `LakearchKernel::federate` (§12.3/§12.5).** Nimmt den
+  fremden Bestand auf: jedes aktive fremde Daten über `append_datum` (Dedup §5.3 kollabiert
+  inhaltsgleiche). Liefert `(new_count, dedup_count)`. `federate` nimmt den **Schreib**-Lock
+  des lokalen und den **Lese**-Lock des fremden Bestands (verschiedene Stores ⇒ kein
+  Selbst-Deadlock; der fremde wird nur gelesen). `LakearchKernel<I>::federate<J>` ist
+  **engine-generisch** (zwei beliebige `EdgeIndex`-Bestände föderierbar).
+
+- **`ContentStore::reconcile_anchor` / `LakearchKernel::reconcile_anchor` (§12.4).** Hängt
+  den opaken Regel-Wert + den Regel-Rollen-Kontext + den Versöhnungs-Kontext über den
+  **einen** Append-Pfad an (Schreib-Lock, serialisiert §7.1). Dedup macht Wiederholung
+  idempotent. **Der Kernel ENTSCHEIDET keine Identität (§9-Präambel/§1.4)** — er nimmt die
+  von der Schicht darüber bestimmte Korrelation `(foreign, local, rule)` auf und
+  **verlinkt** sie; er rankt/wertet/schwellt **nichts**. Welche Anker „dasselbe Ding" sind,
+  findet die Schicht darüber über `anchor_cids()` (alle Anker-`ContentId`s, §12.4).
+
+- **Vergleichs-Helfer (§12.3/§12.4).** `LakearchKernel::content_set()` (alle aktiven
+  `ContentId`s, aufsteigend) ist der **föderationsstabile Vergleichs-Schlüssel**: gleiche
+  Menge ⇒ inhaltsgleicher Bestand. `anchor_cids()` listet die Anker für die Schicht darüber.
+
+- **Tests (`tests/federation.rs`, öffentliche API, alle grün):** inhaltsgleiche Daten zweier
+  getrennter Bestände kollabieren via `ContentId` (`new_count`/`dedup_count` belegt §12.3);
+  referenziell-gleiche Anker verbinden sich über den Versöhnungs-Kontext (von **beiden**
+  Ankern aus über `graded_identity_links_visible` auffindbar, §5.5); verschiedene lokale
+  Klassen ⇒ verschiedene Anker, dennoch deterministisch versöhnt; **Doppel-Ingest
+  sequenziell** ⇒ zweiter Ingest schreibt `new_count == 0`, `content_set` byte-gleich
+  (idempotent §12.4); **Doppel-Ingest nebenläufig** (4 Threads `federate` + dieselbe
+  `reconcile_anchor`) ⇒ `content_set` byte-gleich zur Ein-Ingest-Referenz (der eine
+  Append-Pfad serialisiert §7.1, deterministische Kontexte kollabieren per Hash §5.3).
+  Plus Store-Unit-Tests (Abhängigkeits-Reihenfolge, inaktiv-Ausschluss, Kollaps+neu,
+  deterministische idempotente Versöhnung) und drei `model.rs`-Tests.
+
+- **`#![forbid(unsafe_code)]`** bleibt auf `model.rs`/`store.rs`/`kernel.rs`; rein additiv
+  (keine bestehende Methode/kein bestehendes Verhalten geändert; die frozen-Form-Trait-
+  `Kernel` ist unangetastet).
+
+**Vertagte, nicht-blockierende Punkte (Phase 8 — Compaction/Erasure):**
+> **NACHTRAG (inzwischen ERLEDIGT):** Die unten als „in diesem Lauf nicht umgesetzt"
+> notierte zweite Phase-8-Hälfte (Compaction / Crypto-Shredding / Erasure) ist im
+> Folge-Lauf vollständig implementiert + grün — siehe den Abschnitt „Phase 8 —
+> Compaction & physische Erasure" weiter unten. Dieser Absatz bleibt nur als
+> historischer Beleg des Zwischenstands stehen.
+- **Compaction / Crypto-Shredding / Erasure (§15/§9.5)** waren in jenem Zwischen-Lauf
+  **noch nicht** umgesetzt (der Auftrag deckte zuerst FÖDERATION ab). Der Plan und §15 sehen vor: Index referenziert
+  **stabile logische IDs** (ContentId / segment-id+generation, **nie** rohe Byte-Offsets) —
+  **bereits erfüllt** (`store.rs` adressiert ausschließlich über `ContentId` und den
+  `dedup: ContentId → Offset`-Cache; der `EdgeIndex` liefert owned `ContentId`s, kein Offset
+  verlässt das Crate). Damit ist ein späterer Segment-Rewrite ohne globalen Index-Rewrite
+  möglich. Offen bleiben: physisches Segment-Rewrite (Epoch-Swap §13, drop-after-quiesce),
+  Crypto-Shredding (per-Lösch-Schlüssel-AEAD, z. B. chacha20poly1305), Refcount-Reachability
+  für Dedup-Sicherheit und die **gegatete, auditierte, nicht-transitive** Erasure-Op (§12.3).
+  Das **logische** Verbergen (§9.5, „restrict processing") ist bereits implementiert
+  (Phase 4, `curation_hide`/`unhide`); die **physische** Erasure („right to be forgotten")
+  ist die offene Phase-8-Hälfte.
+
+### Phase 8 — Compaction & physische Erasure (§15/§9.5, Branch `kernel-impl`)
+
+Die zweite Hälfte von Phase 8: das *physische* Entfernen Überholter/Verborgener/Eraster
+aus dem append-only Log (§7.1) als **neue, unveränderliche Generation** plus die
+**Crypto-Shred-Erasure** für das „Recht auf Vergessen". **Grün verifiziert** (gesamter
+Workspace): `cargo build --all-targets`, `cargo test` (**289 Tests**: 240 lib + 12
+Kanonik + 5 Compaction/Erasure + 5 Föderation + 11 Kernel-E2E + 5 Store + 4 FFI c_abi +
+5 lakearchd-lib + 2 grpc_e2e), `cargo clippy --all-targets -- -D warnings`.
+
+- **Neue Abhängigkeit:** `chacha20poly1305 = "0.10"` (default-features off, nur `alloc`)
+  — pure-Rust AEAD für das Crypto-Shredding. Kein `getrandom`/keine Uhr im Krypto-Pfad:
+  der 12-Byte-Nonce wird **deterministisch** aus der `ContentId` abgeleitet
+  (`BLAKE3(nonce-tag‖ContentId)[..12]`), die `ContentId` ist zugleich AEAD-AAD. So ist
+  `seal` eine **reine Funktion** ⇒ Compaction reproduzierbar/föderationsstabil (§12.3).
+
+- **(1) Stabile logische ID — bereits erfüllt + verifiziert (§15-Plan).** Der Index
+  (`EdgeIndex` + `dedup: ContentId → Offset`) referenziert jedes Daten über seine
+  **ContentId**, **nie** über einen rohen Byte-Offset (der Offset ist nur die *physische*
+  Auflösung innerhalb der aktuellen Reihe). Eine compactierte Generation
+  (`compaction::CompactedSegment`) hält ihre Records ausschließlich über
+  `ContentId` **+ `Generation`** — ein Segment-Rewrite verschiebt damit **keine** logische
+  Referenz und bricht **keinen** in-flight MVCC-Snapshot (der hält **seine** Generation;
+  die neue ist eine andere Epoche).
+
+- **(2) Compaction (`compaction.rs::Compactor`/`CompactedSegment`, `kernel.rs::compact`/
+  `compact_with_drop`):** rewritet die aktiven Daten (`iter_active_data`,
+  Abhängigkeits-Reihenfolge) in eine **neue, unveränderliche** Generation
+  (`base/compacted/gen-N/segment.lkc`), lässt verwaiste Records physisch fallen und
+  schaltet die Generation **atomar** über den `CURRENT`-Marker live (Temp+Rename+fsync =
+  §13-Epoche-Analogon; ein Crash davor lässt die alte Generation live). Das laufende
+  Append-Log (`log.rs`-mmap), das Leser halten, wird **nie** unmappt — die Generation lebt
+  in ihrem **eigenen** Verzeichnis (drop-after-quiesce: die alte Generation bleibt auf
+  Platte). Index rekonstruiert: deterministische Adress-Order (§5.2/§1.4) ⇒ ein erneutes
+  Lesen (`CompactedSegment::read_from`) liefert dieselbe Sicht.
+
+- **(3) Refcount/Reachability + Closure-Fixpunkt (`compaction.rs::Refcounts`,
+  §5.3/§3.6):** ein Drop-Kandidat wird **nur** fallengelassen, wenn **kein behaltenes**
+  Daten ihn als besessenen Kontext referenziert — als **Fixpunkt** (Drop eines Kandidaten
+  kann weitere freigeben). Das erhält die referenzielle Geschlossenheit (§3.6: nichts
+  Behaltenes verweist je auf Entferntes) **und** schützt jede rechtmäßig gehaltene
+  Dedup-Referenz (§5.3). Ein erastes Daten wird **nie** fallengelassen (es bleibt als
+  versiegelter Tombstone).
+
+- **(4) Crypto-Shredding (`crypto.rs`, `Keystore`, §Crypto-Shred):** erasbare Nutzlasten
+  werden in der compactierten Generation per ChaCha20-Poly1305 unter einem
+  **pro-Lösch-Schlüssel** versiegelt; das **Zerstören** des Schlüssels
+  (`Keystore::destroy`) macht die Bytes unrückholbar (O(1)), während **ContentId und
+  Kanten intakt** bleiben (§3.6: eine Traversierung, die den erasten Knoten erreicht,
+  trifft einen **Tombstone** — `canonical_bytes` ⇒ `Ok(None)`, `contains` ⇒ `true`). Der
+  Keystore ist **kein** Log-Bestandteil (§8.4): er ist das **zerstörbare Geheimnis** und
+  wird **nie** wie der unveränderliche Log-Inhalt repliziert/gesichert.
+  - **DESIGN-ENTSCHEIDUNG (Crypto-Shred am Compaction-Layer, nicht im Basis-Log-Format):**
+    Eine volle At-Rest-Verschlüsselung **jedes** Records im `log.rs`-Format hätte einen
+    tiefen, riskanten Format-Bruch erfordert (das Log re-hasht/prüfsummt `Header‖Payload`,
+    und `get_by_content_id` re-hasht die Payload defensiv gegen die `ContentId` — ein
+    Sealen der Payload dort bräche die Content-Adressierung). Der Plan erlaubt genau das:
+    „falls volle Payload-Verschlüsselung einen tieferen, heute-unsicheren Format-Bruch
+    bräuchte, Crypto-Shredding am COMPACTION/Rewrite-Layer (compactiertes Segment hält
+    per-Record versiegelte Payloads + Keystore)". Genau so umgesetzt: das **Basis-Log**
+    bleibt unverändert; Crypto-Shred lebt im **neuen** `CompactedSegment`-Format
+    (`{ ContentId, kind: Plain|Sealed, bytes }`) + `Keystore`. Die `ContentId` wird im
+    compactierten Segment **explizit** geführt (kein Re-Hash der Chiffre nötig); ein
+    entsiegeltes Plain/Sealed-Daten wird defensiv gegen seine `ContentId` geprüft.
+
+- **(5) Erasure = gegatet + auditiert + nicht-transitiv (`kernel.rs::erase`,
+  `model.rs`, §15/§11/§12.3):**
+  - **gegatet:** `erase(target, right, key)` verlangt, dass `right` das eingefrorene
+    **Erasure-Recht** trägt (`Datum::is_erasure_right`, Atom `lakearch/erasure-right/v1\n`);
+    sonst `KernelError::ErasureDenied` (fail-closed §11) und **nichts** geschieht.
+  - **auditiert:** die Op hängt ihr **eigenes** Audit-Daten an
+    (`Datum::erasure_audit(target)` = `{ erasure-audit-marker, target }`, append-only §7.1)
+    — der unveränderliche Beleg bleibt im Log/in der Generation, auch nachdem die Nutzlast
+    geschreddert ist (§3.6: das Audit zeigt auf den Tombstone). Gibt die Audit-`ContentId`
+    zurück.
+  - **nicht-transitiv über Föderation (§12.3):** eine Erasure wirkt **nur lokal** (der
+    Lösch-Schlüssel lebt nur im lokalen Keystore). Ein bestand-übergreifend inhaltsgleiches
+    Daten trägt dieselbe `ContentId` (§12.3), aber S2 behält seine Klartext-Bytes, bis S2
+    **selbst** (eigenständig gegatet + auditiert) erast — Test
+    `erasure_is_non_transitive_across_federation`.
+  - **Abgrenzung (§9.5 vs §15):** das **logische Verbergen** (§9.5, `curation_hide`, bereits
+    Phase 4) deckt DSGVO „Einschränkung der Verarbeitung" (reversibel); die **physische
+    Erasure** (Crypto-Shred) deckt „Recht auf Vergessen" (endgültig).
+
+- **DESIGN-ENTSCHEIDUNG (Compaction entscheidet keine Version, §1.4/§6.4).** `compact()`
+  ist **konservativ**: es schlägt überholte (§6.3) und verborgene (§9.5) Daten als
+  Fallenlass-**Kandidaten** vor, lässt aber — durch den Closure-Fixpunkt — **nur** die
+  genuin verwaisten tatsächlich fallen. Da in diesem inhaltsadressierten Modell der
+  Ersetzungs-/Verbergen-**Kontext** sein Ziel referenziert (§3.6), bleibt ein überholtes/
+  verborgenes Daten physisch erhalten, solange sein (behaltener) markierender Kontext es
+  referenziert — das ist die **§3.6-sichere** Vorgabe. Will die Schicht darüber (die §6.4/§8
+  die „gültige Version" entscheidet — **nicht** der Kernel, §1.4) eine ganze, closure-
+  konsistente Version-Kette physisch entfernen, übergibt sie diese als `extra_drop` an
+  `compact_with_drop`. **Alternative (verworfen):** den Kernel selbst eine transitive
+  „Version-Kette wegräumen"-Heuristik fahren zu lassen — das verstieße gegen §1.4/§6.4
+  („der Kernel entscheidet keine Version").
+
+- **Neue `KernelError`-Variante:** `ErasureDenied` (Erasure ohne spezifisches Recht;
+  fail-closed §11, sichtbarkeits-blind §11.3).
+
+- **`#![forbid(unsafe_code)]`** auf `crypto.rs` **und** `compaction.rs` (beweisbar sicheres
+  Rust; das einzige `unsafe`/mmap bleibt im `log.rs`-Leaf). Das compactierte Segment + der
+  Keystore werden per sicherer `std::fs`-API (`pwrite`/`pread` + atomarer Temp+Rename+fsync)
+  geschrieben/gelesen.
+
+- **Tests (alle grün):** `crypto.rs` (seal/open round-trip, Determinismus, falscher
+  Schlüssel ⇒ unrückholbar, AAD-Bindung an ContentId, deterministische Ableitung,
+  Debug-Redaction); `compaction.rs` (Drop unreferenzierter überholter Records, Refcount-
+  Schutz, Crypto-Shred mit Tombstone+überlebenden Dedup-Referenzen, Generation-Round-Trip
+  auf Platte mit Keystore); `kernel.rs` (`erase` ohne Recht verweigert + kein Audit; mit
+  Recht Audit angehängt; `compact` crypto-shreddet + hält Kanten geschlossen + andere
+  überleben + live-Reader-sicher; expliziter Drop entfernt Verwaistes + rekonstruiert
+  konsistente Generation; Closure-Schutz für noch-referenzierten Kandidaten; `compact`
+  ohne base_dir ⇒ Inconsistent); `tests/compaction_erasure.rs` (öffentliche E2E: Crypto-
+  Shred-Garantie, Gate+Audit, live-Reader-sicher, **nicht-transitiv über Föderation**,
+  Generation-Round-Trip).
+
+**Vertagte, nicht-blockierende Punkte (Phase 8+ / spätere Härtung):**
+- **`ContentStore` liest noch aus dem Basis-Append-Log**, nicht aus der compactierten
+  Generation. `compact` schreibt die Generation + Keystore + `CURRENT`-Marker durabel und
+  liefert das `CompactedSegment` zurück, **swappt** aber den live Store des laufenden
+  Kernels (noch) **nicht** auf die neue Generation um (das laufende Log bleibt die
+  Lese-Wahrheit, sodass live Leser nie ein gehaltenes Segment verlieren — die sichere
+  Vorgabe). Das **Umschalten** des Lese-Pfades auf die jeweils live Generation (inkl.
+  drop-after-quiesce-GC der alten Generationen + Wiederaufnahme der `CURRENT`-Generation
+  beim `open`) ist die nächste, billige Integrationsstufe (Log = Wahrheit, Generation als
+  Derivat). Für die Phase-8-Garantien (physisches Wegfallen, Crypto-Shred, Refcount,
+  Gate/Audit/Nicht-Transitivität) ist die Generation als eigenständig les-/round-trip-bares
+  Artefakt bereits vollständig + getestet.
+- **Schlüssel-Erzeugung (Zufalls-Quelle) liegt bewusst außerhalb** (`ErasureKey::from_bytes`/
+  `derive`): die Schlüssel-Politik (eine Quelle pro Subjekt/Datensatz, Rotation, ob Schlüssel
+  überhaupt gesichert werden) kennt die Schicht darüber/der Daemon (§1.4/§8.4) — der Kernel
+  **hält und benutzt** den Schlüssel nur.
+- **Persistenter Erasure-Plan über Neustarts:** der ausstehende Crypto-Shred-Plan
+  (`erase` → nächste `compact`) lebt aktuell in-memory (`Mutex<CompactionPlan>`); das Audit-
+  Daten ist bereits durabel im Log. Ein Reopen-vor-Compact rekonstruierte den Plan aus den
+  Audit-Daten (sie benennen das eraste `target`) — die Wiederherstellung des Plans aus dem
+  Log ist ein billiger späterer Schritt (Log = Wahrheit).

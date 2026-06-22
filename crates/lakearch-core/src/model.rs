@@ -302,6 +302,32 @@ const CURATION_REPLACE_MARKER_PAYLOAD: &[u8; 28] = b"lakearch/curation/replace/v
 /// damit die Invalidierungs-Rückwärts-Traversierung §10.3).
 const ORIGIN_MARKER_PAYLOAD: &[u8; 18] = b"lakearch/origin/v1";
 
+/// Eingefrorene atomare Nutzlast des **Föderations-Versöhnungs-Regel**-Marker-Atoms
+/// (§12.4): das Rollen-Marker-Atom, das den **opaken** Versöhnungs-Regel-Wert einer
+/// Anker-Versöhnung trägt. Exakt 31 Bytes ASCII; **niemals** ändern (verschöbe die
+/// `ContentId` aller Versöhnungs-Regel-Kontexte und damit die Föderations-Idempotenz
+/// §12.4). lakearch interpretiert die Bytes **nicht** (§1.4); der Wert ist allein
+/// eine wohlbekannte, föderationsweit gleiche Konvention (gleiche Bytes ⇒ gleiche
+/// `ContentId`, §5.3/§12.3).
+const RECONCILE_RULE_MARKER_PAYLOAD: &[u8; 31] = b"lakearch/reconcile-anchor/rule1";
+
+/// Eingefrorene atomare Nutzlast des **Erasure-Recht**-Marker-Atoms (§15/§9.5,
+/// Plan „Compaction/DSGVO"): das Recht, das eine **physische Erasure** (Crypto-
+/// Shred) eines Daten autorisiert — analog zur Subjekt-/Bereichs-Rolle einer
+/// Berechtigung (§11.1). Exakt 26 Bytes ASCII; **niemals** ändern (verschöbe die
+/// `ContentId` aller Erasure-Rechte). Der Kernel interpretiert die Bytes **nicht**
+/// (§1.4); der Wert ist eine wohlbekannte, föderationsweit gleiche Konvention.
+const ERASURE_RIGHT_MARKER_PAYLOAD: &[u8; 26] = b"lakearch/erasure-right/v1\n";
+
+/// Eingefrorene atomare Nutzlast des **Erasure-Audit**-Marker-Atoms (§15, Plan
+/// „Compaction/DSGVO": „Erasure ist eine gegatete, auditierte Kernel-Op … eigenes
+/// Audit-Daten"). Exakt 26 Bytes ASCII; **niemals** ändern. Eine Erasure **hängt
+/// ihr eigenes Audit-Daten an** (append-only, §7.1) — der unveränderliche Beleg,
+/// **dass** und **was** (welche `ContentId`) erast wurde, bleibt im Log, auch
+/// nachdem die Nutzlast crypto-geschreddert ist (§3.6: der Verweis bleibt
+/// geschlossen, das Audit zeigt auf den Tombstone).
+const ERASURE_AUDIT_MARKER_PAYLOAD: &[u8; 26] = b"lakearch/erasure-audit/v1\n";
+
 /// Eingefrorene atomare Nutzlast des **Aktiv-Marker**-Atoms (§13): das
 /// abschließende „Aktiv-Schreiben", das einen Mehr-Daten-Umbau gemeinsam sichtbar
 /// macht (§13.1). Exakt 25 Bytes ASCII; **niemals** ändern. lakearch interpretiert
@@ -1363,6 +1389,169 @@ impl Datum {
     }
 }
 
+/// Föderation (§12) — Anker-**Versöhnung** über gradierte Identität, **rein
+/// deterministisch** (§12.4), damit Doppel-/Concurrent-Ingest **idempotent** ist.
+///
+/// **§12.3/§12.4.** Über Bestände hinweg tragen inhaltsgleiche Daten **denselben**
+/// Inhalts-Hash (§5.2) und fallen automatisch zusammen (Dedup §5.3). **Anker-IDs
+/// (§9.1) sind bestand-LOKAL** und werden beim Zusammenführen über **gradierte
+/// Identität** (§5.5) versöhnt — und einen Bestand in einen anderen aufzunehmen
+/// **ist** der Korrelations-Pfad (§5.7 b). Eine Versöhnung verknüpft daher zwei
+/// referenziell „gleiche" Anker (einen fremden, einen lokalen) über einen
+/// **gradierten Identitäts-Kontext** (§5.5).
+///
+/// **IDEMPOTENZ (§12.4 / Plan „Föderations-Idempotenz").** Die Bytes des
+/// Versöhnungs-Kontextes sind eine **reine Funktion** von
+/// `(foreign_anchor, local_anchor, rule)` — **keine** Wall-Clock-, **keine**
+/// Random-Felder. Ein erneuter Lauf erzeugt **inhaltsgleiche** Kontexte, die per
+/// Hash kollabieren (§5.3) ⇒ Doppel- und Concurrent-Ingest sind **provably
+/// idempotent** (byte-gleicher Bestand). `rule` ist ein **opakes** Daten (die
+/// Regel/Begründung der Versöhnung, von der Schicht darüber bestimmt); der Kernel
+/// **wertet sie nicht** (§1.4).
+///
+/// **HARTE GRENZE (§9-Präambel/§1.4).** Der Kernel **entscheidet keine Identität**
+/// — er **verlinkt** nur (§9-Präambel/§1.4: „erzeugt keine Konfidenz, entscheidet
+/// keine Identität"). **Welche** Anker zu versöhnen sind, bestimmt die Schicht
+/// darüber (Korrelations-Pfad §5.7 b); der Kernel hält den gradierten Kontext und
+/// traversiert ihn. Die gewählte Stärke ist [`IdentityStrength::Deckungsgleich`]
+/// (§5.5) — die Schicht darüber darf eine schwächere wählen, indem sie selbst
+/// einen gradierten Identitäts-Kontext baut ([`Datum::graded_identity`]).
+impl Datum {
+    /// Das eingefrorene **Versöhnungs-Regel-Rollen**-Marker-Atom (§12.4) — ein
+    /// gewöhnliches Blatt-Daten (§2.1) mit fester atomarer Nutzlast.
+    pub fn reconcile_rule_marker() -> Self {
+        Datum::leaf(*RECONCILE_RULE_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt einen **Versöhnungs-Regel-Kontext** `{ reconcile_rule_marker, rule }`
+    /// (§12.4) — der reifizierte Sub-Kontext (§3.4), der die **opake** Versöhnungs-
+    /// Regel `rule` trägt. `rule` ist die `ContentId` eines **gewöhnlichen**
+    /// Regel-Daten (z. B. ein Blatt mit der Begründungs-Konvention der Schicht
+    /// darüber); der Kernel **interpretiert/vergleicht** sie **nie** (§1.4).
+    pub fn reconcile_rule(rule: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::reconcile_rule_marker());
+        Datum::node([marker, rule])
+            .expect("Versöhnungs-Regel-Kontext besitzt stets das Marker-Atom (§12.4)")
+    }
+
+    /// Erzeugt einen **Anker-Versöhnungs-Kontext** (§12.4) zwischen einem **fremden**
+    /// Anker `foreign_anchor` und einem **lokalen** Anker `local_anchor` unter der
+    /// **opaken** Regel `rule`.
+    ///
+    /// Strukturell ist dies ein **gradierter Identitäts-Kontext** (§5.5)
+    /// [`IdentityStrength::Deckungsgleich`] zwischen den zwei Ankern, dessen einziger
+    /// reifizierter Sub-Kontext der [`reconcile_rule`](Datum::reconcile_rule)-Kontext
+    /// ist (§3.4). Föderation ist damit **kein Sonderfall** (§12.5): sie nutzt allein
+    /// die schon vorhandenen Primitive (gradierte Identität §5.5, Inhaltsadressierung
+    /// §5.2).
+    ///
+    /// **IDEMPOTENZ (§12.4).** Die zurückgegebene `ContentId` ist eine **reine,
+    /// deterministische** Funktion von `(foreign_anchor, local_anchor, rule)` — die
+    /// `owns`-Menge wird kanonisch sortiert/dedupliziert (§K2.3), **keine** Wall-Clock,
+    /// **kein** Random. Re-Run ⇒ byte-gleicher Kontext ⇒ Dedup-Kollaps (§5.3). Der
+    /// Kernel **entscheidet keine Identität** (§9-Präambel); er verlinkt nur (§1.4).
+    pub fn reconcile_anchors(
+        foreign_anchor: ContentId,
+        local_anchor: ContentId,
+        rule: ContentId,
+    ) -> Self {
+        let rule_ctx = ContentId::of_datum(&Datum::reconcile_rule(rule));
+        Datum::graded_identity(
+            foreign_anchor,
+            local_anchor,
+            IdentityStrength::Deckungsgleich,
+            [rule_ctx],
+        )
+    }
+}
+
+/// Erasure & Audit (§15/§9.5, Plan „Compaction/DSGVO") — die **physische** Löschung
+/// (Crypto-Shred) als **gegatete, auditierte** Kernel-Op, **rein strukturelle
+/// Konvention** (§1.3).
+///
+/// **Abgrenzung (§9.5/§15).** Das **logische Verbergen** (§9.5,
+/// [`Datum::curation_hide`]) ist die **reversible** Löschung (es deckt das DSGVO-
+/// „Einschränkung der Verarbeitung" ab); die **physische Erasure** (Crypto-Shred,
+/// §15) deckt das „Recht auf Vergessen" ab. Diese ist:
+///
+/// - **gegatet:** sie verlangt ein spezifisches **Erasure-Recht**
+///   ([`Datum::erasure_right`]) — analog zur Subjekt-/Bereichs-Rolle einer
+///   Berechtigung (§11.1); ohne das Recht ist sie verweigert (fail-closed §11);
+/// - **auditiert:** sie **hängt ihr eigenes Audit-Daten an** ([`Datum::erasure_audit`],
+///   append-only §7.1) — der unveränderliche Beleg bleibt im Log, auch nachdem die
+///   Nutzlast geschreddert ist (§3.6: der Verweis bleibt geschlossen);
+/// - **nicht-transitiv über Föderation (§12.3):** eine Erasure wirkt **nur lokal**;
+///   sie propagiert **nicht** automatisch in andere Bestände (Inhalts-IDs sind
+///   bestand-unabhängig §12.3, der Lösch-Schlüssel ist bestand-lokal — er existiert
+///   nur im lokalen Keystore). Ein anderer Bestand muss seine eigene, eigenständig
+///   gegatete+auditierte Erasure durchführen.
+///
+/// **HARTE GRENZE (§1.4).** Der Kernel **wertet das Recht nicht** — er prüft nur
+/// **strukturell** (§1.3), **ob** das vorgelegte Recht-Daten genau das eingefrorene
+/// Erasure-Recht-Atom **ist** (bzw. besitzt). Welches Subjekt das Recht hat, regelt
+/// die Schicht darüber (§11.1/§8.4) — der Kernel **hält und matcht** nur.
+impl Datum {
+    /// Das eingefrorene **Erasure-Recht**-Marker-Atom (§15) — ein gewöhnliches
+    /// Blatt-Daten (§2.1) mit fester atomarer Nutzlast. Das vorgelegte Recht-Daten
+    /// einer Erasure **muss** strukturell dieses Atom sein bzw. besitzen
+    /// ([`Datum::is_erasure_right`]); sonst ist die Erasure verweigert (§11).
+    pub fn erasure_right_marker() -> Self {
+        Datum::leaf(*ERASURE_RIGHT_MARKER_PAYLOAD)
+    }
+
+    /// Das eingefrorene **Erasure-Recht**-Daten (§15) — der unfälschbare,
+    /// föderationsweit gleiche strukturelle Nachweis, dass ein Aufrufer eine
+    /// physische Erasure durchführen darf. Hier identisch zum Marker-Atom (das Recht
+    /// **ist** das Atom); die Schicht darüber bindet es per Berechtigung (§11.1) an
+    /// ein Subjekt. Reine Konvention (§1.3); keine Wertung (§1.4).
+    pub fn erasure_right() -> Self {
+        Datum::erasure_right_marker()
+    }
+
+    /// `true`, wenn dieses Daten das **Erasure-Recht** trägt (§15) — also das
+    /// eingefrorene Erasure-Recht-Atom **ist** oder (als Knoten) **besitzt**. Reines
+    /// strukturelles Matching (§1.3): der Kernel **wertet das Recht nicht** (§1.4),
+    /// er erkennt nur die Struktur. Das vorgelegte Recht ist genau dann gültig, wenn
+    /// dieses Prädikat hält.
+    pub fn is_erasure_right(&self) -> bool {
+        if self.payload() == Some(&ERASURE_RIGHT_MARKER_PAYLOAD[..]) {
+            return true;
+        }
+        let marker = ContentId::of_datum(&Datum::erasure_right_marker());
+        matches!(self.owns(), Some(owns) if owns.binary_search(&marker).is_ok())
+    }
+
+    /// Das eingefrorene **Erasure-Audit**-Marker-Atom (§15) — ein gewöhnliches
+    /// Blatt-Daten (§2.1) mit fester atomarer Nutzlast.
+    pub fn erasure_audit_marker() -> Self {
+        Datum::leaf(*ERASURE_AUDIT_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt ein **Erasure-Audit-Daten** (§15): der Knoten
+    /// `{ erasure_audit_marker, erased }`, der **strukturell** belegt, dass das
+    /// Daten `erased` physisch erast (crypto-geschreddert) wurde — ein gewöhnliches,
+    /// append-only Daten (§7.1), das **im Log bleibt**, auch nachdem die Nutzlast von
+    /// `erased` geschreddert ist (§3.6: der Verweis ist geschlossen, das Audit zeigt
+    /// auf den Tombstone). Der Beleg ist **unveränderlich** und **föderationsstabil**
+    /// (reine Funktion von `erased` — kein Wall-Clock, kein Random). Reifizierte
+    /// Sub-Kontexte (Urheber, Zeit, Begründung, §3.4) darf die Schicht darüber als
+    /// **eigene** Daten/Verweise anhängen; der Kernel **wertet sie nicht** (§1.4).
+    pub fn erasure_audit(erased: ContentId) -> Self {
+        let marker = ContentId::of_datum(&Datum::erasure_audit_marker());
+        Datum::node([marker, erased])
+            .expect("Erasure-Audit besitzt stets das Marker-Atom (§15)")
+    }
+
+    /// Liest aus einem **Erasure-Audit-Daten** (§15) die `ContentId` des erasten
+    /// Daten, falls dieser Knoten ein Audit ist — also exakt
+    /// `{ erasure_audit_marker, erased }` besitzt; sonst `None`. Reines strukturelles
+    /// Matching (§1.3); keine Wertung (§1.4).
+    pub fn erasure_audit_target(&self) -> Option<ContentId> {
+        let marker = ContentId::of_datum(&Datum::erasure_audit_marker());
+        self.role_target(marker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1988,5 +2177,101 @@ mod tests {
         // Weder payload noch Eingaben ⇒ kein wohlgeformter Knoten (§K2.1).
         let empties: [ContentId; 0] = [];
         assert!(Datum::computed_result(empties, empties).is_none());
+    }
+
+    // -- Föderation: Anker-Versöhnung (§12.4) --------------------------------
+
+    #[test]
+    fn reconcile_rule_marker_is_a_frozen_distinct_leaf() {
+        // §12.4: das Versöhnungs-Regel-Marker-Atom ist ein gewöhnliches Blatt (§2.1)
+        // mit fester, eingefrorener Nutzlast — distinkt von allen anderen Markern.
+        let m = Datum::reconcile_rule_marker();
+        assert!(m.is_leaf());
+        assert_eq!(m.payload(), Some(&b"lakearch/reconcile-anchor/rule1"[..]));
+        assert_eq!(m.payload().unwrap().len(), 31, "dokumentierte Länge");
+        let rule = ContentId::of_datum(&m);
+        for other in [
+            Datum::anchor_marker(),
+            Datum::membership_marker(),
+            Datum::supersession_marker(),
+            Datum::origin_marker(),
+            Datum::active_marker(),
+            Datum::identity_strength_marker(IdentityStrength::Deckungsgleich),
+        ] {
+            assert_ne!(rule, ContentId::of_datum(&other), "Regel-Marker distinkt (§12.4)");
+        }
+    }
+
+    #[test]
+    fn reconcile_anchors_is_a_graded_identity_context_deckungsgleich() {
+        // §12.4/§12.5: eine Versöhnung IST ein gradierter Identitäts-Kontext (§5.5) —
+        // kein Sonderfall. Stärke = Deckungsgleich; er erwähnt beide Anker.
+        let foreign = ContentId::of_datum(&Datum::anchor([cid(0xF0)]));
+        let local = ContentId::of_datum(&Datum::anchor([cid(0x10)]));
+        let rule = ContentId::of_datum(&Datum::leaf(b"same-key".to_vec()));
+        let r = Datum::reconcile_anchors(foreign, local, rule);
+        assert!(r.is_graded_identity());
+        assert_eq!(r.identity_strength(), Some(IdentityStrength::Deckungsgleich));
+        // Beide Anker sind als erwähnte Daten enthalten (von beiden aus auffindbar).
+        let ctxs = r.graded_identity_contexts().expect("gradierter Kontext");
+        assert!(ctxs.contains(&foreign) && ctxs.contains(&local));
+        // Der reifizierte Regel-Sub-Kontext ist enthalten (§3.4).
+        let rule_ctx = ContentId::of_datum(&Datum::reconcile_rule(rule));
+        assert!(ctxs.contains(&rule_ctx));
+    }
+
+    #[test]
+    fn reconcile_anchors_is_pure_deterministic_no_wallclock_no_random() {
+        // §12.4: die Bytes sind eine REINE Funktion von (foreign, local, rule) —
+        // zwei Aufrufe mit denselben Argumenten ⇒ byte-gleiche ContentId (Dedup-
+        // Kollaps, §5.3 ⇒ Idempotenz). KEINE Wall-Clock, KEIN Random.
+        let foreign = cid(0xF1);
+        let local = cid(0x11);
+        let rule = cid(0x22);
+        let a = ContentId::of_datum(&Datum::reconcile_anchors(foreign, local, rule));
+        let b = ContentId::of_datum(&Datum::reconcile_anchors(foreign, local, rule));
+        assert_eq!(a, b, "reine Funktion ⇒ byte-gleich (§12.4)");
+        // Andere Regel / vertauschte Anker ⇒ andere ContentId (Bindung an alle drei).
+        let other_rule = ContentId::of_datum(&Datum::reconcile_anchors(foreign, local, cid(0x23)));
+        assert_ne!(a, other_rule);
+        // Hinweis: `graded_identity` sortiert die owns-Menge adressbasiert (§K2.3);
+        // (foreign,local) und (local,foreign) erwähnen dieselbe Anker-MENGE, daher
+        // ist die Versöhnung symmetrisch in den beiden Ankern — referenzielle
+        // Identität ist eine Aussage ÜBER die Daten, ungerichtet hier (§5.1/§5.5).
+        let swapped = ContentId::of_datum(&Datum::reconcile_anchors(local, foreign, rule));
+        assert_eq!(a, swapped, "Anker-Menge ist symmetrisch (§5.5/§K2.3)");
+    }
+
+    // -- Erasure-Recht & Audit (§15/§9.5) ------------------------------------
+
+    #[test]
+    fn erasure_right_atom_is_recognized() {
+        // §15: das eingefrorene Recht-Atom ist als Erasure-Recht erkennbar (§1.3).
+        let right = Datum::erasure_right();
+        assert!(right.is_erasure_right());
+        assert!(Datum::erasure_right_marker().is_erasure_right());
+        // Ein Knoten, der das Recht-Atom BESITZT, trägt das Recht ebenfalls.
+        let marker = ContentId::of_datum(&Datum::erasure_right_marker());
+        let bearing = Datum::node([marker, cid(0xAB)]).unwrap();
+        assert!(bearing.is_erasure_right());
+        // Ein gewöhnliches Daten trägt das Recht NICHT.
+        assert!(!Datum::leaf(b"x".to_vec()).is_erasure_right());
+        assert!(!Datum::node([cid(0x01)]).unwrap().is_erasure_right());
+    }
+
+    #[test]
+    fn erasure_audit_points_to_erased_datum_deterministically() {
+        // §15: das Audit zeigt strukturell auf das eraste Daten; reine Funktion von
+        // `erased` (föderationsstabil, kein Wall-Clock/Random).
+        let erased = cid(0x7E);
+        let audit = Datum::erasure_audit(erased);
+        assert!(audit.is_node());
+        assert_eq!(audit.erasure_audit_target(), Some(erased));
+        // Deterministisch: zweimal ⇒ byte-gleiche ContentId.
+        let a = ContentId::of_datum(&Datum::erasure_audit(erased));
+        let b = ContentId::of_datum(&Datum::erasure_audit(erased));
+        assert_eq!(a, b);
+        // Ein gewöhnlicher Knoten ist kein Audit.
+        assert_eq!(Datum::node([cid(0x01)]).unwrap().erasure_audit_target(), None);
     }
 }

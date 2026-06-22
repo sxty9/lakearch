@@ -123,11 +123,46 @@
 //!   [`LakearchKernel::graded_identity_links_visible`]) reichen **nur sichtbare**
 //!   `ContentId`s heraus (VANISH inkl. kuratorisch verborgener; Inhalt nur übers Tor)
 //!   und ranken/werten **nie**.
+//! - **Föderation (Phase 8, §12)** auf [`ContentStore`]/[`LakearchKernel`]: einen
+//!   **fremden** Bestand aufnehmen ist **kein Sonderfall** (§12.5) — jedes aktive
+//!   fremde Daten läuft über den **einen** Append-Pfad ([`LakearchKernel::federate`]/
+//!   [`ContentStore::ingest_foreign`]); inhaltsgleiche Daten kollabieren **automatisch**
+//!   über ihre [`ContentId`] (Dedup §5.3/§12.3). Bestand-**lokale** Anker (§9.1) werden
+//!   über **deterministische** gradierte-Identitäts-Versöhnungs-Kontexte versöhnt
+//!   ([`LakearchKernel::reconcile_anchor`], [`Datum::reconcile_anchors`], §12.4 /
+//!   Korrelations-Pfad §5.7 b): die Bytes sind eine **reine Funktion** von
+//!   `(fremder Anker, lokaler Anker, Regel)` — **keine** Wall-Clock, **kein** Random ⇒
+//!   Re-Run kollabiert per Hash (§5.3), Doppel-/Concurrent-Ingest ist **idempotent**
+//!   (byte-gleicher Bestand). Der Kernel **entscheidet keine Identität** (§9-Präambel/
+//!   §1.4) — er **verlinkt** nur; **welche** Anker „dasselbe Ding" sind, bestimmt die
+//!   Schicht darüber. Vergleichs-Helfer: [`LakearchKernel::content_set`] (föderations-
+//!   stabiler Inhalts-Schlüssel), [`LakearchKernel::anchor_cids`] (Versöhnungs-Kandidaten).
+//! - **Crypto-Shredding (Phase 8, §15/§9.5)** in [`crypto`]: eine pure-Rust AEAD
+//!   (ChaCha20-Poly1305) versiegelt eine erasbare Nutzlast unter einem pro-Lösch-
+//!   Schlüssel; das **Zerstören** des Schlüssels macht die Bytes **unrückholbar**,
+//!   während die [`ContentId`] und Kanten **intakt** bleiben (§3.6 — eine
+//!   Traversierung trifft einen Tombstone). Der Nonce ist **deterministisch** aus der
+//!   `ContentId` abgeleitet (kein Random/keine Uhr) ⇒ reproduzierbare Compaction.
+//! - **Compaction & physische Erasure (Phase 8, §15/§9.5)** in [`compaction`]: der
+//!   [`Compactor`] rewritet die aktiven Daten in eine **neue, unveränderliche**
+//!   [`CompactedSegment`]-Generation, lässt Überholte (§6.3)/Verborgene (§9.5)/Eraste
+//!   physisch fallen (Closure-/Refcount-geschützt, §3.6/§5.3 — nie eine rechtmäßig
+//!   gehaltene Dedup-Referenz zerstört), versiegelt Eraste (Crypto-Shred) und schaltet
+//!   die Generation **atomar** über den `CURRENT`-Marker live (§13-Epoche), **ohne** je
+//!   ein Segment zu unmappen, das ein Leser hält (drop-after-quiesce). Index referenziert
+//!   **stabile logische IDs** ([`ContentId`] + [`Generation`]), **nie** rohe Offsets.
+//!   [`LakearchKernel::erase`] ist die **gegatete** (Erasure-Recht, sonst
+//!   [`KernelError::ErasureDenied`]), **auditierte** ([`Datum::erasure_audit`], append-only
+//!   §7.1) und **nicht-transitive** (§12.3 — lokaler [`Keystore`]) Lösch-Op; das logische
+//!   Verbergen (§9.5) bleibt die reversible „Einschränkung der Verarbeitung", die physische
+//!   Erasure das „Recht auf Vergessen".
 
 mod model;
 mod serialize;
 
 pub mod api;
+pub mod compaction;
+pub mod crypto;
 pub mod error;
 pub mod format;
 pub mod gate;
@@ -139,6 +174,11 @@ pub mod store;
 pub mod traverse;
 
 pub use api::{Direction, Kernel, SnapshotToken, Step, StepStream};
+pub use compaction::{
+    generation_dir, publish_generation, read_current_generation, CompactedSegment,
+    CompactionPlan, CompactionReport, Compactor, Generation, Keystore, Refcounts,
+};
+pub use crypto::{ErasureKey, ERASURE_KEY_LEN};
 pub use error::KernelError;
 pub use format::{
     checksum, decode_record, encode_record, encode_record_to_vec, BatchFooter, DecodedRecord,

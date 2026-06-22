@@ -39,9 +39,15 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::RwLock;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Mutex, RwLock};
 
 use crate::api::{Direction, Kernel, SnapshotToken, StepStream};
+use crate::compaction::{
+    self, CompactedSegment, CompactionPlan, CompactionReport, Compactor, Generation, Keystore,
+};
+use crate::crypto::ErasureKey;
 use crate::error::KernelError;
 use crate::gate::{Capability, GrantedScopes, SealedRecord};
 use crate::id::{AnchorId, ContentId};
@@ -94,6 +100,15 @@ pub struct LakearchKernel<I: EdgeIndex> {
     /// Der Content-Store hinter einem Lese-/Schreib-Lock. Der Store ist der eine
     /// Append-Pfad (`&mut self`); der Lock erlaubt den `&self`-Vertrag des Traits.
     store: RwLock<ContentStore<I>>,
+    /// **Basis-Verzeichnis** des Bestands (für Compaction-Generationen §15). `None`,
+    /// wenn der Kernel über [`from_store`](LakearchKernel::from_store) ohne Pfad
+    /// gebaut wurde — dann ist [`compact`](LakearchKernel::compact) nicht verfügbar.
+    base_dir: Option<PathBuf>,
+    /// **Ausstehende Erasure** (§15): der Crypto-Shred-Plan, den eine gegatete,
+    /// auditierte [`erase`](LakearchKernel::erase) füllt und die nächste
+    /// [`compact`](LakearchKernel::compact) anwendet (sie versiegelt die erasten
+    /// Nutzlasten). Hinter einem eigenen `Mutex` (orthogonal zum Store-Lock).
+    pending: Mutex<CompactionPlan>,
 }
 
 impl<I: EdgeIndex> LakearchKernel<I> {
@@ -103,6 +118,19 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     pub fn from_store(store: ContentStore<I>) -> Self {
         LakearchKernel {
             store: RwLock::new(store),
+            base_dir: None,
+            pending: Mutex::new(CompactionPlan::new()),
+        }
+    }
+
+    /// Wie [`from_store`](LakearchKernel::from_store), aber mit dem **Basis-Verzeichnis**
+    /// des Bestands — Voraussetzung für [`compact`](LakearchKernel::compact) (die
+    /// compactierten Generationen leben unter `base_dir/compacted/`, §15).
+    pub fn from_store_at(store: ContentStore<I>, base_dir: PathBuf) -> Self {
+        LakearchKernel {
+            store: RwLock::new(store),
+            base_dir: Some(base_dir),
+            pending: Mutex::new(CompactionPlan::new()),
         }
     }
 
@@ -620,6 +648,224 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         Ok(store.anchor_cid_of(anchor_id))
     }
 
+    /// Alle **Anker-`ContentId`s** dieses Bestands (§9.1/§12.4) — owned, aufsteigend
+    /// in 32-Byte-Adress-Order (deterministisch, **kein** Wert-Sort §1.4). Die
+    /// Schicht darüber findet damit Versöhnungs-Kandidaten für die Föderation und
+    /// **entscheidet** die referenzielle Identität (§9-Präambel/§5.7 b); der Kernel
+    /// **verlinkt** nur (§1.4). Reine Handle-Auflösung; **kein** Inhalts-Read.
+    pub fn anchor_cids(&self) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        Ok(store.anchor_cids())
+    }
+
+    /// **content_set** (§12) — die `ContentId`s **aller** aktiven (§13) Daten dieses
+    /// Bestands, owned und aufsteigend in 32-Byte-Adress-Order (deterministisch,
+    /// **kein** Wert-Sort §1.4). Föderationsstabiler Vergleichs-Schlüssel: zwei
+    /// Bestände sind **inhaltsgleich**, wenn ihre `content_set` gleich sind (§12.3).
+    /// Reines Adress-Matching (§1.3); **kein** Inhalt verlässt das Crate (nur Hash-
+    /// Adressen). Nützlich, um die **Idempotenz** eines Doppel-Ingest zu prüfen
+    /// (gleiche Menge ⇒ byte-gleicher Bestand, §12.4).
+    pub fn content_set(&self) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let mut ids: Vec<ContentId> = store
+            .iter_active_data()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// **federate** (§12.3/§12.5) — nimmt einen **fremden** Bestand `foreign` in
+    /// diesen auf. **Kein Sonderfall** (§12.5): jedes aktive fremde Daten läuft über
+    /// den **einen** lokalen Append-Pfad ([`Kernel::append`]); **inhaltsgleiche**
+    /// Daten kollabieren **automatisch** über ihre `ContentId` (Dedup §5.3/§12.3).
+    ///
+    /// Liefert `(new_count, dedup_count)`: wie viele fremde Daten **neu** geschrieben
+    /// wurden bzw. per Dedup **kollabierten**. Nimmt den **Lese**-Lock des fremden
+    /// und den **Schreib**-Lock des lokalen Bestands (der lokale Store ist der eine
+    /// Append-Pfad, §7.1). Ein vergifteter Lock ⇒ [`KernelError::Poisoned`] (§11).
+    ///
+    /// **Anker-Versöhnung (§12.4)** ist getrennt: Inhalts-IDs kollabieren hier
+    /// automatisch, **Anker-IDs sind bestand-lokal** (§9.1) und werden über
+    /// [`reconcile_anchor`](LakearchKernel::reconcile_anchor) als **deterministische**
+    /// gradierte-Identitäts-Kontexte versöhnt. **Welche** Anker „dasselbe Ding" sind,
+    /// bestimmt die Schicht darüber (Korrelations-Pfad §5.7 b); der Kernel
+    /// **entscheidet keine Identität** (§9-Präambel/§1.4) — er verlinkt nur.
+    pub fn federate<J: EdgeIndex>(
+        &self,
+        foreign: &LakearchKernel<J>,
+    ) -> Result<(u64, u64), KernelError> {
+        // Schreib-Lock zuerst (der lokale Store ist der eine Append-Pfad), dann der
+        // Lese-Lock des fremden Bestands. Verschiedene Stores ⇒ kein Selbst-Deadlock;
+        // der fremde Bestand wird nur gelesen.
+        let mut local = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        let foreign_store = foreign.store.read().map_err(|_| KernelError::Poisoned)?;
+        local.ingest_foreign(&foreign_store)
+    }
+
+    /// **reconcile_anchor** (§12.4) — versöhnt einen **fremden** Anker mit einem
+    /// **lokalen** über einen **gradierten Identitäts-Kontext** (§5.5), dessen Bytes
+    /// eine **reine, deterministische** Funktion von `(foreign_anchor, local_anchor,
+    /// rule)` sind — **keine** Wall-Clock, **kein** Random. Ein erneuter Aufruf
+    /// erzeugt einen **byte-gleichen** Kontext, der per Hash kollabiert (§5.3) ⇒
+    /// Doppel-/Concurrent-Ingest sind **idempotent** (§12.4). Serialisiert durch den
+    /// **einen** Append-Pfad (Schreib-Lock). Liefert die `ContentId` des
+    /// Versöhnungs-Kontextes.
+    ///
+    /// `rule` ist das **opake** Regel-Daten (die Begründung der Versöhnung, von der
+    /// Schicht darüber bestimmt); der Kernel **wertet sie nicht** (§1.4) und
+    /// **entscheidet keine Identität** (§9-Präambel) — er verlinkt nur die von der
+    /// Schicht darüber bestimmte Korrelation (§5.7 b).
+    pub fn reconcile_anchor(
+        &self,
+        foreign_anchor: ContentId,
+        local_anchor: ContentId,
+        rule: &Datum,
+    ) -> Result<ContentId, KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.reconcile_anchor(foreign_anchor, local_anchor, rule)
+    }
+
+    /// **erase** (§15/§9.5/§11, Plan „Compaction/DSGVO") — eine **gegatete,
+    /// auditierte, nicht-transitive** physische Erasure (Crypto-Shred) des Daten
+    /// `target` planen. Diese Op ist die **endgültige** Löschung („Recht auf
+    /// Vergessen") — im Unterschied zum **reversiblen** logischen Verbergen (§9.5,
+    /// [`Datum::curation_hide`], „Einschränkung der Verarbeitung").
+    ///
+    /// **Gegatet (§11):** das vorgelegte `right`-Daten **muss** das spezifische
+    /// **Erasure-Recht** tragen ([`Datum::is_erasure_right`]); sonst geschieht
+    /// **nichts** und es kommt [`KernelError::ErasureDenied`] zurück (fail-closed).
+    ///
+    /// **Auditiert (§7.1):** die Op **hängt ihr eigenes Audit-Daten an**
+    /// ([`Datum::erasure_audit`]`(target)`) — der unveränderliche Beleg, **dass** und
+    /// **was** erast wurde, bleibt im Log, auch nachdem die Nutzlast geschreddert ist
+    /// (§3.6: der Verweis bleibt geschlossen, das Audit zeigt auf den Tombstone).
+    /// Liefert die `ContentId` des Audit-Daten.
+    ///
+    /// **Wirkung:** `target` wird mit dem Lösch-Schlüssel `key` in den ausstehenden
+    /// Crypto-Shred-Plan aufgenommen; die **nächste** [`compact`](LakearchKernel::compact)
+    /// versiegelt seine Nutzlast in der neuen Generation. Das spätere **Zerstören**
+    /// des Schlüssels im Keystore macht die Bytes unrückholbar (O(1)).
+    ///
+    /// **Nicht-transitiv über Föderation (§12.3):** die Erasure wirkt **nur lokal**
+    /// (der Lösch-Schlüssel lebt nur im lokalen Keystore); sie propagiert **nicht** in
+    /// andere Bestände. Ein anderer Bestand muss seine eigene, eigenständig gegatete +
+    /// auditierte Erasure durchführen.
+    pub fn erase(
+        &self,
+        target: ContentId,
+        right: &Datum,
+        key: ErasureKey,
+    ) -> Result<ContentId, KernelError> {
+        // §11 Tor-Gate: ohne das spezifische Erasure-Recht geschieht NICHTS.
+        if !right.is_erasure_right() {
+            return Err(KernelError::ErasureDenied);
+        }
+        // §7.1 Audit: das eigene, unveränderliche Audit-Daten anhängen (durch den
+        // EINEN Append-Pfad serialisiert). Bleibt im Log, auch nach dem Shred (§3.6).
+        let audit = Datum::erasure_audit(target);
+        let audit_id = {
+            let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+            store.append_datum(&audit)?
+        };
+        // Den Crypto-Shred-Plan vormerken (die nächste Compaction versiegelt `target`).
+        let mut pending = self.pending.lock().map_err(|_| KernelError::Poisoned)?;
+        pending.erase(target, key);
+        Ok(audit_id)
+    }
+
+    /// **compact** (§15, Plan „Compaction/DSGVO") — schreibt die **nächste
+    /// unveränderliche Generation** des Bestands: sie lässt **überholte** (§6.3) und
+    /// **kuratorisch verborgene** (§9.5) Records physisch fallen (sofern kein retained
+    /// Daten sie noch referenziert — Refcount-Schutz §5.3), **versiegelt** die geplanten
+    /// **erasten** Records (Crypto-Shred) und schaltet die neue Generation **atomar**
+    /// über den `CURRENT`-Marker live (§13-Epoche-Analogon). Sie **unmappt nie** das
+    /// laufende Append-Log, das Leser halten — die compactierte Generation lebt in
+    /// **ihrem eigenen** Verzeichnis (`base_dir/compacted/gen-N`), die alte bleibt auf
+    /// Platte (drop-after-quiesce).
+    ///
+    /// Sie rekonstruiert einen **konsistenten** Index implizit: die neue Generation
+    /// hält jedes Daten über seine **stabile logische ID** ([`ContentId`], nie ein roher
+    /// Offset, §15) in deterministischer Adress-Order (§5.2/§1.4) — ein erneutes Lesen
+    /// liefert dieselbe Sicht (Content-Adressierung intakt). Liefert die
+    /// [`CompactedSegment`], den befüllten [`Keystore`] (die Lösch-Schlüssel) und einen
+    /// [`CompactionReport`].
+    ///
+    /// **Refcount/Reachability (§5.3):** ein per Dedup mehrfach referenziertes Daten
+    /// wird **nicht** fallengelassen, solange **eine** Referenz es behält — die
+    /// Löschung einer Referenz zerstört **nicht** die Daten einer anderen.
+    ///
+    /// Erfordert ein **Basis-Verzeichnis** ([`LakearchKernel::open`]/
+    /// [`from_store_at`](LakearchKernel::from_store_at)); sonst
+    /// [`KernelError::Inconsistent`] (kein Ort für die Generation).
+    ///
+    /// **Konservativ (§1.4/§6.4).** `compact` **entscheidet keine Version** (welche
+    /// von zwei Ersetzungs-verknüpften Daten „gilt", ist eine **Leseregel der Schicht
+    /// darüber**, §6.4/§8). Es schlägt als Fallenlass-Kandidaten **mechanisch** die
+    /// überholten (§6.3) und verborgenen (§9.5) Daten vor, lässt aber **nur** die
+    /// **genuin verwaisten** (von keinem behaltenen Daten referenzierten) tatsächlich
+    /// fallen (Closure-Fixpunkt §3.6). Will die Schicht darüber gezielt eine ganze
+    /// (closure-konsistente) Version-Kette physisch entfernen, übergibt sie diese als
+    /// `extra_drop` an [`compact_with_drop`](LakearchKernel::compact_with_drop).
+    pub fn compact(&self) -> Result<(CompactedSegment, Keystore, CompactionReport), KernelError> {
+        self.compact_with_drop(HashSet::new())
+    }
+
+    /// **compact_with_drop** (§15) — wie [`compact`](LakearchKernel::compact), aber mit
+    /// einem **expliziten zusätzlichen Fallenlass-Satz** `extra_drop`, den die Schicht
+    /// darüber (die §6.4/§8 die „gültige Version" bestimmt — **nicht** der Kernel,
+    /// §1.4) als **closure-konsistente** Menge der physisch zu entfernenden Records
+    /// vorlegt. Der Kernel **wertet nicht** (§1.4): er entfernt genau die übergebenen
+    /// (plus die mechanisch verwaisten überholten/verborgenen) — geschützt durch den
+    /// Closure-Fixpunkt (§3.6: nichts Behaltenes verweist je auf Entferntes) und den
+    /// Refcount (§5.3: eine rechtmäßig gehaltene Referenz bewahrt ihr Daten).
+    pub fn compact_with_drop(
+        &self,
+        extra_drop: HashSet<ContentId>,
+    ) -> Result<(CompactedSegment, Keystore, CompactionReport), KernelError> {
+        let base = self.base_dir.clone().ok_or(KernelError::Inconsistent)?;
+
+        // Die aktiven Daten (§13) in Abhängigkeits-Reihenfolge (Kontexte vor Besitzern)
+        // — die Eingabe des Rewrites. Plus die Fallenlass-Kandidaten (überholt §6.3 +
+        // verborgen §9.5 + explizit übergebene) und der ausstehende Erasure-Plan (§15).
+        let (data, drop_set) = {
+            let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+            let data = store.iter_active_data()?;
+            let mut drop: HashSet<ContentId> = extra_drop;
+            for id in store.superseded_ids() {
+                drop.insert(id);
+            }
+            for id in store.curation_hidden_ids() {
+                drop.insert(id);
+            }
+            (data, drop)
+        };
+
+        let plan = {
+            let pending = self.pending.lock().map_err(|_| KernelError::Poisoned)?;
+            pending.clone()
+        };
+
+        // Die nächste Generation bestimmen (§15: monoton steigende Epoche).
+        let next_gen: Generation =
+            compaction::read_current_generation(&base)?.map(|g| g + 1).unwrap_or(0);
+
+        // Compactor: physisch verdichten + crypto-shredden (closure-/refcount-geschützt).
+        let compactor = Compactor::new(drop_set, plan);
+        let (segment, keystore, _refs, report) = compactor.compact(next_gen, &data)?;
+
+        // Die Generation UNVERÄNDERLICH schreiben (Segment + Keystore), DANN atomar
+        // live schalten (CURRENT-Marker = der eine Linearisierungspunkt §13). Ein
+        // Crash vor dem Publish lässt die alte Generation live (die neue nie sichtbar).
+        let gdir = compaction::generation_dir(&base, next_gen);
+        segment.write_to(&gdir)?;
+        keystore.save(compaction::keystore_path(&gdir))?;
+        compaction::publish_generation(&base, next_gen)?;
+
+        Ok((segment, keystore, report))
+    }
+
     /// Aggregierte **Betriebs-Zähler** (§Betrieb). Liest sowohl die Store- als auch
     /// die Log-Metriken unter dem Lese-Lock zusammen.
     pub fn stats(&self) -> Result<KernelMetrics, KernelError> {
@@ -653,7 +899,7 @@ impl LakearchKernel<crate::index::RedbEdgeIndex> {
         let log = SegmentLog::open(&log_dir)?;
         let index = crate::index::RedbEdgeIndex::open(dir.join("index.redb"))?;
         let store = ContentStore::open(log, index)?;
-        Ok(LakearchKernel::from_store(store))
+        Ok(LakearchKernel::from_store_at(store, dir.to_path_buf()))
     }
 }
 
@@ -2542,5 +2788,171 @@ mod tests {
             k.get_by_content_id(result_id, &cap2, snap2).unwrap().is_some(),
             "altes Ergebnis bleibt durabel erhalten (append-only §7.1)"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Erasure & Compaction (§15/§9.5) — gegatet, auditiert, crypto-geshreddet,
+    // refcount-geschützt, live-Reader-sicher, Index rekonstruiert.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn erase_is_denied_without_the_erasure_right() {
+        // §15/§11: ohne das spezifische Erasure-Recht geschieht NICHTS (fail-closed),
+        // und es wird KEIN Audit-Daten angehängt.
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let target = k.append(&Datum::leaf(b"sensibel".to_vec())).unwrap();
+        let before = k.content_set().unwrap().len();
+
+        // Ein gewöhnliches Daten ist KEIN Erasure-Recht.
+        let not_a_right = Datum::leaf(b"ich-bin-kein-recht".to_vec());
+        let key = ErasureKey::from_bytes([0x01; 32]);
+        let denied = k.erase(target, &not_a_right, key);
+        assert!(matches!(denied, Err(KernelError::ErasureDenied)), "ohne Recht ⇒ verweigert");
+        // Kein Audit angehängt (der Bestand ist unverändert).
+        assert_eq!(k.content_set().unwrap().len(), before, "nichts angehängt ohne Recht");
+    }
+
+    #[test]
+    fn erase_with_right_writes_an_audit_datum() {
+        // §15/§7.1: mit dem Erasure-Recht hängt die Op ihr eigenes Audit-Daten an
+        // (append-only) — der unveränderliche Beleg bleibt im Log (§3.6).
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let target = k.append(&Datum::leaf(b"vergiss-mich".to_vec())).unwrap();
+
+        let right = Datum::erasure_right();
+        let key = ErasureKey::from_bytes([0x02; 32]);
+        let audit_id = k.erase(target, &right, key).expect("mit Recht erlaubt");
+
+        // Das Audit-Daten ist im Bestand und zeigt strukturell auf das eraste Daten.
+        let (cap, snap) = cap_and_snap(&k);
+        let sealed = k.get_by_content_id(audit_id, &cap, snap).unwrap().expect("Audit vorhanden");
+        let audit = strict_decode(open(&sealed, &cap).unwrap().canonical_bytes()).unwrap();
+        assert_eq!(audit.erasure_audit_target(), Some(target), "Audit belegt das eraste Daten");
+    }
+
+    #[test]
+    fn compact_crypto_shreds_erased_datum_keeping_refs_closed_and_others_alive() {
+        // §15/§Crypto-Shred/§3.6/§5.3: erase + compact ⇒ die erasten Bytes sind nach
+        // Zerstören des Schlüssels unrückholbar; ContentId/Kanten bleiben (Tombstone);
+        // eine andere Dedup-Referenz überlebt (Refcount); der Index ist konsistent.
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Graph: zwei Blätter `a` (überlebt), `secret` (erast); ein Knoten `n` besitzt
+        // beide (referenziert `secret` weiter ⇒ Kante bleibt §3.6).
+        let a = k.append(&Datum::leaf(b"oeffentlich".to_vec())).unwrap();
+        let secret = k.append(&Datum::leaf(b"streng-geheim".to_vec())).unwrap();
+        let n = k.append(&Datum::node([a, secret]).unwrap()).unwrap();
+
+        // Erasure (gegatet + auditiert).
+        let key = ErasureKey::from_bytes([0x42; 32]);
+        let audit_id = k.erase(secret, &Datum::erasure_right(), key).unwrap();
+
+        // Compaction: die nächste Generation versiegelt `secret`.
+        let (seg, mut ks, report) = k.compact().unwrap();
+        assert_eq!(report.sealed, 1, "genau das eraste Daten versiegelt");
+        assert!(seg.is_sealed(secret));
+        // Live-Reader-sicher: das laufende Append-Log bleibt unangetastet lesbar.
+        let (cap, snap) = cap_and_snap(&k);
+        assert!(k.get_by_content_id(secret, &cap, snap).unwrap().is_some(),
+            "altes Log (das ein Leser hält) wird NICHT unmappt (§15)");
+
+        // Mit dem lebenden Schlüssel sind die Bytes in der Generation noch lesbar.
+        assert_eq!(seg.datum(secret, &ks).unwrap(), Some(Datum::leaf(b"streng-geheim".to_vec())));
+
+        // Schlüssel ZERSTÖREN ⇒ die Bytes sind unrückholbar (das „Recht auf Vergessen").
+        assert!(ks.destroy(secret));
+        assert_eq!(seg.canonical_bytes(secret, &ks).unwrap(), None, "Bytes geschreddert");
+        // ABER: die ContentId bleibt als Adresse erreichbar (§3.6 — Verweis geschlossen).
+        assert!(seg.contains(secret), "Tombstone: ContentId/Kante bleibt (§3.6)");
+        // Eine andere Referenz (`a`) überlebt unverändert (Refcount §5.3).
+        assert_eq!(seg.datum(a, &ks).unwrap(), Some(Datum::leaf(b"oeffentlich".to_vec())));
+        // Der besitzende Knoten `n` referenziert `secret` strukturell weiter (Kante intakt).
+        assert_eq!(seg.datum(n, &ks).unwrap(), Some(Datum::node([a, secret]).unwrap()));
+        // Das Audit-Daten ist ebenfalls in der Generation (Beleg bleibt, §15).
+        assert!(seg.contains(audit_id), "Audit überlebt die Compaction (§15)");
+    }
+
+    #[test]
+    fn compact_with_explicit_drop_removes_orphaned_record_and_reconstructs_consistent_index() {
+        // §15: die Schicht darüber (die §6.4/§8 die „gültige Version" entscheidet,
+        // NICHT der Kernel) übergibt einen closure-konsistenten Fallenlass-Satz; ein
+        // verwaistes (von nichts Behaltenem referenziertes) Daten wird physisch
+        // entfernt. Die Generation hält jedes behaltene Daten über seine stabile
+        // logische ID (ContentId) — ein erneutes Lesen ist konsistent (Index rekonstruiert).
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let keep = k.append(&Datum::leaf(b"behalten".to_vec())).unwrap();
+        // Ein eigenständiges, von NICHTS referenziertes Daten (z. B. eine alte,
+        // ersetzte Version, deren Ersetzungs-Kette die Schicht darüber mit-entfernt).
+        let orphan = k.append(&Datum::leaf(b"verwaiste-version".to_vec())).unwrap();
+
+        let mut drop = HashSet::new();
+        drop.insert(orphan);
+        let (seg, ks, report) = k.compact_with_drop(drop).unwrap();
+        assert!(report.dropped >= 1, "das verwaiste Daten fällt physisch weg (§15)");
+        assert!(!seg.contains(orphan), "verwaistes Daten physisch entfernt (§15)");
+        // Content-Adressierung des behaltenen Daten intakt + reproduzierbar.
+        assert_eq!(seg.datum(keep, &ks).unwrap(), Some(Datum::leaf(b"behalten".to_vec())));
+
+        // Index rekonstruiert: ein erneutes Lesen aus der Generation auf Platte liefert
+        // dieselbe Sicht (deterministische Adress-Order, §5.2/§1.4).
+        let gdir = crate::compaction::generation_dir(dir.path(), report.generation);
+        let seg2 = CompactedSegment::read_from(&gdir).unwrap();
+        assert_eq!(seg2.ids(), seg.ids(), "Generation deterministisch reproduzierbar");
+        assert!(!seg2.contains(orphan));
+    }
+
+    #[test]
+    fn compact_drop_is_closure_preserving_keeps_still_referenced_candidate() {
+        // §3.6/§5.3: selbst wenn die Schicht darüber ein noch REFERENZIERTES Daten zum
+        // Fallenlassen vorschlägt, behält der Closure-Fixpunkt es — kein behaltenes
+        // Daten darf je auf ein entferntes verweisen (§3.6), und eine rechtmäßig
+        // gehaltene Dedup-Referenz bewahrt ihr Daten (§5.3).
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let shared = k.append(&Datum::leaf(b"geteilt".to_vec())).unwrap();
+        // Ein behaltener Knoten referenziert `shared` ⇒ Drop-Vorschlag wird ignoriert.
+        let _owner = k.append(&Datum::node([shared]).unwrap()).unwrap();
+
+        let mut drop = HashSet::new();
+        drop.insert(shared);
+        let (seg, ks, _report) = k.compact_with_drop(drop).unwrap();
+        assert!(seg.contains(shared), "referenziertes Daten bleibt (Closure/Refcount §3.6/§5.3)");
+        assert_eq!(seg.datum(shared, &ks).unwrap(), Some(Datum::leaf(b"geteilt".to_vec())));
+    }
+
+    #[test]
+    fn compaction_refcount_protects_still_referenced_hidden_datum() {
+        // §5.3-Refcount-Sicherheit: ein kuratorisch verborgenes Daten, das von einem
+        // BEHALTENEN Daten (hier seinem Verbergen-Kontext) noch referenziert wird, wird
+        // NICHT physisch fallengelassen — die Löschung/Verbergung einer Referenz
+        // zerstört nicht die Daten, die eine andere Referenz rechtmäßig hält (§3.6).
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+        let hidden = k.append(&Datum::leaf(b"verborgen".to_vec())).unwrap();
+        k.append(&Datum::curation_hide_marker()).unwrap();
+        // Der Verbergen-Kontext besitzt `hidden` ⇒ Refcount(hidden) ≥ 1 ⇒ geschützt.
+        k.append(&Datum::curation_hide(hidden)).unwrap();
+
+        let (seg, ks, _report) = k.compact().unwrap();
+        assert!(seg.contains(hidden), "referenziertes Daten bleibt (Refcount-Schutz §5.3)");
+        assert_eq!(seg.datum(hidden, &ks).unwrap(), Some(Datum::leaf(b"verborgen".to_vec())));
+    }
+
+    #[test]
+    fn compact_without_base_dir_is_inconsistent() {
+        // from_store (ohne Pfad) ⇒ kein Ort für die Generation ⇒ Inconsistent.
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log = SegmentLog::open(&log_dir).unwrap();
+        let index = RedbEdgeIndex::open(dir.path().join("index.redb")).unwrap();
+        let store = ContentStore::open(log, index).unwrap();
+        let k = LakearchKernel::from_store(store);
+        assert!(matches!(k.compact(), Err(KernelError::Inconsistent)));
     }
 }

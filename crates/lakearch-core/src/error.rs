@@ -62,6 +62,14 @@ pub enum KernelError {
     /// halb-gültigen Zustand fortzufahren (§Durability: „Segment vergiften").
     #[error("Segment-Log vergiftet nach fatalem Fehler (§Durability)")]
     Poisoned,
+
+    /// **Erasure verweigert** (§15/§11): eine physische Erasure (Crypto-Shred) wurde
+    /// **ohne** das spezifische **Erasure-Recht** angefordert (Plan „Compaction/
+    /// DSGVO": „Erasure ist eine gegatete … Kernel-Op, eigenes Recht"). Fail-closed
+    /// (§11): ohne das Recht geschieht **nichts**. Sichtbarkeits-blind (§11.3): der
+    /// Text nennt **keine** konkreten Daten/IDs.
+    #[error("Erasure verweigert: spezifisches Erasure-Recht fehlt (§15/§11)")]
+    ErasureDenied,
 }
 
 #[cfg(test)]
