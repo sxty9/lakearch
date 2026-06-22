@@ -39,6 +39,29 @@ pub enum KernelError {
     /// sichtbarkeits-blind (§11.3) und nennt **keine** konkreten Daten/IDs.
     #[error("interne Konsistenz verletzt; fail-closed (§11)")]
     Inconsistent,
+
+    /// **Operativer I/O-Fehler** des Segment-Logs (§7.1-Persistenz): ein
+    /// `pwrite`, `fsync`, Mapping- oder Verzeichnis-Vorgang ist fehlgeschlagen.
+    /// Ein **fsync-Fehler ist fatal** (Linux errseq/„fsyncgate"): er wird **nie**
+    /// als Erfolg geackt; das betroffene Segment wird vergiftet. Der Text ist
+    /// sichtbarkeits-blind (§11.3) und nennt **keine** konkreten Daten/IDs.
+    #[error("I/O-Fehler des Segment-Logs (§7.1)")]
+    Io,
+
+    /// **Beschädigte durable Daten** im Segment-Log: eine Prüfsummen-Verletzung
+    /// oder seq-Lücke **vor** dem letzten gültigen Batch-Footer (§Durability:
+    /// Recovery-Policy). Das sind bereits geackte, durable Daten — sie dürfen
+    /// **niemals** auto-trunkiert werden (§7.1: nie löschen). Der Kernel **HÄLT**
+    /// für den Operator an. Sichtbarkeits-blind (§11.3).
+    #[error("durable Daten beschädigt vor letztem Footer; HALT für Operator (§Durability)")]
+    Corruption,
+
+    /// Das Segment-Log ist **vergiftet** (poisoned): ein vorausgegangener fataler
+    /// Fehler (fsync-Fehler, Korruption) hat es in einen unbrauchbaren Zustand
+    /// versetzt. Jede weitere Operation schlägt definiert fehl, statt auf einem
+    /// halb-gültigen Zustand fortzufahren (§Durability: „Segment vergiften").
+    #[error("Segment-Log vergiftet nach fatalem Fehler (§Durability)")]
+    Poisoned,
 }
 
 #[cfg(test)]

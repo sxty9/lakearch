@@ -30,6 +30,35 @@
 //!   Prädikate getrennt, `traverse`/Anker-/Provenance-Verben (umbenannt), die
 //!   einzigen Mutationen `append`/`set_active_marker`, ein opaker
 //!   `SnapshotToken` an jeder Read-Signatur. Bodies sind Stubs je Phase.
+//! - [`format`] — das **On-Disk-Format** des Append-Segment-Logs (§7.1): das
+//!   gerahmte Record-Layout (`magic + format-version + checksum-algo-id + seq +
+//!   payload-length` + reservierte NULL-Felder), der geprüfsummte Batch-Footer
+//!   (Group-Commit) und die BLAKE3-Prüfsumme. Das Framing ist **getrennte**
+//!   Metadaten und geht **nie** in den `ContentId`-Preimage ein (§K5). Reine
+//!   in-memory Kodierung/Dekodierung; die Datei-I/O folgt in Phase 1.
+//! - [`log`] — das **Append-Segment-Log** (§7.1) als alleinige Durability-
+//!   Wahrheit (§8.4): `pwrite`-Schreibpfad, Group-Commit mit geprüfsummtem
+//!   Footer, `fsync`-Durability-on-Ack (fsync-Fehler = fatal/poison), read-only
+//!   `mmap` **nur** bis zum letzten committeten Footer, monotone seq je
+//!   physischem Record und Recovery (Tail-Truncate nach dem letzten gültigen
+//!   Footer; HALT bei Korruption davor). Einziges `unsafe`-Leaf-Modul (mmap).
+//! - [`store`] — der **Content-Store** (§5.2/§5.3): `append_datum` kanonisiert +
+//!   hasht + **dedupliziert** (§5.3: existiert die `ContentId`, wird nichts
+//!   geschrieben) + hängt den gerahmten Record ans Log; `get_by_content_id`
+//!   liest die durablen kanonischen Bytes/das [`Datum`] zurück. Hält die
+//!   in-memory Dedup-Karte und beide Kanten-Indizes als **reine, neu-baubare**
+//!   Derivate (§8.4): Ordnung **log-fsync → index-commit**, Reconciliation beim
+//!   Öffnen, `rebuild_index_from_log`.
+//! - [`index`] — die **Kanten-Indizes** (§1.2/§10.3): der [`EdgeIndex`]-Trait
+//!   (`owner→contexts` / `target→referrers`; **owned** `ContentId`s; Range-Scan;
+//!   transaktionales Watermark) und die redb-Impl [`RedbEdgeIndex`]. Reines
+//!   Derivat (§8.4) — wipe-/neu-baubar, Engine billig revidierbar.
+//! - [`kernel`] — die konkrete **Kernel-Implementierung** [`LakearchKernel`]: sie
+//!   besitzt den [`ContentStore`] (Log + Content-Store + Kanten-Indizes) und
+//!   verdrahtet die Phase-1-Verben des [`Kernel`]-Vertrags — `append` (§7.1,
+//!   Dedup §5.3, Index erst nach Log-`fsync` §8.4) und `get_by_content_id`
+//!   (§5.2-Fetch, liefert ein [`SealedRecord`] durchs Tor §11). Aggregierte
+//!   Betriebs-Zähler [`KernelMetrics`] über [`LakearchKernel::stats`] (§Betrieb).
 //! - [`error`] — [`error::KernelError`] (rein **mechanische** Zustände, §1.4).
 //! - Platzhalter-Konvention (§3.6) auf [`Datum`]
 //!   ([`Datum::placeholder`]/[`Datum::unresolved_marker`]): geschlossene
@@ -40,15 +69,29 @@ mod serialize;
 
 pub mod api;
 pub mod error;
+pub mod format;
 pub mod gate;
 pub mod id;
+pub mod index;
+pub mod kernel;
+pub mod log;
+pub mod store;
 
 pub use api::{Direction, Kernel, SnapshotToken, Step, StepStream};
 pub use error::KernelError;
-pub use gate::{Capability, GrantedScopes, SealedRecord, VisibleDatum};
+pub use format::{
+    checksum, decode_record, encode_record, encode_record_to_vec, BatchFooter, DecodedRecord,
+    RecordHeader, CHECKSUM_ALGO_BLAKE3, CHECKSUM_LEN, FOOTER_MAGIC, RECORD_FORMAT_VERSION,
+    RECORD_HEADER_LEN, RECORD_MAGIC,
+};
+pub use gate::{open, Capability, GrantedScopes, SealedRecord, VisibleDatum};
 pub use id::{AnchorId, ContentId, DOMAIN_TAG_V1};
+pub use index::{Edge, EdgeIndex, RedbEdgeIndex};
+pub use kernel::{KernelMetrics, LakearchKernel};
+pub use log::{LogMetrics, LoggedRecord, SegmentLog};
 pub use model::Datum;
-pub use serialize::canonical_cbor;
+pub use serialize::{canonical_cbor, strict_decode};
+pub use store::{ContentStore, StoreMetrics};
 
 #[cfg(test)]
 mod tests {

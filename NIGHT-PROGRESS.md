@@ -7,7 +7,7 @@ Branch: `kernel-impl` · Plan: `~/.claude/plans/lakearch-geht-in-die-indexed-sph
 |---|---|---|---|
 | 0 — Skeleton & Invarianten | ✅ Start | (scaffold) | Workspace + ContentId/AnchorId, build+test+clippy grün |
 | 0.5 — Irreversibles einfrieren | ✅ | kernel-impl | eingefrorene kanonische CBOR (selbst erzwungen) + Golden Vectors + 2. Encoder, model/serialize/id, Tor-Typ-Skelett, API-Trait; build+test (45)+clippy -D warnings grün |
-| 1 — Append + Store + Index + Betrieb | ⏳ | – | |
+| 1 — Append + Store + Index + Betrieb | ✅ | kernel-impl | `pwrite`-Log + Read-mmap + Group-Commit + Recovery (HALT bei Korruption), redb-Kanten-Indizes (`owner→contexts`/`target→referrers`), Content-Store + Dedup (§5.3), Log-als-Wahrheit + Wipe-&-Rebuild, gegateter `get_by_content_id`, Betriebs-/Metrik-Basis; build+test (125)+clippy -D warnings grün |
 | 2 — Traversierung + Tor-Logik | ⏳ | – | |
 | 3 — Bitemporal + Platzhalter | ⏳ | – | |
 | 4 — Anker / referenzielle Identität | ⏳ | – | |

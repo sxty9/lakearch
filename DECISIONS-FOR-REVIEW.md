@@ -71,3 +71,367 @@ markieren; nur bei wirklich unumkehrbaren Weichen anhalten und warten.
   (in Spec §K8 GV-4 und im Test fixiert). Ein veralteter Kommentar in `serialize.rs`
   spricht noch von einem „27"-Tippfehler der Spec-Prosa; die Spec ist inzwischen korrekt
   (28) — Kommentar bei Gelegenheit aufräumen (nicht blockierend).
+
+### Phase 1 — On-Disk-Format-Schicht (`format.rs`, Branch `kernel-impl`)
+
+Reine **in-memory** Kodierung/Dekodierung des Segment-Log-Framings; **keine**
+Datei-I/O (die kommt mit dem `pwrite`-Log-Writer/-Reader später in Phase 1).
+
+- **Magic-Bytes:** Record-Frame = `b"LKR1"` (`4C 4B 52 31`), Batch-Footer =
+  `b"LKF1"` (`4C 4B 46 31`). Bewusst **verschieden**, damit ein Footer beim
+  Record-für-Record-Recovery-Scan nie als Record fehlgedeutet wird.
+- **Prüfsumme (`checksum-algo-id = 1`):** **BLAKE3**, volle 32-Byte-Default-
+  Ausgabe. Gewählt statt CRC, weil BLAKE3 schon Kern-Abhängigkeit (ContentId,
+  §K5) ist, jeden Ein-Bit-Flip sicher erkennt und schnell ist. Die Prüfsumme ist
+  **nur** Framing-Integrität — **kein** Teil des ContentId-Preimage.
+- **Byte-Reihenfolge:** alle Mehrbyte-Integer **little-endian** (native x86-64/
+  aarch64), einmal festgelegt und dokumentiert.
+- **Record-Layout (fester 64-Byte-Header, `format-version = 1`):**
+  `magic(4) | format_version(u16) | checksum_algo_id(u16) | seq(u64) |
+  payload_length(u64) |` reservierte NULL-Felder `activation_epoch(u64) |
+  marker_offset(u64) | constituent_range(u64) | shard_id(u32) |
+  index_validity_offset(u64) | reserved_pad(u32)`, danach `payload` und
+  `checksum(32)` über `Header ‖ Payload`. Gesamt = `64 + payload_len + 32`.
+- **Batch-Footer-Layout (fester 64-Byte-Rumpf, `format-version = 1`):**
+  `magic(4) | format_version(u16) | checksum_algo_id(u16) | record_count(u64) |
+  first_seq(u64) | last_seq(u64) |` reservierte NULL-Felder
+  `activation_epoch(u64) | shard_id_packed(u64) | index_validity_offset(u64) |
+  reserved_pad(u64)`, danach `checksum(32)` über den Rumpf. Gesamt = `64 + 32`.
+- **Reservierte Felder** (für spätere Phasen, damit das append-only-Format **nie**
+  geändert werden muss, §K5.1): in v1 stets **NULL**; per Test (`reserved_*_fields_
+  round_trip_as_zero`) abgesichert.
+- **Striktheit (§Durability):** truncierter Header/Payload/Footer, falsches Magic,
+  unbekannte `format-version`/`checksum-algo-id` und jede Prüfsummen-Verletzung ⇒
+  definierter Fehler `KernelError::Inconsistent` — **nie** stilles Überspringen.
+  seq-Lücken-Prüfung gehört in den Reader/Recovery (nächster Phase-1-Schritt),
+  nicht in die reine Frame-Dekodierung.
+- **`#![forbid(unsafe_code)]`** bleibt auf `format.rs` (nur Slice-/`Vec`-Arbeit);
+  `unsafe` bleibt dem späteren log/mmap-Leaf-Modul vorbehalten.
+
+**Index-Engine (Notiz, noch nicht implementiert):** **RocksDB heute bewusst
+ausgeschlossen** — `libclang` fehlt in dieser Umgebung (RocksDB-bindgen braucht
+es). Gewählt wird **redb** (pure-Rust); da das **Log die alleinige Wahrheit** ist
+(§8.4) und die Sekundär-Indizes reine, neu-baubare Derivate sind, ist die Engine
+**billig revidierbar** — das de-riskt redbs relative Jugend. Edge-Index hinter
+einem Trait (owned `ContentId`s), redb als konkrete Impl; folgt nach der
+Format-Schicht in Phase 1.
+
+### Phase 1 — Append-Segment-Log (`log.rs`, Branch `kernel-impl`)
+
+Die Datei-I/O-Schicht über dem Framing aus `format.rs`. Höchstrisiko-Modul;
+rigoros + breit getestet (20 Log-Tests). **Grün:** `cargo build --all-targets`,
+`cargo test` (89 Tests), `cargo clippy --all-targets -D warnings`.
+
+- **Abhängigkeiten:** `memmap2 = "0.9"` (read-only mmap, dependency),
+  `tempfile = "3"` (dev-dependency für Tests).
+- **Schreibpfad `pwrite`:** Records werden per
+  `std::os::unix::fs::FileExt::write_at`/`write_all_at` geschrieben — **nie**
+  mmap-Stores fürs Log (§Durability). mmap ist ausschließlich **read-only**.
+- **Group-Commit:** `append_record` puffert nur (in-memory `pending`-Vec);
+  `commit` schreibt `Records ‖ Footer` ab dem committed offset, `fsync`t die
+  Daten und veröffentlicht **erst danach** den neuen committed offset (Watermark
+  `W`). `append_and_commit` ist der Ein-Record-Bequempfad.
+- **Durability-on-Ack:** ein Record ist erst **nach** dem einschließenden
+  Group-Commit-`fsync` geackt/sichtbar; vorher liegt er nur im Pending-Puffer und
+  ist für Leser unsichtbar (Test `uncommitted_append_is_invisible_until_commit`,
+  `uncommitted_tail_is_dropped_on_reopen`).
+- **fsync-Fehler = fatal (errseq):** vergiftet das Log (`poisoned`-Flag,
+  `KernelError::Poisoned`); **nie** Retry-als-Erfolg. Auch der Verzeichnis-`fsync`
+  nach Segment-Erstellung ist fatal-bei-Fehler.
+- **Lesepfad read-only mmap:** gemappt **nur bis `committed_offset`** (fester
+  `MmapOptions::len`), nie über EOF / in den Schreibbereich (kein Torn-Read/
+  SIGBUS). **Prüfsumme wird VOR Herausgabe der Bytes verifiziert** (`decode_record`).
+  Test `mmap_reads_never_exceed_committed_offset` belegt den Map-Umfang.
+- **monotone seq je physischem Record:** Dedup-Treffer (§5.3) liegen ÜBER diesem
+  Modul (die schreibende Schicht entscheidet, ob überhaupt geschrieben wird) —
+  `log.rs` vergibt seq strikt fortlaufend für jeden übergebenen Record und nimmt
+  den Stand nach Reopen wieder auf.
+- **Recovery (zwei getrennte Begriffe):** **strukturelles Vorrücken** über die
+  Frame-Länge (Header-`payload_length`) erlaubt es, **über einen prüfsummen-
+  defekten Record hinweg** weiterzuscannen, um einen *späteren* gültigen Footer zu
+  finden; **Integritäts-Validierung** (Prüfsumme/seq-Kette/Footer-Felder) vermerkt
+  den **ersten** Defekt. committed offset = Ende des letzten gültig
+  abgeschlossenen Batches; **erster Defekt strikt VOR committed offset ⇒
+  `KernelError::Corruption` (HALT, kein Auto-Truncate)**; Defekt am/nach committed
+  offset ⇒ nur un-ackter Tail → trunkiert (`set_len` + `fsync`). Tests decken:
+  torn mid-record, torn mid-footer, voller Record ohne Footer (verworfen),
+  gekipptes Byte im ersten/nicht-ersten committeten Record (HALT), beschädigter
+  committeter Footer vor dem letzten (HALT).
+- **`unsafe`-Kapselung:** `log.rs` ist das **einzige** `unsafe`-Leaf-Modul (genau
+  **ein** `MmapOptions::map`-Aufruf) mit `#![deny(unsafe_op_in_unsafe_fn)]` +
+  SAFETY-Kommentar; `gate.rs`/`format.rs` bleiben `#![forbid(unsafe_code)]`.
+- **Neue `KernelError`-Varianten:** `Io` (operativer I/O-Fehler), `Corruption`
+  (beschädigte durable Daten → HALT), `Poisoned` (Log nach fatalem Fehler).
+- **Bewusste Vereinfachungen (Phase 1, nicht-blockierend):**
+  - **Ein Segment** (`000000000000.seg`); Roll-over/Mehr-Segment-LRU ist ein
+    späterer Schritt. Der Dateiname ist sortierbar-gepolstert, damit das ohne
+    Format-Bruch erweiterbar ist; Segment-Erstellung löst bereits den
+    Directory-`fsync` aus.
+    `LogMetrics.segment_count` ist in v1 stets 1.
+  - **Externe Out-of-Band-Truncation/Korruption** eines gemappten Segments durch
+    Dritte ist ein **Operator-Vertragsbruch** (§Sicherheit) und außerhalb der
+    SIGBUS-Garantie; ein dedizierter `SIGBUS`-Handler ist ein späterer Härtungs-
+    Schritt. Korruption **innerhalb** des durablen Präfixes (z. B. Bit-Rot)
+    wird durch die Prüfsumme-vor-Herausgabe erkannt (`read_all`/`read_at` ⇒
+    `Corruption`).
+  - **Recovery liest das Segment via `pread` in einen `Vec`** (nicht mmap), weil
+    der Tail torn/un-ackt sein darf; ein mmap des ganzen (evtl. torn) Files wäre
+    SIGBUS-riskant. Bei sehr großen Historien werden hier in einer späteren Phase
+    Checkpoints/segmentweises Streaming gebraucht (RTO-Bindung, vgl. Plan).
+  - **Group-Commit ist noch nicht die volle MPSC-Pipeline:** `SegmentLog` ist der
+    eine Append-Pfad (`&mut self`); die lock-free Producer-Queue + Loom-Tests
+    folgen mit der `Kernel::append`-Verdrahtung.
+
+### Phase 1 — Content-Store + Sekundär-Indizes (`store.rs`, `index.rs`, Branch `kernel-impl`)
+
+Der Content-Store über dem Log (`store.rs`) und die abgeleiteten Kanten-Indizes
+(`index.rs`, redb). **Grün:** `cargo build --all-targets`, `cargo test`
+(97 lib + 12 Kanonik-Vektoren + 5 Store-Integration = 114 Tests),
+`cargo clippy --all-targets -D warnings`.
+
+- **Neue Abhängigkeit:** `redb = "2"` (löst auf **redb 2.6.3**, pure-Rust, baut mit
+  Rust 1.96). **RocksDB heute bewusst ausgeschlossen** (libclang fehlt für
+  RocksDB-bindgen); LMDB/heed nicht aufgenommen. Da das **Log die alleinige
+  Wahrheit** ist (§8.4) und die Indizes reine, neu-baubare Derivate sind, ist die
+  Engine **billig revidierbar** — das de-riskt redbs relative Jugend.
+- **`strict_decode` (§K6) in `serialize.rs` ergänzt:** der Neu-Bau aus dem Log
+  (und `get_by_content_id` als `Datum`) braucht die **strikte** Umkehr der
+  Kanonisierung. `strict_decode(canonical_cbor(d)) == d` und Idempotenz
+  (`re-encode == bytes`) sind getestet; jede nicht-kanonische Eingabe (nicht-
+  kürzeste Länge §K3.1, indefinite-length §K3.2, Tag/Float/Simple §K3.4–§K3.6,
+  fremder Schlüssel, gemischte/leere Klasse §K2.1, **unsortierte/doppelte** `owns`
+  §K2.3, Rest-Bytes) ⇒ `KernelError::Inconsistent`. **Nie** stilles
+  Re-Kanonisieren.
+
+- **EdgeIndex-Trait-Form (eingefroren als Form, Logik bleibt mechanisch §1.3):**
+  - `commit_edges(&mut self, edges: &[Edge], new_watermark: u64) -> Result<(),_>`
+    — **eine** atomare Transaktion für Kanten **und** Watermark (§8.4); Watermark
+    monoton nicht-fallend (Rückschritt ⇒ `Inconsistent`).
+  - `contexts_of(owner) -> Vec<ContentId>` (Vorwärts, `owner→contexts`, §1.2/§3.2).
+  - `referrers_of(target) -> Vec<ContentId>` (Rückwärts, `target→referrers`,
+    §1.2/§10.3) — Grundlage der Invalidierung.
+  - `watermark() -> u64` (§8.4-Watermark).
+  - `scan_owners(start, end) -> Vec<(ContentId, Vec<ContentId>)>` (Präfix-/Range-
+    Scan über die 32-Byte-Adress-Order, halb-offen `[start, end)`).
+  - `wipe()` (alles löschen + Watermark→0, atomar; reines Derivat §8.4).
+  Alle Rückgaben sind **owned** `ContentId`s (keine geliehenen redb-Guards lecken)
+  und **aufsteigend** in 32-Byte-Order (deterministischer, föderationsstabiler
+  Tiebreak; §5.2/§1.4, **kein** Wert-Sort). `Edge { owner, context }` ist nur ein
+  Index-Eintrag, **keine** adressierbare Entität (§2.2/§K2.2).
+
+- **redb-Schema/Tabellen-Layout (`RedbEdgeIndex`):**
+  - `owner_contexts` : **Multimap** `[u8;32] → [u8;32]` (Vorwärts: owner→context).
+  - `target_referrers` : **Multimap** `[u8;32] → [u8;32]` (Rückwärts: target→owner).
+  - `watermark` : Tabelle `&str → u64`, **ein** Eintrag `"log_offset"` — im
+    **selben Commit** wie die Kanten geschrieben (transaktionale Atomarität, §8.4).
+  - Schlüssel/Werte sind die rohen 32 `ContentId`-Bytes (redb `[u8; 32]`-Key).
+  - **Durability:** Index-Commits laufen mit `Durability::Immediate`. Bei Verlust/
+    Vorauseilen ist der Index als reines Derivat neu baubar — nie die Wahrheit.
+
+- **Content-Store (`ContentStore<I: EdgeIndex>`):**
+  - `append_datum(&Datum)`: kanonisiert → `ContentId::of_datum` (§K5) → **Dedup**
+    (in-memory `HashMap<ContentId, Offset>`): existiert die ID, **kein** Record,
+    **keine** seq, Dedup-Zähler+1, vorhandene ID zurück (§5.3). Sonst:
+    `append_and_commit` ans Log (**Log-fsync ZUERST**), Offset in die Dedup-Karte,
+    **danach** `commit_edges` in den Index (**log-fsync → index-commit**, §8.4),
+    Watermark = neuer committed Log-Offset.
+  - `get_canonical_bytes` / `get_by_content_id`: Dedup-Karte → `read_at` (Prüfsumme
+    verifiziert) → optional `strict_decode` zum `Datum`. Defensiv: zurückgelesene
+    Form muss dieselbe ID tragen (sonst `Inconsistent`). **Noch kein Tor** in
+    diesem Stand (Tor-Sichtbarkeit/VANISH ist Phase 2; der `SealedRecord`-Pfad
+    folgt mit der `Kernel`-Trait-Verdrahtung).
+  - **Reine Derivate, beim Öffnen rekonstruiert (§8.4):** Dedup-Karte stets
+    vollständig aus dem Log; Index versöhnt (`W==T` sync, `W<T` Records ab Offset
+    `W` nachspielen, `W>T` **voller Neu-Bau** — keine Suffix-Chirurgie).
+    `rebuild_index_from_log()` = wipe + ganzen Log replayen.
+  - **Metriken** (`StoreMetrics`): `append_count`, `dedup_hit_count`, `edge_count`.
+
+- **Tests (alle grün):** owner/referrer-Kanten in beide Richtungen; Dedup
+  (Log-Länge unverändert + Dedup-Zähler); **Wipe-&-Rebuild identisch**; Watermark
+  monoton; Reopen konsistent (W==T); Lag-Replay (W<T, ohne Wipe); Index-Voraus
+  (W>T ⇒ Neu-Bau); Blatt hat keine Kanten; `strict_decode` Round-Trip +
+  Ablehnung nicht-kanonischer Eingaben; redb-Direkttests (beide Richtungen,
+  Watermark, Wipe, Reopen, Range-Scan, Idempotenz).
+
+**Vertagte, nicht-blockierende Punkte (Phase 1+):**
+- **RocksDB/LMDB-Vergleichs-Benchmark vertagt:** das Engine-Benchmark-Gate
+  (redb vs LMDB(heed) vs RocksDB: 100M–1Mrd Tiny-Edges, Write/Space-Amplification,
+  p99-Referrer-Präfix-Scan, COW-Reader-File-Bloat) bleibt offen, bis libclang
+  verfügbar ist bzw. der Bedarf gemessen wird. Die `EdgeIndex`-Abstraktion ist
+  genau dafür da — die Engine ist hinter dem Trait austauschbar (§Storage-Engine).
+- **`Kernel`-Trait-Verdrahtung** (`append`/`get_by_content_id` über das Tor mit
+  `SealedRecord`/`Capability`/`SnapshotToken`): **erledigt** — siehe Abschnitt
+  „Phase 1 — Kernel-Verdrahtung" unten. Die Tor-**Sichtbarkeitslogik** (VANISH,
+  Bereichs-Filter) und die volle Snapshot-Epochen-Semantik bleiben Phase 2/5.
+- **Index-Durability vs. einzige reale Barriere:** Index nutzt aktuell
+  `Durability::Immediate` (zwei fsyncs pro Append). Der Plan sieht einen
+  nicht-durablen/checkpointed Index mit **einer** realen Barriere vor; da der Index
+  neu baubar ist, ist die Umstellung billig und für eine spätere Performance-Runde
+  vorgesehen (vgl. Risiko „Doppelte Durability-Barriere/Skew").
+
+### Phase 1 — Kernel-Verdrahtung (`kernel.rs`, Branch `kernel-impl`)
+
+Die konkrete `Kernel`-Implementierung `LakearchKernel<I: EdgeIndex>` über dem
+`ContentStore`. **Grün:** `cargo build --all-targets`, `cargo test`
+(102 lib + 12 Kanonik + 5 Store-Integration + 3 Kernel-E2E = 122 Tests),
+`cargo clippy --all-targets -D warnings`.
+
+- **`LakearchKernel<I>`** besitzt den `ContentStore<I>` hinter einem
+  `std::sync::RwLock` (der Store ist der eine Append-Pfad `&mut self`, der
+  `Kernel`-Vertrag führt jedes Verb über `&self`): `append` nimmt den Schreib-Lock,
+  Lesepfade den Lese-Lock. Ein **vergifteter Lock** ⇒ `KernelError::Poisoned`
+  (fail-closed, §11). Die volle lock-freie MPSC-/Group-Commit-Pipeline ist eine
+  spätere Phase. `LakearchKernel::open(dir)` ist die Standard-Konstruktion mit der
+  redb-Engine (`dir/log` + `dir/index.redb`).
+- **Verdrahtete Phase-1-Verben:** `append` (§7.1, Dedup §5.3, Index erst nach
+  Log-`fsync` §8.4 — alles delegiert an `ContentStore::append_datum`) und
+  `get_by_content_id` (§5.2-Fetch, liefert ein `SealedRecord` durchs Tor §11 via
+  neuem `ContentStore::get_sealed`). **`pin_snapshot`/`authorize` minimal
+  verdrahtet** (statt der Trait-Stubs), damit ein Ende-zu-Ende-Lesepfad existiert:
+  `pin_snapshot` pinnt am aktuellen durablen Watermark `W` (committed Log-Offset);
+  `authorize` stellt eine `Capability` aus, **ohne** schon Berechtigungen zu
+  matchen (Tor-Logik = Phase 2). Alle übrigen Verben (Matching, Traversierung,
+  Anker, Provenance, `set_active_marker`) bleiben die phasenrichtigen
+  `NotYetImplemented`-Stubs des Trait-Defaults (Test
+  `unwired_verbs_still_report_their_phase`).
+- **`SealedRecord` trägt jetzt echte Bytes (statt Skelett-Spiegel):**
+  `SealedRecord::seal(content_id, canonical_bytes)` (crate-intern) hält die
+  durablen kanonischen CBOR-Bytes (§K4); `open` legt sie als
+  `VisibleDatum::canonical_bytes()` frei — die **einzige** Stelle, an der die
+  Roh-Sicht einen Leser erreicht, und **nur** gegen eine `Capability` (§11.5). Der
+  frühere `revealed_content_id()`-Skelett-Getter ist durch `canonical_bytes()`
+  ersetzt. Die Compile-Zeit-Unumgehbarkeit bleibt: kein Inhalts-Getter auf
+  `SealedRecord`, `Capability`/`VisibleDatum` unfälschbar (privat + `Sealed`).
+- **`GrantedScopes::from_scope_ids` jetzt `pub`** (war `pub(crate)`): `GrantedScopes`
+  ist das **Eingabe-Subjekt** des Lesers, das die Schicht darüber dem Kernel vorlegt
+  (§11.1) — daher öffentlich konstruierbar. Das bricht die Tor-Garantie **nicht**:
+  das Tor (Phase 2) *validiert* die Scopes gegen die auditierten Berechtigungen,
+  bevor es eine `Capability` ausstellt; `Capability`/`VisibleDatum` bleiben
+  unfälschbar. (Korrigiert die Phase-0.5-Notiz „GrantedScopes außerhalb gate.rs
+  nicht konstruierbar" — die Unfälschbarkeit liegt bei `Capability`/`VisibleDatum`,
+  nicht beim bloßen Scopes-Eingabewert.)
+- **Metriken (§Betrieb):** `KernelMetrics` über `LakearchKernel::stats()` fasst die
+  Store- und Log-Zähler zu **einer** sichtbarkeits-blinden (§11.3) Lese-Sicht
+  zusammen: `append_count`, `dedup_hit_count`, `edge_count`, `batch_count`,
+  `fsync_count`, `segment_count`, `committed_bytes`. `append_count`/`dedup_hit_count`
+  sind Prozess-Mechanik-Zähler (nicht persistiert; nach einem Reopen 0, die Daten
+  selbst sind durabel).
+- **Tests:** Ende-zu-Ende `append → get_by_content_id → open → strict_decode`
+  (lib + öffentliche `tests/kernel_e2e.rs`); Dedup spiegelt sich in `stats`; Reopen
+  von Platte liest zurück (committeter Watermark überlebt, Dedup-Karte aus dem Log
+  rekonstruiert); unbekannte ID ⇒ `None` (VANISH-Vorform); nicht-verdrahtete Verben
+  melden weiter ihre Phase.
+
+### Phase 1 — Review-Härtung (blockierende Findings behoben, Branch `kernel-impl`)
+
+Zwei blockierende Review-Findings adressiert; beide **warranted** ⇒ behoben (keine
+Wegerklärung). **Grün:** `cargo build --all-targets`, `cargo test`
+(105 lib + 12 Kanonik + 3 Kernel-E2E + 5 Store-Integration = 125 Tests),
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Finding 1 (Durability) — Recovery verlor still geackte Daten bei Header-
+  Korruption.** Der alte Recovery-Scan (`log.rs::scan_segment`) rückte über einen
+  Record per `record_frame_len` vor, das die **unverifizierte** `payload_length`
+  (Header-Bytes 16..24) las. Ein gekipptes Längen-Byte eines bereits geackten
+  Records ließ den Vorlauf den nachfolgenden Batch-Footer **verschlucken**;
+  `committed_offset` blieb bei 0 (Einzel-Batch) bzw. einem früheren Wert, der
+  HALT-Guard `d < committed_offset` zündete nicht (`0 < 0` ist falsch), und
+  `recover()` trunkierte die **geackten** Daten als vermeintlichen un-ackten Tail.
+  Das verletzte den Durability-Vertrag (Plan „Durability/Recovery": Defekt VOR dem
+  letzten Footer ⇒ **HALT**, nie auto-truncate; §7.1; §8.4).
+  **Behebung (zwei Elemente):**
+  1. **Defekter Header ist nicht vertrauenswürdig.** Schlägt `decode_record` die
+     Prüfsumme eines Records fehl (ein gekipptes `payload_length` verfälscht die
+     Prüfsumme über `Header ‖ Payload` immer), wird **nicht** über die im Header
+     genannte Länge vorgerückt. Stattdessen sucht `next_frame_magic` **byteweise**
+     das nächste Frame-Magic (`LKR1`/`LKF1`), sodass spätere gültige Footer
+     weiterhin gefunden werden. `record_frame_len` ist entfernt.
+  2. **Der Footer ist die Commit-Autorität.** Ein prüfsummen-**gültiger** Batch-
+     Footer beweist, dass der mit ihm endende Byte-Bereich durable committet ist;
+     `committed_offset` = Ende des **letzten** gültigen Footers (nicht aus
+     unverifizierten Längen abgeleitet). HALT, sobald der erste Defekt **strikt
+     vor** diesem committed offset liegt — einschließlich des Einzel-Batch-Falls,
+     in dem der gekippte Record der allererste vor einem sonst gültigen Footer ist.
+  **Neue Tests:** `recovery_halts_on_corrupt_payload_len_in_single_committed_batch`
+  (Szenario A), `…_in_first_of_two_committed_batches` (B) und
+  `…_on_shrunk_payload_len_in_committed_record` (C) — jeweils `Err(Corruption)`
+  **und** Datei NICHT trunkiert. Alle bestehenden Torn-Tail-Regressionen
+  (mid-record, mid-footer, voller Record ohne Footer, sauberer Multi-Batch, korrupte
+  Nutzlast/Footer-Body) bleiben grün.
+
+- **Finding 2 (Axiom-Treue §11) — ungegateter Byte-Zugriff verließ das Crate.**
+  `ContentStore::get_canonical_bytes` und `…::get_by_content_id` waren `pub` und gaben
+  Roh-CBOR-Bytes bzw. ein voll dekodiertes `Datum` **ohne** das Tor heraus; der
+  öffentliche Integrationstest nutzte diesen Bypass. Das widersprach §11.2/§11.5
+  („unumgehbares, manipulationssicheres Tor; jeder Lesevorgang passiert es") und der
+  `gate.rs`-Zusage „ohne Tor lesen ist im Typsystem nicht darstellbar".
+  **Behebung:** beide Methoden auf `pub(crate)` gesetzt; die `Datum`-Variante
+  (nur noch von crate-internen Tests genutzt) zusätzlich `#[cfg(test)]`. Der
+  **einzige** externe Lese-Pfad ist jetzt `ContentStore::get_sealed` (+ `gate::open`
+  gegen eine `Capability`) bzw. der `Kernel`-Vertrag. Interne Aufrufer
+  (`get_sealed`, Reconcile-/Rebuild-Pfade) laufen unter `pub(crate)` unverändert.
+  `tests/store_index.rs::get_by_content_id_round_trips` ist auf den gegateten
+  `LakearchKernel`-Pfad (`pin_snapshot → authorize → get_by_content_id → open`)
+  umgestellt. Da `Capability` außerhalb von `gate.rs` nicht konstruierbar ist, kann
+  externer Code die versiegelten Bytes nur durchs Tor öffnen — die Compile-Zeit-
+  „kein-ungegateter-Byte-Zugriff"-Eigenschaft ist wiederhergestellt.
+
+- **Index-Engine-Notiz (RocksDB heute ausgeschlossen, redb gewählt):** bleibt gültig
+  (siehe oben „Index-Engine"-Notiz): `libclang` fehlt in dieser Umgebung
+  (RocksDB-bindgen braucht es); **redb** ist pure-Rust. Weil das **Log die alleinige
+  Wahrheit** ist (§8.4) und die Indizes reine, neu-baubare Derivate sind (hinter dem
+  `EdgeIndex`-Trait, der owned `ContentId`s liefert), ist die Engine **billig
+  revidierbar** — das de-riskt redbs relative Jugend. Das Vergleichs-Benchmark-Gate
+  (redb vs LMDB/heed vs RocksDB) bleibt offen, bis libclang verfügbar bzw. der Bedarf
+  gemessen ist.
+
+### Phase 1 — Abschluss & Commit (Branch `kernel-impl`)
+
+Phase 1 ist **fertig und grün** und wird als ein Commit eingefroren (Politik:
+ein Commit pro grüner Phase). **Grün verifiziert** (`source $HOME/.cargo/env`,
+in `/home/nanu/lakearch`):
+- `cargo build --all-targets` — sauber.
+- `cargo test` — **125 Tests** grün: 105 lib-Unit + 12 Kanonik-Vektoren
+  (`tests/canonical_vectors.rs`) + 3 Kernel-E2E (`tests/kernel_e2e.rs`) + 5
+  Store-Integration (`tests/store_index.rs`); 0 fehlgeschlagen, 0 ignoriert.
+- `cargo clippy --all-targets -- -D warnings` — sauber (Exit 0).
+
+Damit deckt Phase 1 ab: `pwrite`-Append-Log (alleinige Wahrheit, §8.4) +
+read-only-mmap + Group-Commit + Recovery (HALT bei Korruption vor dem letzten
+Footer, Tail-Truncate danach), die redb-Kanten-Indizes hinter dem
+`EdgeIndex`-Trait (`owner→contexts` / `target→referrers`, §1.2/§10.3) als reine
+neu-baubare Derivate (Wipe-&-Rebuild getestet, §8.4), der Content-Store mit
+Wert-Dedup (§5.3), die gegatete `Kernel::append`/`get_by_content_id`-Verdrahtung
+(§7.1/§5.2 durchs Tor §11) und die Betriebs-/Metrik-Basis (§Betrieb). Die
+inhaltlichen Phase-1-Entscheidungen stehen in den Abschnitten oben
+(`format.rs`, `log.rs`, `store.rs`/`index.rs`, `kernel.rs`, Review-Härtung).
+
+**Vertagte, nicht-blockierende Punkte (für Phase 2+ / spätere Performance-Runde):**
+- **RocksDB/LMDB-Vergleichs-Benchmark (Engine-Benchmark-Gate):** vertagt, bis
+  `libclang` verfügbar ist (RocksDB-bindgen braucht es) bzw. der Bedarf gemessen
+  wird. Messpunkte laut Plan: 100M–1Mrd Tiny-Edges nebenläufig ingesten,
+  Write/Space-Amplification, p99-Referrer-Präfix-Scan, COW-Reader-File-Bloat;
+  Kandidaten **redb vs LMDB(heed) vs RocksDB**. Die `EdgeIndex`-Abstraktion (owned
+  `ContentId`s) ist genau dafür da — die Engine ist hinter dem Trait austauschbar,
+  und da das Log die Wahrheit ist, ist der Wechsel billig (§Storage-Engine).
+- **`dm-flakey`/CrashMonkey-Fault-Injection vertagt:** der Plan verlangt echte
+  Fehler-Injektion (reordered/lost/partial I/O über Segment-, Footer-,
+  Dir-Entry-, Index-Grenzen), nicht nur sauberen Prozess-Kill. Aktuell ist die
+  Crash-Konsistenz durch **deterministische Recovery-Tests** abgedeckt (torn
+  mid-record/mid-footer, voller Record ohne Footer, gekipptes Byte / verfälschte
+  `payload_length` im committeten Präfix ⇒ HALT, kein Auto-Truncate). Die echte
+  Block-Layer-Fault-Injection (Kernel-`dm-flakey`-Device) braucht Root/Geräte-Setup
+  und wird in einer dedizierten Härtungs-Runde nachgezogen (vgl. Plan
+  „Durability/Recovery", Verifikation Punkt 2).
+- **`loom` für die künftige MPSC-/Group-Commit-Pipeline vertagt:** `SegmentLog`
+  ist heute der **eine** Append-Pfad (`&mut self`), und `LakearchKernel` serialisiert
+  Appends über einen `RwLock` — es gibt in Phase 1 noch **keinen** lock-freien
+  MPSC-Producer-Pfad, also nichts, was `loom` modellieren könnte. Sobald die
+  lock-freie Producer-Queue + Group-Commit-Pipeline gebaut wird (spätere Phase),
+  kommen `loom`-Modelle (plus `Miri` für etwaigen zerocopy-Code) als CI-Gate dazu
+  (vgl. Plan „Sicherheit, `unsafe` & Verifikations-Tooling").
+- **Index-Durability vs. einzige reale Barriere:** der Index nutzt aktuell
+  `Durability::Immediate` (zwei fsyncs pro Append). Der Plan sieht einen
+  nicht-durablen/checkpointed Index mit **einer** realen Barriere vor; da der Index
+  neu baubar ist, ist die Umstellung billig (spätere Performance-Runde, Risiko
+  „Doppelte Durability-Barriere/Skew").

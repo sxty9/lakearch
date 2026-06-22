@@ -68,27 +68,26 @@ pub struct SealedRecord {
 }
 
 /// Privater Inhaltsträger eines [`SealedRecord`]. Bewusst ein eigener Typ, damit
-/// keine `pub`-Felder durchsickern und der Skelett-Inhalt später (Phase 1) gegen
-/// echte kanonische Bytes / einen `Arc<SegmentHandle>+offset` getauscht werden
-/// kann, **ohne** die öffentliche Tor-Signatur zu ändern.
+/// keine `pub`-Felder durchsickern und die Roh-Sicht später (Phase 7) gegen einen
+/// `Arc<SegmentHandle>+offset` (Zero-Copy) getauscht werden kann, **ohne** die
+/// öffentliche Tor-Signatur zu ändern.
 #[derive(Clone, Debug)]
 struct SealedPayload {
-    /// Skelett-Platzhalter für die spätere Roh-Sicht. Im Skelett spiegeln wir
-    /// die `ContentId`, damit [`VisibleDatum`] etwas Reales trägt; ab Phase 1
-    /// stehen hier die kanonischen Bytes bzw. ein Segment-Handle.
-    content_id: ContentId,
+    /// Die **kanonischen CBOR-Bytes** des Daten (§K4), wie sie durabel im Log
+    /// liegen — die einzige Roh-Sicht auf den Inhalt. **Privat**; sie verlässt
+    /// das Modul **ausschließlich** über [`open`] in einem [`VisibleDatum`].
+    canonical_bytes: Vec<u8>,
 }
 
 impl SealedRecord {
-    /// **Crate-interner** Konstruktor: nur Speicher/Index (ab Phase 1) erzeugen
-    /// versiegelte Records. Es gibt **keinen** öffentlichen Konstruktionsweg —
-    /// damit ist „Record ohne Tor selbst bauen und auslesen" außerhalb des
-    /// Crates unmöglich.
-    #[allow(dead_code)] // Phase 1: ruft der Speicher/Index; jetzt nur Tests + Form.
-    pub(crate) fn seal(content_id: ContentId) -> Self {
+    /// **Crate-interner** Konstruktor mit den durablen **kanonischen Bytes** des
+    /// Daten (§K4): nur Speicher/Kernel (Phase 1) erzeugen versiegelte Records. Es
+    /// gibt **keinen** öffentlichen Konstruktionsweg — damit ist „Record ohne Tor
+    /// selbst bauen und auslesen" außerhalb des Crates unmöglich (§11.5).
+    pub(crate) fn seal(content_id: ContentId, canonical_bytes: Vec<u8>) -> Self {
         SealedRecord {
             content_id,
-            payload: SealedPayload { content_id },
+            payload: SealedPayload { canonical_bytes },
         }
     }
 
@@ -137,12 +136,18 @@ impl Capability {
 /// Daten, deren Zugehörigkeit das Tor matchen darf (*Bereich ∈ gewährte
 /// Bereiche*, §11.2/§1.3).
 ///
-/// **Außerhalb dieses Moduls nicht konstruierbar** (privates Feld). Ab Phase 2
-/// baut sie das Tor aus den aktiven Berechtigungen im Snapshot.
+/// `GrantedScopes` sind das **Eingabe-Subjekt** eines Lesevorgangs, das die
+/// **Schicht darüber** dem Kernel vorlegt (§11.1) — sie sind daher öffentlich
+/// **konstruierbar** ([`GrantedScopes::from_scope_ids`]). Das bricht die
+/// Tor-Garantie **nicht**: das Tor (Phase 2) *validiert* sie gegen die
+/// auditierten Berechtigungen im Snapshot, bevor es eine [`Capability`] ausstellt;
+/// eine [`Capability`]/[`VisibleDatum`] bleibt unfälschbar (privat + `Sealed`).
+/// Die Bereichs-Bytes selbst gibt das Feld **nicht** heraus (sonst Bereichs-Leak,
+/// §11.3).
 pub struct GrantedScopes {
     /// Bereichs-Daten-IDs (§11.1). Privat; das Tor matcht sie strukturell, gibt
     /// sie aber nicht heraus (sonst Bereichs-Leak, §11.3). Gelesen ab Phase 2
-    /// (Tor-Logik); im Skelett friert das Feld nur die Form.
+    /// (Tor-Logik) via `scope_ids()`.
     #[allow(dead_code)] // Phase 2: liest die Tor-Logik via `scope_ids()`.
     scope_ids: Vec<ContentId>,
 }
@@ -150,9 +155,11 @@ pub struct GrantedScopes {
 impl sealed::Sealed for GrantedScopes {}
 
 impl GrantedScopes {
-    /// **Crate-interner** Konstruktor (ab Phase 2 aus dem Bereichs-Index).
-    #[allow(dead_code)] // Phase 2: baut das Tor; jetzt nur Tests + Form.
-    pub(crate) fn from_scope_ids(scope_ids: impl IntoIterator<Item = ContentId>) -> Self {
+    /// Konstruiert die **gewährten Bereiche**, die die Schicht darüber dem Kernel
+    /// für einen Lesevorgang vorlegt (§11.1). Öffentlich, weil dies das
+    /// **Eingabe-Subjekt** des Lesers ist — die Validierung gegen die auditierten
+    /// Berechtigungen leistet das Tor (Phase 2), nicht der Aufrufer.
+    pub fn from_scope_ids(scope_ids: impl IntoIterator<Item = ContentId>) -> Self {
         GrantedScopes {
             scope_ids: scope_ids.into_iter().collect(),
         }
@@ -175,8 +182,10 @@ impl GrantedScopes {
 #[derive(Clone, Debug)]
 pub struct VisibleDatum {
     content_id: ContentId,
-    /// Freigelegte Inhalts-Sicht. Privat; ab Phase 1 die kanonischen Bytes bzw.
-    /// ein Lese-Handle. Hier spiegeln wir die `ContentId` (Skelett).
+    /// Freigelegte Inhalts-Sicht: die durablen **kanonischen Bytes** (§K4).
+    /// Privat; ein Leser erschließt sie nur über die Methoden unten. (Ab Phase 7
+    /// kann hier ein Zero-Copy-Lese-Handle stehen, ohne die Tor-Signatur zu
+    /// ändern.)
     revealed: SealedPayload,
 }
 
@@ -186,12 +195,12 @@ impl VisibleDatum {
         self.content_id
     }
 
-    /// Skelett-Auskunft, dass der Inhalt freigelegt ist. Ab Phase 1 ersetzt dies
-    /// ein echter Inhalts-Zugriff (`payload()`/`owns()`-Sicht); im Skelett
-    /// genügt der konsistente `ContentId`-Spiegel als Beweis, dass `open`
-    /// tatsächlich aus dem versiegelten Inhalt schöpfte.
-    pub fn revealed_content_id(&self) -> ContentId {
-        self.revealed.content_id
+    /// Die freigelegten **kanonischen CBOR-Bytes** (§K4) des Daten. Dies ist die
+    /// einzige Stelle, an der die durable Roh-Sicht einen Leser erreicht — und
+    /// **nur** nach Vorlage einer [`Capability`] an [`open`]. Die Bytes strikt zu
+    /// dekodieren ist Sache der Schicht darüber ([`crate::serialize::strict_decode`]).
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.revealed.canonical_bytes
     }
 }
 
@@ -238,13 +247,14 @@ mod tests {
     fn the_only_construction_path_compiles() {
         // Der **einzige** legale Weg zum Inhalt: Speicher versiegelt (crate-
         // intern) → Tor stellt Capability aus (crate-intern) → `open`.
-        let record = SealedRecord::seal(cid(0x42));
+        let record = SealedRecord::seal(cid(0x42), vec![0xA1, 0x00, 0x40]);
         let cap = Capability::issue(GrantedScopes::from_scope_ids([cid(0x01)]));
 
-        let visible = open(&record, &cap).expect("Skelett legt Inhalt frei");
+        let visible = open(&record, &cap).expect("Tor legt Inhalt frei");
         assert_eq!(visible.content_id(), cid(0x42));
-        // `open` schöpft tatsächlich aus dem versiegelten Inhalt (Skelett-Spiegel).
-        assert_eq!(visible.revealed_content_id(), cid(0x42));
+        // `open` schöpft tatsächlich aus dem versiegelten Inhalt (die durablen
+        // kanonischen Bytes).
+        assert_eq!(visible.canonical_bytes(), &[0xA1, 0x00, 0x40]);
     }
 
     #[test]
@@ -252,7 +262,7 @@ mod tests {
         // §5.2: die Adresse ist nicht-geheim und die **einzige** öffentliche
         // Auskunft eines versiegelten Records. (Dass es keinen Inhalts-Getter
         // gibt, ist eine Compile-Zeit-Eigenschaft — siehe Modul-Doc.)
-        let record = SealedRecord::seal(cid(0x07));
+        let record = SealedRecord::seal(cid(0x07), vec![0xA1, 0x00, 0x40]);
         assert_eq!(record.content_id(), cid(0x07));
     }
 
@@ -273,7 +283,7 @@ mod tests {
     //
     //   // (4) Inhalt aus SealedRecord ohne `open` ziehen — es gibt keine solche
     //   //     Methode (nur `content_id()`), also schon ein Name-Resolution-Fehler:
-    //   let _ = SealedRecord::seal(cid(0)).payload;     // E0616: feld privat
+    //   let _ = SealedRecord::seal(cid(0), vec![]).payload;  // E0616: feld privat
     //
     //   // (5) Eigenen „Capability"-Typ in `open` einsetzen — `Sealed`-Schranke
     //   //     + konkreter Parametertyp verhindern jeden Fremd-Token.
@@ -283,7 +293,7 @@ mod tests {
         // Dieser Test dokumentiert die Garantie und stellt sicher, dass die
         // legitimen Konstruktoren existieren; die Negativ-Fälle oben sind
         // Compile-Fehler (per Konstruktion).
-        let _ = SealedRecord::seal(cid(0));
+        let _ = SealedRecord::seal(cid(0), vec![0xA1, 0x00, 0x40]);
         let _ = Capability::issue(GrantedScopes::from_scope_ids([]));
     }
 }
