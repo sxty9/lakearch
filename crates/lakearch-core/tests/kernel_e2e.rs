@@ -257,18 +257,18 @@ fn supersession_chain_traversable_both_directions_over_public_api() {
         let snap = k.pin_snapshot().unwrap();
         let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         // Vorwärts (neuer→älter) und rückwärts (älter→neuer).
-        assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
-        assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
-        assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+        assert_eq!(k.supersedes_visible(v3, &cap, snap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v1, &cap, snap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v2, &cap, snap).unwrap(), vec![v3]);
     }
     // Reopen: die Indizes sind aus dem Log rekonstruiert (§8.4).
     let k = LakearchKernel::open(dir.path()).expect("reopen kernel");
     let snap = k.pin_snapshot().unwrap();
     let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
-    assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
-    assert_eq!(k.supersedes_visible(v2, &cap).unwrap(), vec![v1]);
-    assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
-    assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+    assert_eq!(k.supersedes_visible(v3, &cap, snap).unwrap(), vec![v2]);
+    assert_eq!(k.supersedes_visible(v2, &cap, snap).unwrap(), vec![v1]);
+    assert_eq!(k.superseded_by_visible(v1, &cap, snap).unwrap(), vec![v2]);
+    assert_eq!(k.superseded_by_visible(v2, &cap, snap).unwrap(), vec![v3]);
 }
 
 /// §11.3 VANISH über die öffentliche Oberfläche: ein NICHT-SICHTBARES überholendes
@@ -292,11 +292,11 @@ fn non_visible_superseding_datum_vanishes_over_public_api() {
     let snap = k.pin_snapshot().unwrap();
     let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
     assert!(
-        k.superseded_by_visible(older, &denied).unwrap().is_empty(),
+        k.superseded_by_visible(older, &denied, snap).unwrap().is_empty(),
         "nicht-sichtbares überholendes Daten VANISHt (§11.3)"
     );
     let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
-    assert_eq!(k.superseded_by_visible(older, &granted).unwrap(), vec![newer]);
+    assert_eq!(k.superseded_by_visible(older, &granted, snap).unwrap(), vec![newer]);
 }
 
 /// §6.1/§6.2: der gegatete Zeit-Aussage-Lookup liefert über die öffentliche
@@ -315,13 +315,13 @@ fn time_statement_lookup_over_public_api() {
     let snap = k.pin_snapshot().unwrap();
     let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
     assert_eq!(
-        k.time_carriers_visible(stmt, &cap).unwrap(),
+        k.time_carriers_visible(stmt, &cap, snap).unwrap(),
         vec![carrier],
         "der Träger der Zeit-Aussage wird strukturell gefunden (§1.3)"
     );
     // Eine nie getragene Aussage ⇒ leer (kein „nächstgelegener Zeitpunkt", §6.4).
     let other_stmt = ContentId::of_datum(&Datum::validity_time(t));
-    assert!(k.time_carriers_visible(other_stmt, &cap).unwrap().is_empty());
+    assert!(k.time_carriers_visible(other_stmt, &cap, snap).unwrap().is_empty());
 }
 
 /// §3.6 + §6.3: ein Platzhalter wird über die öffentliche Oberfläche aufgelöst, und
@@ -341,7 +341,7 @@ fn placeholder_resolution_reachable_over_public_api() {
 
     // Platzhalter → Auflöser (gegatet).
     assert_eq!(
-        k.placeholder_resolvers_visible(placeholder_id, &cap).unwrap(),
+        k.placeholder_resolvers_visible(placeholder_id, &cap, snap).unwrap(),
         vec![real_id],
         "der Platzhalter führt zum auflösenden echten Daten (§3.6/§6.3)"
     );
@@ -354,4 +354,65 @@ fn placeholder_resolution_reachable_over_public_api() {
     let visible = open(&sealed, &cap).unwrap();
     let decoded = lakearch_core::strict_decode(visible.canonical_bytes()).unwrap();
     assert!(decoded.is_placeholder(), "Platzhalter bleibt ein Platzhalter (§7.1)");
+}
+
+/// §13 (Atomarität über die **öffentliche** Oberfläche): ein Mehr-Daten-Umbau ist
+/// über **jeden** Lesepfad (`get_by_content_id` + Traversierung) unsichtbar, bis sein
+/// Aktiv-Marker committet — danach **atomar gemeinsam** sichtbar. Reine `pub`-API
+/// (`stage_restructuring`/`commit_restructuring`/`active_marker`).
+#[test]
+fn restructuring_atomically_visible_over_public_api() {
+    let dir = tempdir().unwrap();
+    let k = LakearchKernel::open(dir.path()).expect("open kernel");
+
+    // Vorbedingung (aktiv, unbedingt): ein Knoten A, der zwei noch nicht
+    // eingetroffene Konstituenten besitzt (geschlossene Verweise §3.6); die Ziele
+    // treffen gemeinsam als Umbau ein.
+    let c1 = Datum::leaf(b"r-c1".to_vec());
+    let c2 = Datum::leaf(b"r-c2".to_vec());
+    let c1_id = ContentId::of_datum(&c1);
+    let c2_id = ContentId::of_datum(&c2);
+    let a = k.append(&Datum::node([c1_id, c2_id]).unwrap()).unwrap();
+
+    // --- stagen (INAKTIV) ---
+    let handle = k.stage_restructuring(&[c1, c2]).unwrap();
+    assert_eq!(handle.constituent_ids(), &[c1_id, c2_id]);
+    let snap_s = k.pin_snapshot().unwrap();
+    let cap_s = k.authorize(GrantedScopes::from_scope_ids([]), snap_s).unwrap();
+    // get: beide VANISHen (ununterscheidbar von „nicht vorhanden", §13.2).
+    assert!(k.get_by_content_id(c1_id, &cap_s, snap_s).unwrap().is_none());
+    assert!(k.get_by_content_id(c2_id, &cap_s, snap_s).unwrap().is_none());
+    // Traversierung von A: kein Konstituent erscheint als sichtbarer Knoten.
+    let p = TraversalParams {
+        start: a,
+        dir: Direction::Forward,
+        max_depth: 2,
+        max_nodes: 100,
+        edge_type_filter: None,
+    };
+    let staged: Vec<_> = k
+        .traverse_with(p.clone(), &cap_s, snap_s, &CancelFlag::new())
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        staged.iter().all(|s| s.to != c1_id && s.to != c2_id),
+        "inaktive Konstituenten VANISHen aus der Traversierung (§13.2)"
+    );
+
+    // --- Marker committen (ATOMAR sichtbar) ---
+    k.commit_restructuring(handle, &Datum::active_marker()).unwrap();
+    let snap_d = k.pin_snapshot().unwrap();
+    let cap_d = k.authorize(GrantedScopes::from_scope_ids([]), snap_d).unwrap();
+    assert!(k.get_by_content_id(c1_id, &cap_d, snap_d).unwrap().is_some());
+    assert!(k.get_by_content_id(c2_id, &cap_d, snap_d).unwrap().is_some());
+    let done: Vec<ContentId> = k
+        .traverse_with(p, &cap_d, snap_d, &CancelFlag::new())
+        .unwrap()
+        .map(|r| r.unwrap().to)
+        .collect();
+    assert!(
+        done.contains(&c1_id) && done.contains(&c2_id),
+        "nach dem Marker sind beide Konstituenten gemeinsam sichtbar (§13.1)"
+    );
 }

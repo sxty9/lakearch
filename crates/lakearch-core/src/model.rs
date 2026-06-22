@@ -296,6 +296,15 @@ const CURATION_UNHIDE_MARKER_PAYLOAD: &[u8; 27] = b"lakearch/curation/unhide/v1"
 /// (§9.5). Exakt 28 Bytes ASCII; **niemals** ändern.
 const CURATION_REPLACE_MARKER_PAYLOAD: &[u8; 28] = b"lakearch/curation/replace/v1";
 
+/// Eingefrorene atomare Nutzlast des **Aktiv-Marker**-Atoms (§13): das
+/// abschließende „Aktiv-Schreiben", das einen Mehr-Daten-Umbau gemeinsam sichtbar
+/// macht (§13.1). Exakt 25 Bytes ASCII; **niemals** ändern. lakearch interpretiert
+/// die Bytes **nicht** (§1.4) — der Wert ist nur eine wohlbekannte Konvention,
+/// damit ein Marker-Daten als solches **erkennbar** ist (rein strukturell, §1.3).
+/// Die §13-**Sichtbarkeits-Autorität** ist allein der Offset-Vergleich der
+/// Log-Schicht (`marker_offset < W`), **nicht** dieses Atom.
+const ACTIVE_MARKER_PAYLOAD: &[u8; 25] = b"lakearch/active-marker/v1";
+
 /// Bereichs-Zugehörigkeit (§11.1) — „Zugehörigkeit ist ein Kontext".
 ///
 /// **Konvention (§11.1/§1.3).** Ein **Bereich** ist ein gewöhnliches Daten; die
@@ -1138,6 +1147,62 @@ impl Datum {
     }
 }
 
+/// Aktiv-Marker (§13) — das abschließende „Aktiv-Schreiben" eines Mehr-Daten-Umbaus.
+///
+/// **Konvention (§13.1/§1.3).** Ein Umbau, der **mehrere Daten** betrifft, wird durch
+/// **ein einziges abschließendes Aktiv-Schreiben** gemeinsam sichtbar. Das
+/// Marker-Daten ist ein gewöhnliches Daten (§2.1), das das eingefrorene
+/// [`active_marker`](Datum::active_marker)-Atom besitzt (so ist es **strukturell
+/// erkennbar**, §1.3) und optional weitere Kontexte trägt (z. B. die `ContentId`s der
+/// Konstituenten als Audit/Herkunft — der Kernel **wertet sie nicht**, §1.4).
+///
+/// **Wichtig (§13).** Die Sichtbarkeits-**Autorität** ist allein der Offset-Vergleich
+/// der Log-Schicht (jeder Konstituent trägt im Record-Header den `marker_offset`
+/// seines regierenden Markers; sichtbar ⇔ `marker_offset < W`). Dieses Marker-**Atom**
+/// ist **nur** die strukturelle Erkennbarkeit des Marker-Daten — **keine** zweite
+/// Epoche, **kein** Wall-Clock (§1.4/§13).
+impl Datum {
+    /// Das eingefrorene **Aktiv-Marker-Atom** (§13) — ein gewöhnliches Blatt-Daten
+    /// (§2.1) mit fester atomarer Nutzlast `lakearch/active-marker/v1` (eingefroren —
+    /// eine Änderung verschöbe die Marker-`ContentId`). lakearch interpretiert die
+    /// Bytes **nicht** (§1.4); der Wert ist eine wohlbekannte, föderationsweit gleiche
+    /// Konvention (gleiche Bytes ⇒ gleiche `ContentId`, §5.3/§12.3).
+    pub fn active_marker() -> Self {
+        Datum::leaf(*ACTIVE_MARKER_PAYLOAD)
+    }
+
+    /// Erzeugt ein **Marker-Daten** (§13): ein Knoten, der das
+    /// [`active_marker`](Datum::active_marker)-Atom **und** die übergebenen
+    /// `constituents` als besessene Kontexte trägt (Audit/Herkunft des Umbaus, §13).
+    ///
+    /// Das Marker-Daten ist der **eine** abschließende Aktiv-Schreibvorgang, dessen
+    /// durabler Commit den Umbau **gemeinsam sichtbar** flippt (§13.1) — übergeben an
+    /// [`crate::store::ContentStore::append_restructuring`] /
+    /// [`crate::kernel::LakearchKernel::append_restructuring`]. Die Konstituenten als
+    /// Kontexte aufzunehmen ist rein **Audit** (§13: der Marker trägt im Log ohnehin
+    /// den `constituent_range`); die §13-Sichtbarkeit hängt **allein** am
+    /// Offset-Vergleich, nicht an diesen Kontexten (§1.4). Ist `constituents` leer,
+    /// ist das Marker-Daten das bloße Atom-Blatt.
+    pub fn active_marker_for(constituents: impl IntoIterator<Item = ContentId>) -> Self {
+        let marker = ContentId::of_datum(&Datum::active_marker());
+        let mut owned: Vec<ContentId> = vec![marker];
+        owned.extend(constituents);
+        // `node` sortiert/dedupliziert (§K2.3); das Atom ist stets enthalten ⇒ nie leer.
+        Datum::node(owned).expect("Aktiv-Marker besitzt stets das Marker-Atom (§13)")
+    }
+
+    /// `true`, wenn dieses Daten ein **Aktiv-Marker** (§13) ist — also das
+    /// [`active_marker`](Datum::active_marker)-Atom besitzt **oder** das Atom selbst
+    /// ist. Reines strukturelles Matching (§1.3); keine Wertung (§1.4).
+    pub fn is_active_marker(&self) -> bool {
+        if self.payload() == Some(&ACTIVE_MARKER_PAYLOAD[..]) {
+            return true;
+        }
+        let marker = ContentId::of_datum(&Datum::active_marker());
+        matches!(self.owns(), Some(owns) if owns.binary_search(&marker).is_ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1631,5 +1696,49 @@ mod tests {
         assert_eq!(ids.len(), n, "fünf distinkte Stärke-Marker (§5.5)");
         // Bewusst KEINE Assertion wie `Deckungsgleich > VerwandtMit` — eine solche
         // Ordnung existiert nicht und darf nie hinzukommen (§1.4).
+    }
+
+    // -- Aktiv-Marker (§13) --------------------------------------------------
+
+    #[test]
+    fn active_marker_atom_is_a_frozen_leaf_distinct_from_others() {
+        // §13: das Aktiv-Marker-Atom ist ein gewöhnliches Blatt (§2.1) mit fester
+        // Nutzlast — und distinkt von allen anderen Marker-Atomen.
+        let m = Datum::active_marker();
+        assert!(m.is_leaf());
+        assert_eq!(m.payload(), Some(&b"lakearch/active-marker/v1"[..]));
+        // Distinkt von einer Auswahl bestehender Marker (verschiedene ContentIds).
+        let active = ContentId::of_datum(&m);
+        for other in [
+            Datum::area_membership_marker(),
+            Datum::permission_marker(),
+            Datum::revocation_marker(),
+            Datum::supersession_marker(),
+            Datum::anchor_marker(),
+            Datum::membership_marker(),
+            Datum::curation_hide_marker(),
+        ] {
+            assert_ne!(active, ContentId::of_datum(&other), "Aktiv-Marker distinkt (§13)");
+        }
+    }
+
+    #[test]
+    fn active_marker_for_owns_atom_and_constituents_and_is_recognizable() {
+        // §13: ein Marker-Daten besitzt das Aktiv-Marker-Atom (erkennbar, §1.3) und
+        // optional die Konstituenten als Audit-Kontexte.
+        let c1 = cid(0xA1);
+        let c2 = cid(0xA2);
+        let marker = Datum::active_marker_for([c1, c2]);
+        assert!(marker.is_node());
+        assert!(marker.is_active_marker(), "trägt das Aktiv-Marker-Atom (§13)");
+        let atom = ContentId::of_datum(&Datum::active_marker());
+        let owns = marker.owns().expect("Knoten");
+        assert!(owns.contains(&atom), "Atom enthalten");
+        assert!(owns.contains(&c1) && owns.contains(&c2), "Konstituenten als Audit");
+        // Das bloße Atom-Blatt ist ebenfalls als Marker erkennbar.
+        assert!(Datum::active_marker().is_active_marker());
+        // Ein gewöhnlicher Knoten / ein Blatt ist KEIN Aktiv-Marker.
+        assert!(!Datum::node([c1]).unwrap().is_active_marker());
+        assert!(!Datum::leaf([0x01]).is_active_marker());
     }
 }

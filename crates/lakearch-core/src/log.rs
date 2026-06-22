@@ -47,7 +47,8 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::error::KernelError;
 use crate::format::{
-    decode_record, encode_record, BatchFooter, RECORD_HEADER_LEN, RECORD_MAGIC,
+    decode_record, encode_record, encode_record_with, BatchFooter, RecordHeader, CHECKSUM_LEN,
+    RECORD_HEADER_LEN, RECORD_MAGIC,
 };
 
 /// Dateiname des (in v1 einzigen) Segments im Log-Verzeichnis.
@@ -71,6 +72,55 @@ pub struct LoggedRecord {
     /// Byte-Offset des Record-Frame-Anfangs im Segment (Speicher-Adresse §5.2;
     /// urteilt nicht). Stabiler Lese-Handle innerhalb dieses Bestands.
     pub offset: u64,
+    /// **§13-Sichtbarkeit:** Offset des regierenden Aktiv-Markers, falls dieser
+    /// Record ein **bedingter Konstituent** ist; sonst `0` (= **unbedingt**, ein
+    /// gewöhnlicher Einzel-Append). Ein Konstituent ist erst sichtbar, wenn sein
+    /// Marker durabel committet ist ([`SegmentLog::visible`]).
+    pub marker_offset: u64,
+    /// **§13-Audit:** auf einem **Marker-Record** der Anfangs-Offset des ersten
+    /// Konstituenten (gepackter Bereich, vgl. [`RecordHeader::with_constituent_range`]);
+    /// auf gewöhnlichen Records `0`. Nur Audit/Rekonstruktion — **keine**
+    /// Sichtbarkeits-Autorität.
+    pub constituent_range: u64,
+}
+
+/// Handle eines **gestageten Umbaus** (§13): die durablen Offsets der bedingten
+/// Konstituenten und der (gemeinsame) Offset ihres regierenden Markers.
+///
+/// Zwischen [`SegmentLog::stage_constituents`] und [`SegmentLog::commit_marker`]
+/// sind die Konstituenten **durabel, aber inaktiv** (ihr `marker_offset == marker_offset`
+/// dieses Handles liegt **über** dem Watermark `W`); der Marker-Commit flippt sie
+/// gemeinsam sichtbar.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StagedRestructuring {
+    /// Die Frame-Anfangs-Offsets der Konstituenten-Records, in Schreib-Reihenfolge.
+    constituent_offsets: Vec<u64>,
+    /// Anfangs-Offset des **ersten** Konstituenten (= Beginn des inklusiven
+    /// Bereichs `[first_constituent_offset, marker_offset)`).
+    first_constituent_offset: u64,
+    /// Offset des regierenden **Markers** (jeder Konstituent trägt ihn in
+    /// `marker_offset`). Solange `marker_offset > W`, sind die Konstituenten inaktiv.
+    marker_offset: u64,
+}
+
+impl StagedRestructuring {
+    /// Die Frame-Anfangs-Offsets der Konstituenten-Records (Speicher-Adressen §5.2;
+    /// urteilt nicht), in Schreib-Reihenfolge.
+    pub fn constituent_offsets(&self) -> &[u64] {
+        &self.constituent_offsets
+    }
+
+    /// Der Offset des regierenden **Markers** (§13): solange das Snapshot-Watermark
+    /// `W < marker_offset`, sind alle Konstituenten inaktiv ([`SegmentLog::visible`]).
+    pub fn marker_offset(&self) -> u64 {
+        self.marker_offset
+    }
+
+    /// Anfangs-Offset des ersten Konstituenten (Beginn des inklusiven
+    /// Konstituenten-Bereichs `[first_constituent_offset, marker_offset)`, Audit §13).
+    pub fn first_constituent_offset(&self) -> u64 {
+        self.first_constituent_offset
+    }
 }
 
 /// Leichtgewichtige **Betriebs-Zähler** des Logs (§Betrieb). Reine Mechanik-
@@ -278,6 +328,200 @@ impl SegmentLog {
         Ok(seq)
     }
 
+    // -- §13 Aktiv-Marker: Staging inaktiv → ein Marker-Commit flippt sichtbar ---
+
+    /// **stage_constituents** (§13) — schreibt eine Menge **bedingter Konstituenten**
+    /// als eigenen Group-Commit-Batch und gibt einen [`StagedRestructuring`]-Handle
+    /// zurück. Die Konstituenten sind danach zwar **durabel**, aber **inaktiv**: jeder
+    /// trägt im Header den Offset seines noch nicht geschriebenen **Markers**
+    /// (`marker_offset`), und der ist (per Konstruktion) **größer** als das aktuelle
+    /// Watermark `W`. Bis [`SegmentLog::commit_marker`] den Marker durabel macht,
+    /// ignoriert [`SegmentLog::visible`] sie also (§13.2).
+    ///
+    /// **Eine Linearisierungsstelle, ein Watermark.** Es gibt **keine** zweite Epoche:
+    /// der Marker-Offset wird **deterministisch vorausberechnet** (der Marker folgt
+    /// unmittelbar auf den Konstituenten-Batch), in jeden Konstituenten gestempelt,
+    /// der Konstituenten-Batch ge-`fsync`t (W rückt über die Konstituenten vor) — und
+    /// **erst** ein späterer `commit_marker` rückt W über den Marker. Ein Crash
+    /// **zwischen** beiden Commits lässt die Konstituenten durabel, aber für immer
+    /// inaktiv (ihr `marker_offset > W`), denn der Marker wurde nie durabel.
+    ///
+    /// `constituent_payloads` darf **nicht leer** sein (ein Umbau betrifft mindestens
+    /// ein Daten, §13.1); sonst [`KernelError::Inconsistent`]. Ein etwaiger offener
+    /// Pending-Batch wird zuerst committet, damit die Konstituenten an einer sauberen
+    /// Commit-Grenze beginnen (so ist ihr Offset wohldefiniert).
+    pub fn stage_constituents(
+        &mut self,
+        constituent_payloads: &[&[u8]],
+    ) -> Result<StagedRestructuring, KernelError> {
+        self.ensure_live()?;
+        if constituent_payloads.is_empty() {
+            // Ein Umbau betrifft mindestens ein Daten (§13.1).
+            return Err(KernelError::Inconsistent);
+        }
+        // Etwaigen offenen Einzel-Append-Batch zuerst committen, damit die
+        // Konstituenten an einer sauberen committeten Grenze beginnen (ihr Offset
+        // ist sonst nicht wohldefiniert).
+        if self.pending_count != 0 {
+            self.commit()?;
+        }
+
+        // Offsets DETERMINISTISCH vorausberechnen: die Konstituenten liegen
+        // contiguous ab dem aktuellen committed offset; der Marker folgt unmittelbar
+        // nach dem Konstituenten-Batch (dessen Records ‖ Footer).
+        let first_constituent_offset = self.committed_offset;
+        let mut constituent_offsets: Vec<u64> = Vec::with_capacity(constituent_payloads.len());
+        let mut cursor = first_constituent_offset;
+        for p in constituent_payloads {
+            constituent_offsets.push(cursor);
+            cursor = cursor
+                .checked_add(record_frame_len(p.len())?)
+                .ok_or(KernelError::Inconsistent)?;
+        }
+        // Ende des Konstituenten-Batches = nach allen Records + dem Batch-Footer.
+        let marker_offset = cursor
+            .checked_add(BatchFooter::encoded_len() as u64)
+            .ok_or(KernelError::Inconsistent)?;
+
+        // Die Konstituenten in den Pending-Puffer kodieren — jeder mit seinem
+        // `marker_offset` gestempelt (bedingter Record, §13).
+        for p in constituent_payloads {
+            self.append_constituent_record(p, marker_offset);
+        }
+        // Den Konstituenten-Batch durabel machen (fsync, W rückt über sie hinaus).
+        self.commit()?;
+        // Sanity: der vorausberechnete Marker-Offset MUSS exakt am neuen committed
+        // offset liegen (sonst stimmte die Offset-Arithmetik nicht — interner Bruch).
+        if self.committed_offset != marker_offset {
+            self.poisoned = true;
+            return Err(KernelError::Inconsistent);
+        }
+
+        Ok(StagedRestructuring {
+            constituent_offsets,
+            first_constituent_offset,
+            marker_offset,
+        })
+    }
+
+    /// **commit_marker** (§13) — schreibt den **einen abschließenden Marker-Record**
+    /// und macht ihn durabel; **dieser eine Commit** flippt alle Konstituenten des
+    /// Umbaus **gemeinsam sichtbar** (§13.1, „gemeinsame Sichtbarkeit durch ein
+    /// einziges abschließendes Aktiv-Schreiben"). Erst nach Rückkehr ist das
+    /// Watermark `W` über den Marker hinaus, womit für jeden Konstituenten
+    /// `marker_offset <= W` gilt — die Atomarität **ohne Transaktions-Maschinerie**
+    /// (§13.3).
+    ///
+    /// Der Marker MUSS am vom `handle` vorhergesagten Offset landen (der
+    /// Konstituenten-Batch darf seit dem Staging nicht weitergeschrieben worden sein);
+    /// sonst [`KernelError::Inconsistent`]. Der Marker trägt im Header den
+    /// Anfangs-Offset des ersten Konstituenten (`constituent_range`) als
+    /// Audit-/Rekonstruktions-Information (§13) — die Sichtbarkeits-Autorität bleibt
+    /// allein der Offset-Vergleich. Liefert den (durablen) Offset des Markers.
+    pub fn commit_marker(
+        &mut self,
+        handle: &StagedRestructuring,
+        marker_payload: &[u8],
+    ) -> Result<u64, KernelError> {
+        self.ensure_live()?;
+        // Der Marker muss exakt an der vorhergesagten Stelle landen (keine fremden
+        // Appends zwischen Staging und Marker-Commit).
+        if self.committed_offset != handle.marker_offset || self.pending_count != 0 {
+            return Err(KernelError::Inconsistent);
+        }
+        self.append_marker_record(marker_payload, handle.first_constituent_offset);
+        let marker_offset = handle.marker_offset;
+        // Genau dieser Commit (fsync) flippt den Umbau gemeinsam sichtbar.
+        self.commit()?;
+        Ok(marker_offset)
+    }
+
+    /// **append_restructuring** (§13) — der **vollständige** Pfad: stage die
+    /// Konstituenten (inaktiv) **und** committe sofort ihren Marker, sodass der
+    /// ganze Umbau am Ende gemeinsam sichtbar ist (§13.1). Bequemer Wrapper über
+    /// [`stage_constituents`](SegmentLog::stage_constituents) +
+    /// [`commit_marker`](SegmentLog::commit_marker); liefert den Handle (er trägt die
+    /// Konstituenten-Offsets **und** den Marker-Offset).
+    ///
+    /// Crash-Atomarität bleibt gewahrt: scheitert/crasht es **nach** den
+    /// Konstituenten, aber **vor** dem Marker-`fsync`, sind die Konstituenten zwar
+    /// durabel, aber für immer inaktiv (ihr `marker_offset > W`).
+    pub fn append_restructuring(
+        &mut self,
+        constituent_payloads: &[&[u8]],
+        marker_payload: &[u8],
+    ) -> Result<StagedRestructuring, KernelError> {
+        let handle = self.stage_constituents(constituent_payloads)?;
+        self.commit_marker(&handle, marker_payload)?;
+        Ok(handle)
+    }
+
+    /// **§13-Sichtbarkeits-Prädikat** — der **einzige** Sichtbarkeits-Maßstab: ein
+    /// Record an `offset` mit Marker-Bezug `marker_offset` ist gegenüber dem
+    /// Snapshot-Watermark `w` sichtbar ⇔
+    ///
+    /// > `offset < w  ∧  (marker_offset == 0  ∨  marker_offset < w)`.
+    ///
+    /// Also: der Record selbst muss durabel sein (`offset < w`) **und** er ist
+    /// entweder **unbedingt** (`marker_offset == 0`, gewöhnlicher Einzel-Append) oder
+    /// sein **regierender Marker** ist ebenfalls durabel (`marker_offset < w`).
+    ///
+    /// **Striktes `<`** (nicht `<=`): das Watermark `w` ([`committed_offset`]) zeigt
+    /// **hinter** den letzten durablen Batch-Footer (Ende-des-Batches-Konvention,
+    /// vgl. [`read_at`], das `offset >= committed_offset` ablehnt). Ein Record/Marker,
+    /// der bei `o` **beginnt**, ist also genau dann durabel, wenn `o < w` (sein Frame
+    /// liegt vollständig im committeten Präfix). Wäre der Marker nur **gestaget** (sein
+    /// Konstituenten-Batch committet, der Marker selbst noch nicht), gilt
+    /// `w == marker_offset` — und `marker_offset < w` ist **falsch**, der Konstituent
+    /// also korrekt **inaktiv** (§13.2). Erst der Marker-Commit rückt `w` strikt über
+    /// `marker_offset` und flippt gemeinsam sichtbar (§13.1).
+    ///
+    /// Reiner Offset-Vergleich — **keine** zweite Epoche, **kein** Wall-Clock
+    /// (§1.4/§13). Ein über-frisches Watermark ist harmlos; ein unter-frisches kommt
+    /// per Konstruktion nicht vor (W wird erst **nach** dem fsync veröffentlicht).
+    pub fn visible(offset: u64, marker_offset: u64, w: u64) -> bool {
+        offset < w && (marker_offset == 0 || marker_offset < w)
+    }
+
+    /// `true`, wenn `rec` unter dem Snapshot-Watermark `w` sichtbar ist (§13) —
+    /// Bequem-Hülle um [`SegmentLog::visible`] über die Felder eines
+    /// [`LoggedRecord`].
+    pub fn record_visible(rec: &LoggedRecord, w: u64) -> bool {
+        Self::visible(rec.offset, rec.marker_offset, w)
+    }
+
+    /// Hängt einen **bedingten Konstituenten** (§13) in den aktuellen Pending-Batch
+    /// an: ein gerahmter Record mit gestempeltem `marker_offset`. Vergibt die nächste
+    /// monotone `seq` (wie [`append_record`](SegmentLog::append_record)). Noch nicht
+    /// durabel — das macht der Commit.
+    fn append_constituent_record(&mut self, payload: &[u8], marker_offset: u64) {
+        let seq = self.next_seq;
+        if self.pending_count == 0 {
+            self.pending_first_seq = seq;
+        }
+        let header = RecordHeader::new(seq, payload.len() as u64).with_marker_offset(marker_offset);
+        encode_record_with(header, payload, &mut self.pending);
+        self.pending_count += 1;
+        self.next_seq += 1;
+    }
+
+    /// Hängt den **Marker-Record** (§13) in den aktuellen Pending-Batch an: ein
+    /// gerahmter Record mit gesetztem `constituent_range` (Anfangs-Offset des ersten
+    /// Konstituenten, Audit). Der Marker selbst ist **unbedingt** (`marker_offset ==
+    /// 0`): er wird sichtbar, sobald er durabel ist (`offset <= W`), und flippt damit
+    /// seine Konstituenten mit.
+    fn append_marker_record(&mut self, payload: &[u8], first_constituent_offset: u64) {
+        let seq = self.next_seq;
+        if self.pending_count == 0 {
+            self.pending_first_seq = seq;
+        }
+        let header = RecordHeader::new(seq, payload.len() as u64)
+            .with_constituent_range(first_constituent_offset);
+        encode_record_with(header, payload, &mut self.pending);
+        self.pending_count += 1;
+        self.next_seq += 1;
+    }
+
     /// Der **committed offset** (Watermark `W`): Offset nach dem letzten durablen
     /// Batch-Footer. Leser sehen ausschließlich `[0, committed_offset)`.
     pub fn committed_offset(&self) -> u64 {
@@ -349,6 +593,8 @@ impl SegmentLog {
             seq: decoded.header.seq,
             payload: decoded.payload.to_vec(),
             offset,
+            marker_offset: decoded.header.marker_offset,
+            constituent_range: decoded.header.constituent_range,
         })
     }
 
@@ -516,6 +762,8 @@ impl SegmentLog {
                 seq: decoded.header.seq,
                 payload: decoded.payload.to_vec(),
                 offset: pos as u64,
+                marker_offset: decoded.header.marker_offset,
+                constituent_range: decoded.header.constituent_range,
             };
             pos += decoded.total_len;
             f(rec)?;
@@ -778,6 +1026,18 @@ fn next_frame_magic(buf: &[u8], from: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Die On-Disk-Gesamtlänge eines gerahmten Records mit Nutzlast-Länge
+/// `payload_len` (`Header ‖ Payload ‖ Prüfsumme` = `64 + payload_len + 32`), als
+/// `u64`. Wird beim Staging gebraucht, um den Marker-Offset **deterministisch**
+/// vorauszuberechnen (§13). Überlauf ⇒ [`KernelError::Inconsistent`].
+fn record_frame_len(payload_len: usize) -> Result<u64, KernelError> {
+    let total = RECORD_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|n| n.checked_add(CHECKSUM_LEN))
+        .ok_or(KernelError::Inconsistent)?;
+    u64::try_from(total).map_err(|_| KernelError::Inconsistent)
 }
 
 // Magic-Bytes als `[u8;4]` für die schnellen Slice-Vergleiche im Scan.
@@ -1361,5 +1621,237 @@ mod tests {
     #[test]
     fn checksum_is_used_in_framing() {
         assert_eq!(checksum(b"abc"), checksum(b"abc"));
+    }
+
+    // ========================================================================
+    // §13 Aktiv-Marker: Staging inaktiv → ein Marker-Commit flippt gemeinsam
+    // sichtbar. Einziges Sichtbarkeits-Maß ist der Offset-Vergleich (eine
+    // Linearisierungsstelle, ein Watermark; KEIN zweiter Epochenzähler).
+    // ========================================================================
+
+    /// Liest alle committeten Records und sammelt jene, die unter dem Watermark `w`
+    /// **sichtbar** sind (§13-Prädikat).
+    fn visible_payloads(log: &SegmentLog, w: u64) -> Vec<Vec<u8>> {
+        log.read_all()
+            .expect("read")
+            .into_iter()
+            .filter(|r| SegmentLog::record_visible(r, w))
+            .map(|r| r.payload)
+            .collect()
+    }
+
+    #[test]
+    fn staged_constituents_invisible_until_marker_then_flip_together() {
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+
+        // Ein gewöhnlicher, unbedingter Append vorab — der ist sofort sichtbar.
+        log.append_and_commit(b"plain").expect("plain");
+
+        // Konstituenten stagen (inaktiv): durabel committet, aber ihr Marker fehlt.
+        let staged = log
+            .stage_constituents(&[b"c0".as_slice(), b"c1".as_slice(), b"c2".as_slice()])
+            .expect("stage");
+        let w_after_stage = log.committed_offset();
+
+        // Die Konstituenten sind PHYSISCH committet (W über sie hinaus) …
+        assert!(w_after_stage > staged.constituent_offsets()[2]);
+        // … aber INAKTIV: W zeigt GENAU auf den (noch nicht durablen) Marker-Anfang,
+        // also ist `marker_offset < W` falsch ⇒ NICHT sichtbar (§13.2).
+        assert_eq!(w_after_stage, staged.marker_offset());
+        assert_eq!(
+            visible_payloads(&log, w_after_stage),
+            vec![b"plain".to_vec()],
+            "nur der unbedingte Append ist sichtbar; die Konstituenten sind inaktiv"
+        );
+
+        // Der EINE Marker-Commit flippt alle Konstituenten gemeinsam sichtbar (§13.1).
+        let marker_off = log.commit_marker(&staged, b"MARK").expect("marker");
+        assert_eq!(marker_off, staged.marker_offset());
+        let w_after_marker = log.committed_offset();
+        assert!(w_after_marker > staged.marker_offset());
+
+        let visible = visible_payloads(&log, w_after_marker);
+        // EIN einziger atomarer Flip: alle drei Konstituenten + der Marker + der
+        // unbedingte Append sind nun sichtbar.
+        assert_eq!(
+            visible,
+            vec![
+                b"plain".to_vec(),
+                b"c0".to_vec(),
+                b"c1".to_vec(),
+                b"c2".to_vec(),
+                b"MARK".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn each_constituent_references_the_marker_offset() {
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        let staged = log
+            .stage_constituents(&[b"a".as_slice(), b"b".as_slice()])
+            .expect("stage");
+        // Jeder Konstituent trägt im Header den Offset SEINES Markers.
+        for &off in staged.constituent_offsets() {
+            let rec = log.read_at(off).expect("read constituent");
+            assert_eq!(rec.marker_offset, staged.marker_offset());
+            assert_eq!(rec.constituent_range, 0, "Konstituent trägt keinen Bereich");
+        }
+        log.commit_marker(&staged, b"M").expect("marker");
+        // Der Marker selbst ist unbedingt und trägt den Bereich-Anfang (Audit).
+        let marker = log.read_at(staged.marker_offset()).expect("read marker");
+        assert_eq!(marker.marker_offset, 0, "Marker ist unbedingt");
+        assert_eq!(marker.constituent_range, staged.first_constituent_offset());
+    }
+
+    #[test]
+    fn unconditional_append_is_visible_as_before() {
+        // Ein gewöhnlicher Append (marker_offset == 0) ist sichtbar, sobald er
+        // durabel ist — genau wie vor §13.
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        log.append_and_commit(b"x").expect("x");
+        let w = log.committed_offset();
+        let recs = log.read_all().expect("read");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].marker_offset, 0);
+        assert!(SegmentLog::record_visible(&recs[0], w));
+        assert_eq!(visible_payloads(&log, w), vec![b"x".to_vec()]);
+    }
+
+    #[test]
+    fn watermark_advances_only_post_fsync_for_restructuring() {
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        let w0 = log.committed_offset();
+        let fsync0 = log.metrics().fsync_count;
+
+        let staged = log
+            .stage_constituents(&[b"c0".as_slice(), b"c1".as_slice()])
+            .expect("stage");
+        // Nach dem Konstituenten-fsync: W ist über die Konstituenten, aber NICHT
+        // über den Marker (der ist noch nicht geschrieben).
+        let w1 = log.committed_offset();
+        assert!(w1 > w0);
+        assert_eq!(w1, staged.marker_offset(), "W = Beginn des (noch fehlenden) Markers");
+        assert!(log.metrics().fsync_count > fsync0, "Konstituenten-Batch ge-fsync't");
+        let fsync1 = log.metrics().fsync_count;
+
+        log.commit_marker(&staged, b"M").expect("marker");
+        let w2 = log.committed_offset();
+        // Erst der Marker-fsync rückt W über den Marker (post-fsync-Veröffentlichung).
+        assert!(w2 > w1);
+        assert!(log.metrics().fsync_count > fsync1);
+    }
+
+    #[test]
+    fn crashed_restructuring_stays_invisible_forever_after_reopen() {
+        // Konstituenten geschrieben, Marker NICHT committet (Crash mid-Umbau):
+        // nach dem Reopen rückt Recovery W auf den letzten voll-durablen Record
+        // (= Ende des Konstituenten-Batches). Die Konstituenten referenzieren einen
+        // Marker-Offset > W ⇒ FÜR IMMER inaktiv.
+        let dir = tempdir().expect("tempdir");
+        let constituent_offsets;
+        let marker_offset;
+        {
+            let mut log = SegmentLog::open(dir.path()).expect("open");
+            log.append_and_commit(b"durable-plain").expect("plain");
+            let staged = log
+                .stage_constituents(&[b"c0".as_slice(), b"c1".as_slice()])
+                .expect("stage");
+            constituent_offsets = staged.constituent_offsets().to_vec();
+            marker_offset = staged.marker_offset();
+            // KEIN commit_marker: `log` wird gedroppt (simuliert Crash mid-Umbau).
+        }
+
+        let log = SegmentLog::open(dir.path()).expect("reopen");
+        let w = log.committed_offset();
+        // Die Konstituenten sind durabel (committet vor dem Crash) …
+        assert!(w > constituent_offsets[1]);
+        // … aber der Marker wurde nie durabel: W zeigt höchstens AUF den Marker-Anfang
+        // (Ende des Konstituenten-Batches), nie darüber hinaus ⇒ `marker_offset < W`
+        // bleibt für immer falsch.
+        assert_eq!(w, marker_offset, "W am nie-durablen Marker-Anfang, nie darüber");
+
+        // Folglich sind die Konstituenten für IMMER inaktiv; nur der unbedingte
+        // Append ist sichtbar (§13.3: ein halb-vollzogener Umbau bleibt unsichtbar).
+        assert_eq!(visible_payloads(&log, w), vec![b"durable-plain".to_vec()]);
+        // Auch direkt am Prädikat: jeder Konstituent ist unsichtbar.
+        for &off in &constituent_offsets {
+            let rec = log.read_at(off).expect("read constituent");
+            assert!(!SegmentLog::record_visible(&rec, w), "Konstituent inaktiv");
+        }
+    }
+
+    #[test]
+    fn restructuring_survives_reopen_when_marker_committed() {
+        // Vollständiger Umbau (append_restructuring): nach Reopen sind die
+        // Konstituenten + Marker sichtbar (W über den Marker hinaus, durabel).
+        let dir = tempdir().expect("tempdir");
+        let marker_offset;
+        {
+            let mut log = SegmentLog::open(dir.path()).expect("open");
+            let staged = log
+                .append_restructuring(&[b"m0".as_slice(), b"m1".as_slice()], b"DONE")
+                .expect("restructuring");
+            marker_offset = staged.marker_offset();
+        }
+        let log = SegmentLog::open(dir.path()).expect("reopen");
+        let w = log.committed_offset();
+        assert!(w > marker_offset, "Marker durabel über den Reopen hinaus");
+        assert_eq!(
+            visible_payloads(&log, w),
+            vec![b"m0".to_vec(), b"m1".to_vec(), b"DONE".to_vec()]
+        );
+    }
+
+    #[test]
+    fn empty_constituent_set_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        assert!(matches!(
+            log.stage_constituents(&[]),
+            Err(KernelError::Inconsistent)
+        ));
+    }
+
+    #[test]
+    fn commit_marker_rejects_intervening_append() {
+        // Ein fremder Append zwischen Staging und Marker-Commit verschiebt den
+        // Marker-Offset ⇒ commit_marker MUSS ablehnen (kein stiller Drift).
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        let staged = log
+            .stage_constituents(&[b"c0".as_slice()])
+            .expect("stage");
+        // Dazwischengeschobener Append (z. B. ein paralleler Schreibvorgang).
+        log.append_and_commit(b"intruder").expect("intruder");
+        assert!(matches!(
+            log.commit_marker(&staged, b"M"),
+            Err(KernelError::Inconsistent)
+        ));
+    }
+
+    #[test]
+    fn staging_flushes_open_pending_batch_first() {
+        // Ein offener Pending-Append wird vor dem Staging committet (saubere Grenze).
+        let dir = tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path()).expect("open");
+        log.append_record(b"pending-plain").expect("append");
+        // committed offset ist noch 0 (Pending nicht committet).
+        assert_eq!(log.committed_offset(), 0);
+        let staged = log
+            .stage_constituents(&[b"c0".as_slice()])
+            .expect("stage");
+        // Der Pending-Append wurde committet → der erste Konstituent beginnt NACH ihm.
+        assert!(staged.first_constituent_offset() > 0);
+        log.commit_marker(&staged, b"M").expect("marker");
+        let w = log.committed_offset();
+        assert_eq!(
+            visible_payloads(&log, w),
+            vec![b"pending-plain".to_vec(), b"c0".to_vec(), b"M".to_vec()]
+        );
     }
 }

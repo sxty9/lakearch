@@ -48,9 +48,37 @@ use crate::error::KernelError;
 use crate::gate::SealedRecord;
 use crate::id::{AnchorId, ContentId};
 use crate::index::{Edge, EdgeIndex};
-use crate::log::SegmentLog;
+use crate::log::{SegmentLog, StagedRestructuring};
 use crate::model::Datum;
 use crate::serialize::{canonical_cbor, strict_decode};
+
+/// Handle eines **gestageten Umbaus** auf Store-Ebene (§13): der Log-Handle der
+/// bedingten Konstituenten plus ihre [`ContentId`]s.
+///
+/// Zwischen [`ContentStore::stage_restructuring`] und
+/// [`ContentStore::commit_restructuring`] sind die Konstituenten **durabel, aber
+/// inaktiv** (§13.2): ihr regierender Marker ist noch nicht durabel, also ignorieren
+/// sie **alle** Lesepfade. Der Marker-Commit flippt sie **gemeinsam** sichtbar (§13.1).
+#[derive(Clone, Debug)]
+pub struct StagedHandle {
+    /// Der Log-Handle (Konstituenten-Offsets + vorhergesagter Marker-Offset, §13).
+    staged: StagedRestructuring,
+    /// Die `ContentId`s der gestageten Konstituenten (in Schreib-Reihenfolge).
+    constituent_ids: Vec<ContentId>,
+}
+
+impl StagedHandle {
+    /// Die `ContentId`s der (noch inaktiven) Konstituenten dieses Umbaus (§13).
+    pub fn constituent_ids(&self) -> &[ContentId] {
+        &self.constituent_ids
+    }
+
+    /// Der vorhergesagte Offset des regierenden **Markers** (§13): solange das
+    /// Watermark `W < marker_offset`, sind alle Konstituenten inaktiv.
+    pub fn marker_offset(&self) -> u64 {
+        self.staged.marker_offset()
+    }
+}
 
 /// Leichtgewichtige **Betriebs-Zähler** des Stores (§Betrieb). Reine Mechanik
 /// (§1.4); keine Wertung, keine sichtbaren Daten/IDs in Labels.
@@ -86,6 +114,14 @@ pub struct ContentStore<I: EdgeIndex> {
     /// In-memory **Dedup-Karte** `ContentId → Record-Offset` (§5.3). Reines
     /// Derivat aus dem Log; beim Öffnen rekonstruiert.
     dedup: HashMap<ContentId, u64>,
+    /// In-memory **§13-Sichtbarkeits-Karte** `ContentId → regierender Marker-Offset`:
+    /// für jedes durable Daten der Offset des **Aktiv-Markers**, der es freigibt —
+    /// `0` für ein **unbedingtes** Daten (gewöhnlicher Einzel-Append). Ein **bedingter
+    /// Konstituent** (§13) ist erst **aktiv**, wenn sein Marker durabel committet ist
+    /// (`marker_offset < W`); bis dahin ignorieren ihn alle Lesepfade (§13.2). Reines,
+    /// neu-baubares Derivat aus den Record-Headern des Logs (§8.4); beim Öffnen
+    /// rekonstruiert. Ein Eintrag fehlt ⇔ unbedingt (Default `0`).
+    governing_marker: HashMap<ContentId, u64>,
     /// In-memory **Bereichs-Zugehörigkeits-Index** `Daten → { Bereiche }` (§11.1):
     /// die Bereiche, denen ein Daten angehört. Ein Daten gehört einem Bereich an,
     /// wenn es einen **Zugehörigkeits-Kontext** besitzt (einen Knoten
@@ -190,6 +226,7 @@ impl<I: EdgeIndex> ContentStore<I> {
             log,
             index,
             dedup: HashMap::new(),
+            governing_marker: HashMap::new(),
             areas: HashMap::new(),
             permissions: HashMap::new(),
             revoked: HashSet::new(),
@@ -311,6 +348,166 @@ impl<I: EdgeIndex> ContentStore<I> {
         Ok((real_id, resolution_id))
     }
 
+    /// **append_restructuring** (§13) — die §7.1/§13-„Änderung", die **mehrere Daten**
+    /// betrifft (Zusammenführen/Spalten §9, Berechtigungs-Wechsel §11) und durch
+    /// **ein einziges abschließendes Aktiv-Schreiben** gemeinsam sichtbar wird (§13.1).
+    ///
+    /// Hängt die `constituents` als **bedingte Konstituenten** an (jeder gestempelt mit
+    /// dem Offset des regierenden Markers, §13) und committet anschließend **einen**
+    /// Marker-Record `marker`, der den Umbau freigibt. Bis der Marker durabel ist,
+    /// gelten die Konstituenten als **inaktiv** und werden von allen Lesepfaden
+    /// ignoriert (§13.2); der Marker-Commit flippt sie **gemeinsam** sichtbar (§13.3,
+    /// Atomarität ohne Transaktions-Maschinerie). Crasht es **nach** den Konstituenten,
+    /// aber **vor** dem Marker-`fsync`, bleiben sie für immer inaktiv (ihr Marker wurde
+    /// nie durabel — Recovery setzt `W` auf den letzten voll-durablen Record).
+    ///
+    /// Liefert `(constituent_ids, marker_id)`. Die abgeleiteten Indizes (Kanten,
+    /// Bereich, Zeit, …) werden — wie bei [`append_datum`](ContentStore::append_datum)
+    /// — **nach** dem Log-`fsync` nachgezogen (Ordnung log-fsync → index-commit, §8.4);
+    /// die §13-Sichtbarkeit filtert über-frische Index-Einträge harmlos heraus (der
+    /// Offset-Vergleich ist die alleinige Autorität).
+    ///
+    /// **Kein Wert-Dedup über die Konstituenten (§1.4/§7.2):** ein Umbau stellt eine
+    /// **frische** Menge gemeinsam-sichtbar-werdender Records dar; der Kernel **findet
+    /// nicht den Platz** und **entscheidet keine Mitgliedschaft** (§7.2) — die
+    /// schreibende Schicht legt die Konstituenten fest. (Ein bereits unbedingt
+    /// vorhandenes inhaltsgleiches Daten bliebe ohnehin unabhängig sichtbar; der
+    /// staging-Pfad schreibt die übergebenen Konstituenten physisch an.)
+    pub fn append_restructuring(
+        &mut self,
+        constituents: &[Datum],
+        marker: &Datum,
+    ) -> Result<(Vec<ContentId>, ContentId), KernelError> {
+        // Zwei Phasen, ein Linearisierungspunkt (§13): stagen (inaktiv) → Marker
+        // committen (flippt gemeinsam sichtbar). Hier unmittelbar nacheinander; der
+        // zweiphasige Pfad ([`stage_restructuring`]/[`commit_restructuring`]) erlaubt
+        // einem Aufrufer, den **inaktiven** Zwischenzustand zu beobachten (alle
+        // Lesepfade ignorieren ihn, §13.2).
+        let handle = self.stage_restructuring(constituents)?;
+        let constituent_ids = handle.constituent_ids.clone();
+        let marker_id = self.commit_restructuring(handle, marker)?;
+        Ok((constituent_ids, marker_id))
+    }
+
+    /// **stage_restructuring** (§13, Phase 1) — hängt die `constituents` als
+    /// **bedingte Konstituenten** an (jeder im Record-Header mit dem Offset seines
+    /// regierenden, noch nicht geschriebenen Markers gestempelt) und macht den
+    /// Konstituenten-Batch durabel. Die Konstituenten sind danach **durabel, aber
+    /// inaktiv** (§13.2): ihr `marker_offset` liegt **über** dem Watermark `W`, also
+    /// ignorieren sie **alle** Lesepfade (`get_sealed`, Traversierung, gegatete
+    /// Helfer). Erst [`commit_restructuring`](ContentStore::commit_restructuring)
+    /// flippt sie **gemeinsam** sichtbar (§13.1).
+    ///
+    /// Liefert einen [`StagedHandle`], der die Konstituenten-IDs und den (gemeinsamen)
+    /// Marker-Offset trägt. Die abgeleiteten Indizes (Kanten/Bereich/Zeit/Anker/…)
+    /// werden bereits hier nachgezogen — das ist harmlos, weil die **§13-Sichtbarkeit**
+    /// beim Lesen filtert (ein über-frischer Index ist harmlos; der Offset-Vergleich
+    /// ist die alleinige Autorität, §13).
+    ///
+    /// **Crash zwischen Staging und Marker (§13.3):** die Konstituenten bleiben für
+    /// immer inaktiv (ihr Marker wurde nie durabel; Recovery setzt `W` auf den letzten
+    /// voll-durablen Record) — ein halb-vollzogener Umbau ist nie sichtbar.
+    pub fn stage_restructuring(
+        &mut self,
+        constituents: &[Datum],
+    ) -> Result<StagedHandle, KernelError> {
+        if constituents.is_empty() {
+            // Ein Umbau betrifft mindestens ein Daten (§13.1).
+            return Err(KernelError::Inconsistent);
+        }
+        // Die Konstituenten kanonisieren (§K5).
+        let constituent_cbor: Vec<Vec<u8>> = constituents.iter().map(canonical_cbor).collect();
+        let constituent_slices: Vec<&[u8]> =
+            constituent_cbor.iter().map(|v| v.as_slice()).collect();
+
+        // Staging inaktiv (Log-Schicht): die Konstituenten werden durabel, tragen aber
+        // den Offset ihres noch fehlenden Markers ⇒ `marker_offset > W` ⇒ inaktiv.
+        let staged = self.log.stage_constituents(&constituent_slices)?;
+
+        // Dedup-/§13-Karten nachziehen: jeder Konstituent referenziert den Marker.
+        let constituent_ids: Vec<ContentId> = constituents.iter().map(ContentId::of_datum).collect();
+        let marker_offset = staged.marker_offset();
+        for (&offset, id) in staged.constituent_offsets().iter().zip(constituent_ids.iter()) {
+            // **§5.3/§7.1-Schutz:** ist diese `ContentId` BEREITS unbedingt vorhanden
+            // (sie wurde vor diesem Umbau als gewöhnlicher Append geackt → aktiv,
+            // ohne regierenden Marker), so ist sie per Wert-Identität (§5.3) **dasselbe**
+            // bereits sichtbare Daten. Ein Umbau darf ein **geacktes unbedingtes** Daten
+            // **nicht** rückwirkend konditionieren (das verstieße gegen §7.1: ein
+            // geackter Append geht nie verloren; ein über `marker_offset > W` inaktiv
+            // gemachtes Daten würde aus jedem Lesepfad VANISHen und bei einem Crash vor
+            // dem Marker für immer unsichtbar bleiben). Wir lassen die bestehende
+            // (unbedingte) Dedup-/Marker-Sicht daher **unverändert** und stempeln ihr
+            // keinen regierenden Marker auf. Nur ein **genuin neuer** Konstituent
+            // erhält den regierenden Marker und ist bis zum Marker-Commit inaktiv (§13.2).
+            let pre_existing = self.dedup.contains_key(id);
+            self.dedup.entry(*id).or_insert(offset);
+            if !pre_existing {
+                self.governing_marker.entry(*id).or_insert(marker_offset);
+            }
+            self.metrics.append_count += 1;
+        }
+
+        // Abgeleitete Indizes für die Konstituenten nachziehen (über-frisch harmlos,
+        // §13). Watermark = neuer committed Log-Offset (Ende des Konstituenten-Batches,
+        // also genau `marker_offset` — der Marker selbst ist noch nicht durabel).
+        let new_watermark = self.log.committed_offset();
+        let mut edges: Vec<Edge> = Vec::new();
+        for (datum, id) in constituents.iter().zip(constituent_ids.iter()) {
+            edges.extend(edges_of(*id, datum));
+        }
+        self.index.commit_edges(&edges, new_watermark)?;
+        self.metrics.edge_count += edges.len() as u64;
+        for (datum, id) in constituents.iter().zip(constituent_ids.iter()) {
+            self.index_area_memberships_of(*id, datum)?;
+            self.index_permission_or_revocation_of(*id, datum)?;
+            self.index_time_and_supersession_of(*id, datum)?;
+            self.index_identity_and_curation_of(*id, datum)?;
+        }
+
+        Ok(StagedHandle {
+            staged,
+            constituent_ids,
+        })
+    }
+
+    /// **commit_restructuring** (§13, Phase 2) — schreibt den **einen abschließenden
+    /// Marker** und macht ihn durabel; **dieser eine Commit** flippt alle Konstituenten
+    /// des `handle` **gemeinsam sichtbar** (§13.1, Atomarität ohne Transaktions-
+    /// Maschinerie §13.3). Nach Rückkehr gilt für jeden Konstituenten `marker_offset <
+    /// W` — er ist über jeden Lesepfad sichtbar (sofern §11-Bereich/§9.5-Kuratierung
+    /// es zulassen).
+    ///
+    /// Der Marker MUSS am vom Staging vorhergesagten Offset landen (kein fremder Append
+    /// dazwischen); sonst [`KernelError::Inconsistent`]. Liefert die [`ContentId`] des
+    /// Marker-Daten. Die abgeleiteten Indizes des Markers werden — wie beim Append —
+    /// **nach** dem Log-`fsync` nachgezogen (§8.4).
+    pub fn commit_restructuring(
+        &mut self,
+        handle: StagedHandle,
+        marker: &Datum,
+    ) -> Result<ContentId, KernelError> {
+        let marker_cbor = canonical_cbor(marker);
+        // Genau dieser Marker-Commit (fsync) flippt den Umbau gemeinsam sichtbar (§13.1).
+        let marker_offset = self.log.commit_marker(&handle.staged, &marker_cbor)?;
+
+        // Der Marker selbst ist ein unbedingtes Daten an seinem Offset.
+        let marker_id = ContentId::of_datum(marker);
+        self.dedup.entry(marker_id).or_insert(marker_offset);
+        self.metrics.append_count += 1;
+
+        // Abgeleitete Indizes des Markers nachziehen (§8.4: log-fsync → index-commit).
+        let new_watermark = self.log.committed_offset();
+        let edges = edges_of(marker_id, marker);
+        self.index.commit_edges(&edges, new_watermark)?;
+        self.metrics.edge_count += edges.len() as u64;
+        self.index_area_memberships_of(marker_id, marker)?;
+        self.index_permission_or_revocation_of(marker_id, marker)?;
+        self.index_time_and_supersession_of(marker_id, marker)?;
+        self.index_identity_and_curation_of(marker_id, marker)?;
+
+        Ok(marker_id)
+    }
+
     /// **get_canonical_bytes** (§5.2-Fetch, **un-gated**) — liefert die **kanonischen
     /// Bytes** des durablen Daten, falls vorhanden (sonst `None`). Die Prüfsumme ist
     /// beim Lesen verifiziert (§Durability).
@@ -369,7 +566,22 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// gegen die gewährten Bereiche (Filter-vor-Auflösen, §11.3). `None` ⇒ nicht
     /// vorhanden; nicht-sichtbar wird **erst im Tor** zu `None` (VANISH, ununter-
     /// scheidbar von „nicht vorhanden").
-    pub fn get_sealed(&self, id: ContentId) -> Result<Option<SealedRecord>, KernelError> {
+    ///
+    /// **§13-Snapshot (gepinntes `w`):** das Watermark `w` ist der vom Aufrufer
+    /// gepinnte [`crate::api::SnapshotToken`]-Wert (ein Acquire-Load, §13 — eine
+    /// Linearisierungsstelle), **nicht** das (möglicherweise vorangerückte) Live-
+    /// Watermark. So sieht ein Leser mit fixiertem Snapshot eine über alle Reads
+    /// **stabile** Sicht; ein nach dem Pinnen committeter Umbau bleibt für diesen
+    /// Token unsichtbar (Snapshot-Isolation, „ein W fixiert den Snapshot").
+    pub fn get_sealed(&self, id: ContentId, w: u64) -> Result<Option<SealedRecord>, KernelError> {
+        // §13-Sichtbarkeit (pre-resolution, orthogonal zum §11-Bereichs-Filter): ein
+        // **inaktiver** Konstituent eines noch nicht freigegebenen Umbaus VANISHt —
+        // er wird wie „nicht vorhanden" behandelt (`None`), ununterscheidbar von
+        // Abwesenheit (§13.2/§11.3). So leckt ein halb-vollzogener Umbau **nicht**
+        // durch `get_by_content_id`. Der Snapshot wird vom Aufrufer einmal gepinnt (§13).
+        if !self.is_active(id, w) {
+            return Ok(None);
+        }
         match self.get_canonical_bytes(id)? {
             Some(bytes) => {
                 // Fail-closed (§11): die versiegelten Bereiche werden gegen die
@@ -452,6 +664,30 @@ impl<I: EdgeIndex> ContentStore<I> {
         Ok(Some(found))
     }
 
+    /// **Test-Hook (§13).** Direkter `&mut`-Zugriff auf das Log, um den
+    /// Staging-Zwischenzustand (Konstituenten ohne Marker, inaktiv) zu erzeugen,
+    /// ohne den vollständigen [`append_restructuring`](ContentStore::append_restructuring)-
+    /// Pfad zu durchlaufen. Nur in Tests verfügbar.
+    #[cfg(test)]
+    pub(crate) fn log_mut_for_test(&mut self) -> &mut SegmentLog {
+        &mut self.log
+    }
+
+    /// **Test-Hook (§13).** Trägt einen gestageten (noch inaktiven) Konstituenten in
+    /// die Dedup-/§13-Karten ein — wie es
+    /// [`append_restructuring`](ContentStore::append_restructuring) **nach** dem
+    /// Marker-Commit täte, hier aber im Zwischenzustand (vor dem Marker). Nur in Tests.
+    #[cfg(test)]
+    pub(crate) fn insert_staged_for_test(
+        &mut self,
+        id: ContentId,
+        offset: u64,
+        marker_offset: u64,
+    ) {
+        self.dedup.insert(id, offset);
+        self.governing_marker.insert(id, marker_offset);
+    }
+
     /// **Test-Hook (§11-Fail-closed).** Überschreibt die **gecachten** Bereiche
     /// eines Daten direkt, um einen korrupten Bereichs-Index zu simulieren — der
     /// durable Inhalt im Log bleibt unberührt, sodass
@@ -532,15 +768,28 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// Das ist der **gegatete** Pfad für die Zeit-/Ersetzungs-Lookups: er reicht
     /// **nur** sichtbare `ContentId`s heraus, materialisiert aber **keinen** Inhalt
     /// (den legt erst das Tor frei, §11.5). Owned, aufsteigend (kein Wert-Sort §1.4).
+    ///
+    /// **§13-Snapshot (gepinntes `w`):** das Watermark `w` ist der vom Aufrufer
+    /// gepinnte [`crate::api::SnapshotToken`]-Wert (eine Linearisierungsstelle, §13),
+    /// **nicht** das Live-Watermark — so bleibt die §13-Aktiv-Sicht über alle Reads
+    /// eines Tokens stabil (Snapshot-Isolation).
     pub fn visible_filter(
         &self,
         candidates: &[ContentId],
         granted: &[ContentId],
+        w: u64,
     ) -> Result<Vec<ContentId>, KernelError> {
         let mut out = Vec::new();
         for &id in candidates {
             // VANISH: ein nicht vorhandenes Daten ist kein sichtbarer Knoten.
             if !self.contains(id) {
+                continue;
+            }
+            // §13-Sichtbarkeit (orthogonal zum §11-Bereichs-Filter, beide
+            // pre-resolution): ein **inaktiver** Konstituent eines noch nicht
+            // freigegebenen Umbaus VANISHt — ununterscheidbar von „existiert nicht"
+            // (§13.2). Ein halb-vollzogener Umbau leckt damit durch keinen Lesepfad.
+            if !self.is_active(id, w) {
                 continue;
             }
             // Kuratierung (§9.5): ein **verborgenes** Daten VANISHt ebenfalls aus der
@@ -563,8 +812,40 @@ impl<I: EdgeIndex> ContentStore<I> {
 
     /// `true`, wenn die `ContentId` durabel im Store vorhanden ist (§5.2). Reines
     /// Adress-Matching (§1.3); keine Wertung.
+    ///
+    /// **Hinweis (§13):** „durabel vorhanden" ist **nicht** dasselbe wie „aktiv/
+    /// sichtbar". Ein bedingter Konstituent eines noch nicht freigegebenen Umbaus ist
+    /// durabel vorhanden (`contains == true`), aber für Lesepfade **inaktiv**
+    /// ([`ContentStore::is_active`]). Die Lesepfade (`visible_filter`, `get_sealed`)
+    /// wenden die §13-Sichtbarkeit zusätzlich an.
     pub fn contains(&self, id: ContentId) -> bool {
         self.dedup.contains_key(&id)
+    }
+
+    /// Das aktuelle durable **Watermark `W`** (§13) = committed Log-Offset. Ein Leser
+    /// pinnt damit seinen Snapshot ([`ContentStore::is_active`]); ein Acquire-Load der
+    /// einen, post-fsync veröffentlichten Watermark genügt (eine Linearisierungsstelle).
+    pub fn current_watermark(&self) -> u64 {
+        self.log.committed_offset()
+    }
+
+    /// **§13-Aktivitäts-Prädikat** (orthogonal zum §11-Bereichs-Filter): ist das Daten
+    /// `id` unter dem Snapshot-Watermark `w` **aktiv** (= freigegeben)? Reiner
+    /// Offset-Vergleich (§1.4) über den Record-Offset und den regierenden Marker:
+    ///
+    /// > aktiv ⇔ `record_offset < w  ∧  (unbedingt  ∨  marker_offset < w)`
+    /// > ([`crate::log::SegmentLog::visible`]).
+    ///
+    /// Ein **unbedingtes** Daten ist aktiv, sobald es durabel ist; ein **bedingter
+    /// Konstituent** erst, wenn auch sein Marker durabel ist. Ein nicht vorhandenes
+    /// Daten ist nie aktiv (`false`). **Keine** zweite Epoche, **kein** Wall-Clock.
+    pub fn is_active(&self, id: ContentId, w: u64) -> bool {
+        let offset = match self.dedup.get(&id) {
+            Some(o) => *o,
+            None => return false,
+        };
+        let marker_offset = self.governing_marker.get(&id).copied().unwrap_or(0);
+        crate::log::SegmentLog::visible(offset, marker_offset, w)
     }
 
     /// Anzahl distinkter durabler Daten (= Größe der Dedup-Karte).
@@ -648,16 +929,44 @@ impl<I: EdgeIndex> ContentStore<I> {
 
     /// Baut die in-memory **Dedup-Karte** (`ContentId → Offset`) vollständig aus
     /// dem Log neu (§8.4: Log = Wahrheit). Idempotent.
+    ///
+    /// **§5.3/§7.1-Unbedingt-gewinnt-Regel.** Eine `ContentId`, die **irgendwo** im
+    /// Log unbedingt vorkommt (`marker_offset == 0`, gewöhnlicher Einzel-Append), ist
+    /// dasselbe — bereits sichtbare — Daten (Wert-Identität, §5.3) und bleibt aktiv,
+    /// **unabhängig** von einem späteren oder früheren bedingten Duplikat: ein Umbau
+    /// darf ein geacktes unbedingtes Daten nicht rückwirkend konditionieren (§7.1).
+    /// Daher wird ein etwaiger regierender Marker einer solchen `ContentId`
+    /// **entfernt/nie gesetzt**. Erst eine `ContentId`, die **ausschließlich** als
+    /// bedingter Konstituent vorkommt, trägt ihren regierenden Marker (und ist bis zu
+    /// dessen Commit inaktiv, §13.2). Reihenfolge-unabhängig (§Append-Order-Semantik):
+    /// die Endmenge hängt nicht davon ab, ob das unbedingte oder das bedingte Vorkommen
+    /// zuerst gescannt wird.
     fn rebuild_dedup_from_log(&mut self) -> Result<(), KernelError> {
         self.dedup.clear();
+        self.governing_marker.clear();
+        // `ContentId`s, die mindestens ein unbedingtes Vorkommen haben — sie sind
+        // unbedingt/aktiv und dürfen nie einen regierenden Marker tragen (§5.3/§7.1).
+        let mut seen_unconditional: HashSet<ContentId> = HashSet::new();
         let records = self.log.read_all()?;
         for rec in &records {
             let datum = strict_decode(&rec.payload)?;
             let id = ContentId::of_datum(&datum);
-            // Erstes Vorkommen gewinnt (eine ContentId existiert genau einmal,
-            // §5.3; ein zweiter physischer Record gleicher ID wäre ein Dedup-
-            // Fehler oberhalb — er käme hier nie zustande).
+            // Erstes Vorkommen gewinnt für den Offset (eine ContentId existiert genau
+            // einmal physisch-distinkt im Normalfall, §5.3; ein bedingtes Duplikat
+            // eines bereits unbedingt vorhandenen Daten lässt den Offset unverändert).
             self.dedup.entry(id).or_insert(rec.offset);
+            if rec.marker_offset == 0 {
+                // Unbedingtes Vorkommen: dieses Daten ist aktiv (§13), ein etwaiger
+                // (zuvor gescannter) regierender Marker wird verworfen — unbedingt
+                // gewinnt (§5.3/§7.1).
+                seen_unconditional.insert(id);
+                self.governing_marker.remove(&id);
+            } else if !seen_unconditional.contains(&id) {
+                // §13: bedingter Konstituent ohne (bisher) unbedingtes Vorkommen —
+                // den regierenden Marker-Offset aus dem Record-Header übernehmen.
+                // Erstes bedingtes Vorkommen gewinnt.
+                self.governing_marker.entry(id).or_insert(rec.marker_offset);
+            }
         }
         Ok(())
     }
@@ -1541,6 +1850,290 @@ mod tests {
         assert!(store.granted_areas_for_subject(subject).is_empty());
     }
 
+    // ------------------------------------------------------------------------
+    // §13 Aktiv-Marker (Store-Ebene): ein Umbau wird durch einen abschließenden
+    // Marker-Commit gemeinsam sichtbar; gestagte Konstituenten sind inaktiv (VANISH);
+    // ein halb-vollzogener Umbau leckt durch keinen Lesepfad; Reopen-Treue.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn restructuring_constituents_inactive_until_marker_then_visible_together() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Drei Konstituenten + ein Marker (ein gewöhnliches Daten als Aktiv-Schreiben).
+        let c0 = Datum::leaf(b"c0".to_vec());
+        let c1 = Datum::leaf(b"c1".to_vec());
+        let c2 = Datum::leaf(b"c2".to_vec());
+        let marker = Datum::leaf(b"the-active-marker".to_vec());
+
+        let (constituent_ids, marker_id) = store
+            .append_restructuring(&[c0.clone(), c1.clone(), c2.clone()], &marker)
+            .unwrap();
+        assert_eq!(constituent_ids.len(), 3);
+        assert_eq!(marker_id, ContentId::of_datum(&marker));
+
+        // Nach dem vollständigen append_restructuring (Marker committet) sind ALLE
+        // gemeinsam aktiv (§13.1): visible_filter reicht sie alle durch.
+        let mut all: Vec<ContentId> = constituent_ids.clone();
+        all.push(marker_id);
+        let visible = store.visible_filter(&all, &[], store.current_watermark()).unwrap();
+        let mut expected = all.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(visible, expected, "alle Konstituenten + Marker gemeinsam sichtbar");
+
+        // get_sealed liefert sie alle (durchs Tor, aktiv).
+        for id in &all {
+            assert!(store.get_sealed(*id, store.current_watermark()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn staged_constituents_vanish_until_marker_committed() {
+        // Auf Store-Ebene direkt über die Log-Staging-API: gestagte Konstituenten
+        // sind durabel vorhanden, aber INAKTIV (VANISH) bis der Marker committet.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Wir umgehen append_restructuring und stagen über die Log-API, um den
+        // Zwischenzustand (Konstituenten ohne Marker) zu beobachten.
+        let c0 = Datum::leaf(b"x0".to_vec());
+        let c1 = Datum::leaf(b"x1".to_vec());
+        let c0b = canonical_cbor(&c0);
+        let c1b = canonical_cbor(&c1);
+        let staged = store
+            .log
+            .stage_constituents(&[c0b.as_slice(), c1b.as_slice()])
+            .unwrap();
+        // Dedup-/§13-Karten von Hand nachziehen (wie append_restructuring es täte).
+        let id0 = ContentId::of_datum(&c0);
+        let id1 = ContentId::of_datum(&c1);
+        store.dedup.insert(id0, staged.constituent_offsets()[0]);
+        store.dedup.insert(id1, staged.constituent_offsets()[1]);
+        store.governing_marker.insert(id0, staged.marker_offset());
+        store.governing_marker.insert(id1, staged.marker_offset());
+
+        // Inaktiv: durabel vorhanden, aber nicht aktiv ⇒ VANISH aus visible_filter
+        // und get_sealed (§13.2).
+        let w = store.current_watermark();
+        assert!(store.contains(id0) && store.contains(id1));
+        assert!(!store.is_active(id0, w) && !store.is_active(id1, w));
+        assert!(store.visible_filter(&[id0, id1], &[], store.current_watermark()).unwrap().is_empty());
+        assert!(store.get_sealed(id0, store.current_watermark()).unwrap().is_none());
+        assert!(store.get_sealed(id1, store.current_watermark()).unwrap().is_none());
+
+        // Der Marker-Commit flippt sie gemeinsam aktiv.
+        let marker = Datum::leaf(b"M".to_vec());
+        store
+            .log
+            .commit_marker(&staged, &canonical_cbor(&marker))
+            .unwrap();
+        let w2 = store.current_watermark();
+        assert!(store.is_active(id0, w2) && store.is_active(id1, w2));
+        assert_eq!(store.visible_filter(&[id0, id1], &[], store.current_watermark()).unwrap().len(), 2);
+        assert!(store.get_sealed(id0, store.current_watermark()).unwrap().is_some());
+    }
+
+    #[test]
+    fn unconditional_append_is_active_immediately() {
+        // Ein gewöhnlicher Append ist sofort aktiv (marker_offset == 0), wie vor §13.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let id = store.append_datum(&Datum::leaf(b"plain".to_vec())).unwrap();
+        let w = store.current_watermark();
+        assert!(store.is_active(id, w));
+        assert_eq!(store.visible_filter(&[id], &[], store.current_watermark()).unwrap(), vec![id]);
+        assert!(store.get_sealed(id, store.current_watermark()).unwrap().is_some());
+    }
+
+    #[test]
+    fn crashed_restructuring_invisible_forever_after_reopen() {
+        // Konstituenten gestaget, Marker NICHT committet (Crash mid-Umbau): nach
+        // Reopen rekonstruiert der Store dedup + §13-Karten aus dem Log; die
+        // Konstituenten referenzieren einen Marker-Offset, den W nie erreicht ⇒
+        // für immer inaktiv (§13.3). Sie leckten durch keinen Lesepfad.
+        let dir = tempdir().unwrap();
+        let id0;
+        let id1;
+        {
+            let mut store = open_store(dir.path());
+            store.append_datum(&Datum::leaf(b"plain".to_vec())).unwrap();
+            let c0 = Datum::leaf(b"y0".to_vec());
+            let c1 = Datum::leaf(b"y1".to_vec());
+            id0 = ContentId::of_datum(&c0);
+            id1 = ContentId::of_datum(&c1);
+            // Über die Log-API stagen, KEIN Marker committen → Crash simulieren.
+            let c0b = canonical_cbor(&c0);
+            let c1b = canonical_cbor(&c1);
+            store
+                .log
+                .stage_constituents(&[c0b.as_slice(), c1b.as_slice()])
+                .unwrap();
+            // store wird gedroppt ohne commit_marker.
+        }
+        // Reopen: dedup + §13-Karten aus dem Log rekonstruiert.
+        let store = open_store(dir.path());
+        let w = store.current_watermark();
+        // Durabel vorhanden …
+        assert!(store.contains(id0) && store.contains(id1));
+        // … aber für immer inaktiv (ihr Marker wurde nie durabel).
+        assert!(!store.is_active(id0, w) && !store.is_active(id1, w));
+        assert!(store.visible_filter(&[id0, id1], &[], store.current_watermark()).unwrap().is_empty());
+        assert!(store.get_sealed(id0, store.current_watermark()).unwrap().is_none());
+        assert!(store.get_sealed(id1, store.current_watermark()).unwrap().is_none());
+    }
+
+    #[test]
+    fn restructuring_survives_reopen_when_marker_committed_store() {
+        let dir = tempdir().unwrap();
+        let constituent_ids;
+        let marker_id;
+        {
+            let mut store = open_store(dir.path());
+            let (cids, mid) = store
+                .append_restructuring(
+                    &[Datum::leaf(b"r0".to_vec()), Datum::leaf(b"r1".to_vec())],
+                    &Datum::leaf(b"done".to_vec()),
+                )
+                .unwrap();
+            constituent_ids = cids;
+            marker_id = mid;
+        }
+        let store = open_store(dir.path());
+        let w = store.current_watermark();
+        for id in &constituent_ids {
+            assert!(store.is_active(*id, w), "Konstituent nach Reopen aktiv");
+            assert!(store.get_sealed(*id, store.current_watermark()).unwrap().is_some());
+        }
+        assert!(store.is_active(marker_id, w));
+    }
+
+    // ------------------------------------------------------------------------
+    // REGRESSION (§5.3/§7.1): ein bereits GEACKTES UNBEDINGTES Daten X darf NICHT
+    // durch einen späteren Umbau, der einen wert-gleichen Konstituenten X stagt,
+    // rückwirkend konditioniert (und damit unsichtbar/verloren) werden. X bleibt
+    // aktiv VOR und NACH dem Marker; nur der genuin NEUE Konstituent Y ist bis zum
+    // Marker inaktiv. Bei Crash vor dem Marker bleibt X sichtbar (nur Y inaktiv).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn staging_value_identical_constituent_does_not_retro_condition_acked_datum() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // (1) X als gewöhnlichen, geackten, unbedingten Append — sofort aktiv.
+        let x = Datum::leaf(b"already-acked".to_vec());
+        let x_id = store.append_datum(&x).unwrap();
+        let w0 = store.current_watermark();
+        assert!(store.is_active(x_id, w0), "X ist unbedingt aktiv (§7.1)");
+        assert!(store.get_by_content_id(x_id).unwrap().is_some());
+        // X trägt KEINEN regierenden Marker (unbedingt).
+        assert!(!store.governing_marker.contains_key(&x_id));
+
+        // (2) Ein Umbau, dessen Konstituenten X (wert-gleich, schon vorhanden) UND Y
+        //     (genuin neu) sind. stage_restructuring schreibt zwar einen zweiten
+        //     physischen X-Record, darf aber X NICHT konditionieren (§5.3/§7.1).
+        let y = Datum::leaf(b"genuinely-new".to_vec());
+        let y_id = ContentId::of_datum(&y);
+        let handle = store
+            .stage_restructuring(&[x.clone(), y.clone()])
+            .unwrap();
+        let w_staged = store.current_watermark();
+
+        // X bleibt unbedingt + aktiv (KEIN aufgestempelter Marker); Y ist inaktiv.
+        assert!(!store.governing_marker.contains_key(&x_id), "X nicht konditioniert");
+        assert!(store.is_active(x_id, w_staged), "geacktes X bleibt aktiv (§7.1)");
+        assert!(store.get_by_content_id(x_id).unwrap().is_some(), "X nicht verschwunden");
+        assert!(store.get_sealed(x_id, w_staged).unwrap().is_some(), "X sichtbar durchs Tor");
+        assert!(!store.is_active(y_id, w_staged), "neues Y ist bis zum Marker inaktiv (§13.2)");
+
+        // (3) Marker committen: Y wird aktiv, X war/ist durchgehend aktiv.
+        let marker = Datum::leaf(b"M".to_vec());
+        store.commit_restructuring(handle, &marker).unwrap();
+        let w_done = store.current_watermark();
+        assert!(store.is_active(x_id, w_done), "X auch nach Marker aktiv");
+        assert!(store.is_active(y_id, w_done), "Y nach Marker aktiv (§13.1)");
+    }
+
+    #[test]
+    fn crash_before_marker_keeps_acked_datum_visible_only_new_constituent_lost() {
+        // Wie oben, aber CRASH vor dem Marker (kein commit_restructuring) und Reopen:
+        // das geackte unbedingte X überlebt sichtbar; nur der genuin neue Konstituent Y
+        // bleibt für immer inaktiv (§13.3) — ein geackter Append geht nie verloren (§7.1).
+        let dir = tempdir().unwrap();
+        let x = Datum::leaf(b"acked-survivor".to_vec());
+        let x_id = ContentId::of_datum(&x);
+        let y = Datum::leaf(b"new-victim".to_vec());
+        let y_id = ContentId::of_datum(&y);
+        {
+            let mut store = open_store(dir.path());
+            store.append_datum(&x).unwrap(); // X unbedingt geackt.
+            // Umbau stagen (X wert-gleich + Y neu), KEIN Marker → Crash simulieren.
+            let _handle = store.stage_restructuring(&[x.clone(), y.clone()]).unwrap();
+            // store gedroppt ohne commit_restructuring.
+        }
+        // Reopen: dedup + §13-Karten aus dem Log rekonstruiert (unbedingt gewinnt).
+        let store = open_store(dir.path());
+        let w = store.current_watermark();
+        // X bleibt sichtbar (sein unbedingtes Vorkommen gewinnt, kein regierender Marker).
+        assert!(store.contains(x_id));
+        assert!(!store.governing_marker.contains_key(&x_id), "unbedingt gewinnt (§5.3/§7.1)");
+        assert!(store.is_active(x_id, w), "geacktes X überlebt den Crash sichtbar (§7.1)");
+        assert!(store.get_sealed(x_id, w).unwrap().is_some());
+        // Y bleibt für immer inaktiv (sein Marker wurde nie durabel, §13.3).
+        assert!(store.contains(y_id));
+        assert!(!store.is_active(y_id, w), "genuin neues Y bleibt inaktiv (§13.3)");
+        assert!(store.get_sealed(y_id, w).unwrap().is_none());
+    }
+
+    #[test]
+    fn restructuring_scope_filter_orthogonal_to_active_marker() {
+        // §13-Sichtbarkeit UND §11-Bereichs-Filter laufen ZUSAMMEN (beide
+        // pre-resolution): ein aktiver, aber bereichs-beschränkter Konstituent
+        // VANISHt ohne das Recht; ein inaktiver VANISHt unabhängig vom Recht.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Einen Bereich + Zugehörigkeits-Marker vorab unbedingt anlegen.
+        let area = store.append_datum(&Datum::leaf(b"area".to_vec())).unwrap();
+        store.append_datum(&Datum::area_membership_marker()).unwrap();
+        let membership = store.append_datum(&Datum::area_membership(area)).unwrap();
+
+        // Umbau: ein beschränkter Konstituent (gehört dem Bereich an) + ein
+        // unbeschränkter, plus Marker.
+        let restricted = Datum::node([membership]).unwrap();
+        let unrestricted = Datum::leaf(b"open".to_vec());
+        let (cids, _mid) = store
+            .append_restructuring(&[restricted.clone(), unrestricted.clone()], &Datum::leaf(b"M".to_vec()))
+            .unwrap();
+        let restricted_id = ContentId::of_datum(&restricted);
+        let unrestricted_id = ContentId::of_datum(&unrestricted);
+        assert!(cids.contains(&restricted_id) && cids.contains(&unrestricted_id));
+
+        // Ohne das Recht: der beschränkte Konstituent VANISHt (§11), der
+        // unbeschränkte ist sichtbar (er ist aktiv, §13).
+        let denied = store.visible_filter(&[restricted_id, unrestricted_id], &[], store.current_watermark()).unwrap();
+        assert_eq!(denied, vec![unrestricted_id]);
+        // Mit dem Recht: beide sichtbar (aktiv + im Bereich).
+        let granted = store
+            .visible_filter(&[restricted_id, unrestricted_id], &[area], store.current_watermark())
+            .unwrap();
+        let mut expected = vec![restricted_id, unrestricted_id];
+        expected.sort_unstable();
+        assert_eq!(granted, expected);
+    }
+
+    #[test]
+    fn empty_restructuring_is_rejected_store() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        assert!(matches!(
+            store.append_restructuring(&[], &Datum::leaf(b"M".to_vec())),
+            Err(KernelError::Inconsistent)
+        ));
+    }
+
     #[test]
     fn leaf_has_no_edges() {
         // Ein Blatt besitzt nichts ⇒ keine Kanten in keiner Richtung (§K2.1).
@@ -2096,14 +2689,14 @@ mod tests {
         assert!(store.contains(target));
 
         // VANISH im gegateten Filter: ein verborgenes Daten erscheint nicht.
-        let visible = store.visible_filter(&[target], &[]).unwrap();
+        let visible = store.visible_filter(&[target], &[], store.current_watermark()).unwrap();
         assert!(visible.is_empty(), "verborgenes Daten VANISHt aus der Projektion (§9.5/§11.3)");
 
         // Aufheben (§9.5): reversiert das Verbergen — append-only, nichts gelöscht.
         store.append_datum(&Datum::curation_unhide_marker()).unwrap();
         store.append_datum(&Datum::curation_unhide(target)).unwrap();
         assert!(!store.is_curation_hidden(target), "Aufheben reversiert (§9.5)");
-        assert_eq!(store.visible_filter(&[target], &[]).unwrap(), vec![target]);
+        assert_eq!(store.visible_filter(&[target], &[], store.current_watermark()).unwrap(), vec![target]);
 
         // Neu-Bau aus dem Log (§8.4): das Aufheben bleibt wirksam (reihenfolge-
         // unabhängig); der reversierte Zustand ist neu-baubar identisch.

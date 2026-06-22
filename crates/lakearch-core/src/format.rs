@@ -186,6 +186,36 @@ impl RecordHeader {
         }
     }
 
+    /// Setzt das **§13-Sichtbarkeitsfeld** `marker_offset` (Offset des regierenden
+    /// Aktiv-Markers) auf diesem Header und gibt ihn zurück (Builder).
+    ///
+    /// Ein Record mit `marker_offset != 0` ist ein **bedingter Konstituent** (§13):
+    /// er wird **erst** sichtbar, wenn sein regierender Marker durabel committet ist
+    /// (`marker_offset <= W`). Ein `marker_offset == 0` bedeutet **unbedingt**
+    /// (gewöhnlicher Einzel-Append) — der Offset 0 ist nie ein gültiger Marker-Offset
+    /// (am Offset 0 steht stets der allererste Record, nie ein nachgelagerter Marker
+    /// eines früheren Konstituenten), also ist `0` ein eindeutiges „kein Marker".
+    pub fn with_marker_offset(mut self, marker_offset: u64) -> Self {
+        self.marker_offset = marker_offset;
+        self
+    }
+
+    /// Setzt das **§13-Sichtbarkeitsfeld** `constituent_range` (gepackter
+    /// Konstituenten-Bereich des Markers) auf diesem Header und gibt ihn zurück
+    /// (Builder).
+    ///
+    /// Auf einem **Marker-Record** trägt dieses Feld den **Anfangs-Offset** des
+    /// **ersten** Konstituenten; zusammen mit dem eigenen Offset des Markers ergibt
+    /// das den inklusiven Bereich `[constituent_range, marker_offset)` aller von
+    /// diesem Marker regierten Konstituenten-Records (sie liegen contiguous **vor**
+    /// dem Marker). Reines Audit-/Rekonstruktions-Feld (§13): die
+    /// **Sichtbarkeits-Autorität** ist allein der Offset-Vergleich (`marker_offset
+    /// <= W` je Konstituent), **nicht** dieser Bereich.
+    pub fn with_constituent_range(mut self, constituent_range: u64) -> Self {
+        self.constituent_range = constituent_range;
+        self
+    }
+
     /// Schreibt die festen 64 Header-Bytes in `out` (Magic, Versionen, Felder,
     /// reservierte Null-Felder). **Ohne** Nutzlast/Prüfsumme — das macht
     /// [`encode_record`].
@@ -283,6 +313,24 @@ pub fn encode_record_to_vec(seq: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(RECORD_HEADER_LEN + payload.len() + CHECKSUM_LEN);
     encode_record(seq, payload, &mut out);
     out
+}
+
+/// Kodiert einen Record (Header ‖ Payload ‖ Prüfsumme) **in-memory** in `out`,
+/// mit einem **bereits befüllten** [`RecordHeader`] — so können die §13-
+/// Sichtbarkeitsfelder (`marker_offset`/`constituent_range`) gesetzt werden.
+///
+/// `header.payload_len` wird vor dem Schreiben **autoritativ** auf `payload.len()`
+/// gesetzt (der Header darf keine abweichende Länge tragen). Die Prüfsumme deckt —
+/// genau wie [`encode_record`] — `Header ‖ Payload` ab, also auch die gesetzten
+/// reservierten Felder: ein gekipptes `marker_offset`/`constituent_range` ist damit
+/// ein Prüfsummen-Defekt (§Durability). Keine Datei-I/O.
+pub fn encode_record_with(mut header: RecordHeader, payload: &[u8], out: &mut Vec<u8>) {
+    header.payload_len = payload.len() as u64;
+    let frame_start = out.len();
+    header.write_fixed_head(out);
+    out.extend_from_slice(payload);
+    let digest = checksum(&out[frame_start..]);
+    out.extend_from_slice(&digest);
 }
 
 /// Dekodiert **einen** gerahmten Record vom Anfang von `bytes` **streng**.
@@ -553,6 +601,50 @@ mod tests {
         assert_eq!(decoded.header.index_validity_offset, 0);
         // Auch das Auffüll-Wort ist physisch NULL.
         assert_eq!(&frame[RH_RESERVED_PAD..RH_RESERVED_PAD + 4], &[0u8; 4]);
+    }
+
+    #[test]
+    fn marker_and_constituent_range_fields_round_trip() {
+        // §13: ein Record mit gesetztem marker_offset/constituent_range round-trippt
+        // die Felder und bleibt prüfsummen-gültig (die Felder sind durch die
+        // Prüfsumme über Header ‖ Payload gedeckt).
+        let header = RecordHeader::new(7, 0)
+            .with_marker_offset(4096)
+            .with_constituent_range(128);
+        let mut out = Vec::new();
+        encode_record_with(header, b"constituent", &mut out);
+        let decoded = decode_record(&out).expect("gültig");
+        assert_eq!(decoded.header.seq, 7);
+        assert_eq!(decoded.header.payload_len, b"constituent".len() as u64);
+        assert_eq!(decoded.header.marker_offset, 4096);
+        assert_eq!(decoded.header.constituent_range, 128);
+        assert_eq!(decoded.payload, b"constituent");
+    }
+
+    #[test]
+    fn encode_record_with_overwrites_payload_len_field() {
+        // Eine vom Aufrufer gesetzte payload_len wird autoritativ auf die echte
+        // Länge gesetzt (kein abweichendes Längenfeld kann durchrutschen).
+        let mut header = RecordHeader::new(1, 9999);
+        header.payload_len = 9999; // bewusst falsch.
+        let mut out = Vec::new();
+        encode_record_with(header, b"abc", &mut out);
+        let decoded = decode_record(&out).expect("gültig");
+        assert_eq!(decoded.header.payload_len, 3);
+    }
+
+    #[test]
+    fn flip_in_marker_offset_field_is_detected_by_checksum() {
+        // Ein gekipptes Bit im marker_offset-Feld eines Konstituenten ist ein
+        // Prüfsummen-Defekt (§Durability) — nie stilles Überspringen.
+        let header = RecordHeader::new(2, 0).with_marker_offset(64);
+        let mut frame = Vec::new();
+        encode_record_with(header, b"x", &mut frame);
+        frame[RH_MARKER_OFFSET] ^= 0b0000_0001;
+        assert!(matches!(
+            decode_record(&frame),
+            Err(KernelError::Inconsistent)
+        ));
     }
 
     #[test]

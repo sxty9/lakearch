@@ -152,7 +152,7 @@ pub use kernel::{KernelMetrics, LakearchKernel};
 pub use log::{LogMetrics, LoggedRecord, SegmentLog};
 pub use model::{Datum, IdentityStrength};
 pub use serialize::{canonical_cbor, strict_decode};
-pub use store::{ContentStore, StoreMetrics};
+pub use store::{ContentStore, StagedHandle, StoreMetrics};
 pub use traverse::{CancelFlag, TraversalParams};
 
 #[cfg(test)]

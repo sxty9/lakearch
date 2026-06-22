@@ -168,14 +168,19 @@ impl TraversalParams {
 /// Wert-Sort). Über die Ebenen hinweg ist die Reihenfolge damit stabil und
 /// föderations­stabil.
 ///
-/// **Snapshot (Phase 2).** Der Snapshot ist am Start gepinnt; in Phase 1/2 ist die
-/// Wahrheit alles bis zum committeten Watermark `W`. Der Token wird vom Aufrufer
-/// gepinnt und hier nicht erneut aufgelöst (volle §13-Epochen-Semantik: Phase 5).
+/// **Snapshot (§13 — ein W fixiert den Snapshot).** Das Watermark `w` ist der vom
+/// Aufrufer **gepinnte** [`crate::api::SnapshotToken`]-Wert (ein Acquire-Load, §13 —
+/// eine Linearisierungsstelle), **nicht** das (möglicherweise vorangerückte) Live-
+/// Watermark. Es wird über die **gesamte** Traversierung verwendet — so ist die
+/// §13-Aktiv-Sichtbarkeit über alle Knoten konsistent und für ein Token **stabil**
+/// (Snapshot-Isolation; ein nach dem Pinnen committeter Umbau bleibt unsichtbar). Der
+/// Token wird hier **nicht** erneut aufgelöst (kein In-Traversierungs-TOCTOU).
 pub(crate) fn run_traversal<I: EdgeIndex>(
     store: &ContentStore<I>,
     capability: &Capability,
     params: &TraversalParams,
     cancel: &CancelFlag,
+    w: u64,
 ) -> Vec<Result<Step, KernelError>> {
     let mut out: Vec<Result<Step, KernelError>> = Vec::new();
 
@@ -210,11 +215,18 @@ pub(crate) fn run_traversal<I: EdgeIndex>(
         "edge_type_filter muss aufsteigend sortiert + dedupliziert sein (§1.3/§1.7 a)"
     );
 
+    // **§13: ein W fixiert den Snapshot.** Das Snapshot-Watermark `w` wurde vom
+    // Aufrufer **am Token** gepinnt (ein Acquire-Load; §13 — eine Linearisierungs-
+    // stelle) und wird hier für die **gesamte** Traversierung verwendet — so ist die
+    // §13-Aktiv-Sichtbarkeit über alle Knoten konsistent (kein In-Traversierungs-
+    // TOCTOU) **und** für den Token stabil (Snapshot-Isolation: ein nach dem Pinnen
+    // committeter Umbau bleibt unsichtbar). Wir lösen den Token hier **nicht** erneut
+    // gegen das Live-Watermark auf.
     // Der Start ist selbst nicht sichtbar? Dann ist die ganze Front leer (VANISH):
     // ein nicht-sichtbarer Start ist ununterscheidbar von „existiert nicht". Keine
     // Schritte, kein Fehler — die Ergebnisform verrät nichts (§11.3).
     let granted = capability.scopes().scope_ids();
-    match is_visible_node(store, params.start, granted) {
+    match is_visible_node(store, params.start, granted, w) {
         Ok(true) => {}
         Ok(false) => return out, // VANISH: leere, nicht-unterscheidbare Sicht.
         Err(e) => {
@@ -297,7 +309,7 @@ pub(crate) fn run_traversal<I: EdgeIndex>(
                 // §11.3 Filter-vor-Auflösen / VANISH: ein nicht-sichtbares Ziel ist
                 // ein interner Front-Stopp — weder Step noch Betreten, und es
                 // verändert die Ergebnisform nicht.
-                match is_visible_node(store, to, granted) {
+                match is_visible_node(store, to, granted, w) {
                     Ok(true) => {}
                     Ok(false) => continue, // VANISH.
                     Err(e) => {
@@ -410,19 +422,32 @@ fn is_sorted_deduped(xs: &[ContentId]) -> bool {
     xs.windows(2).all(|w| w[0] < w[1])
 }
 
-/// Sichtbarkeit eines Knotens am Tor (§11.3) — reines Mengen-Matching (§1.3):
-/// `Bereiche(Daten) ∩ gewährte Bereiche` (oder das Daten ist unbeschränkt). Ein
-/// **nicht vorhandenes** Daten gilt als nicht sichtbar (`false`) — ununterscheidbar
-/// (VANISH).
+/// Sichtbarkeit eines Knotens am Tor (§11.3 ∧ §13) — reines Mengen-Matching (§1.3)
+/// **plus** der §13-Aktiv-Offset-Vergleich (beide pre-resolution): sichtbar ⇔ das
+/// Daten ist durabel **und** §13-aktiv unter dem gepinnten `w` **und**
+/// `Bereiche(Daten) ∩ gewährte Bereiche` (oder unbeschränkt). Ein **nicht
+/// vorhandenes** Daten gilt als nicht sichtbar (`false`) — ununterscheidbar (VANISH).
+///
+/// `w` ist das **am Start einmal gepinnte** Snapshot-Watermark (§13: eine
+/// Linearisierungsstelle) — derselbe Wert für jeden Knoten eines Laufs.
 fn is_visible_node<I: EdgeIndex>(
     store: &ContentStore<I>,
     id: ContentId,
     granted: &[ContentId],
+    w: u64,
 ) -> Result<bool, KernelError> {
     // Ein nicht vorhandenes Daten ist kein sichtbarer Knoten (VANISH; ein Verweis
     // auf ein fehlendes Ziel — die schreibende Schicht erzwingt Geschlossenheit,
     // §3.6 — wird als Front-Stopp behandelt, nicht als Fehler).
     if !store.contains(id) {
+        return Ok(false);
+    }
+    // §13-Sichtbarkeit (orthogonal zum §11-Bereichs-Filter, beide pre-resolution):
+    // ein **inaktiver** Konstituent eines noch nicht freigegebenen Umbaus ist kein
+    // sichtbarer Knoten (Front-Stopp, VANISH — §13.2). So leckt ein halb-vollzogener
+    // Umbau auch durch die Traversierung nicht. Reiner Offset-Vergleich gegen das
+    // am Start gepinnte Watermark `w` (die alleinige Sichtbarkeits-Autorität, §13).
+    if !store.is_active(id, w) {
         return Ok(false);
     }
     // Fail-closed (§11): die Bereiche werden gegen die durable Wahrheit geprüft;
@@ -496,7 +521,7 @@ mod tests {
         let a = store.append_datum(&Datum::node([b, c]).unwrap()).unwrap();
 
         let p = params(a, Direction::Forward, 4, 100);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(err.is_none());
         // A → B und A → C (Tiefe 1), in aufsteigender Ziel-Order.
         let targets: Vec<ContentId> = steps.iter().map(|s| s.to).collect();
@@ -521,7 +546,7 @@ mod tests {
         let d = store.append_datum(&Datum::node([b, e]).unwrap()).unwrap();
 
         let p = params(b, Direction::Backward, 1, 100);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(err.is_none());
         let referrers: Vec<ContentId> = steps.iter().map(|s| s.to).collect();
         let mut expected = vec![a, d];
@@ -547,7 +572,7 @@ mod tests {
         let a = store.append_datum(&Datum::node([b]).unwrap()).unwrap();
 
         let p = params(a, Direction::Both, 1000, 1000);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         // Terminiert (kein Hang); das Visited-Set verhindert das Pendeln A↔B.
         assert!(err.is_none(), "Zyklus terminiert ohne Budget-Fehler");
         // Es werden nur A und B je einmal besucht.
@@ -574,7 +599,7 @@ mod tests {
 
         // max_depth = 2 ⇒ Schritte bis Tiefe 2 (A→B Tiefe 1, B→C Tiefe 2), nicht C→D.
         let p = params(a, Direction::Forward, 2, 100);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(err.is_none());
         let max_d = steps.iter().map(|s| s.depth).max().unwrap_or(0);
         assert_eq!(max_d, 2, "kein Schritt tiefer als max_depth");
@@ -598,7 +623,7 @@ mod tests {
         // max_nodes = 2 ⇒ A + ein weiterer Knoten; der zweite neue Knoten sprengt
         // das Budget ⇒ definierter TraversalBudgetExceeded.
         let p = params(a, Direction::Forward, 100, 2);
-        let (_steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (_steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(matches!(err, Some(KernelError::TraversalBudgetExceeded)));
     }
 
@@ -624,7 +649,7 @@ mod tests {
         // Kante sprengt das Budget; der Lauf endet definiert, ohne alle 50 Kanten zu
         // puffern.
         let p = params(a, Direction::Forward, 1, 3);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(
             matches!(err, Some(KernelError::TraversalBudgetExceeded)),
             "hoher Ausgangsgrad ⇒ definierter Budget-Abbruch (§1.7 a)"
@@ -657,7 +682,7 @@ mod tests {
         flag.cancel();
         // Großes Budget, damit NICHT das Budget, sondern der Abbruch greift.
         let p = params(a, Direction::Forward, 1, 1000);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &flag));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &flag, store.current_watermark()));
         assert!(steps.is_empty(), "Abbruch vor jeder zugelassenen Kante");
         assert!(matches!(err, Some(KernelError::Cancelled)));
     }
@@ -684,7 +709,7 @@ mod tests {
             max_nodes: 100,
             edge_type_filter: Some(filter),
         };
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(err.is_none());
         // Nur die Kante mit edge_ctx == r1 bleibt.
         assert_eq!(steps.len(), 1);
@@ -725,7 +750,7 @@ mod tests {
             max_nodes: 100,
             edge_type_filter: Some(vec![rels[4], rels[1], rels[3]]),
         };
-        let (steps_a, err_a) = collect(run_traversal(&store, &cap([]), &p_a, &CancelFlag::new()));
+        let (steps_a, err_a) = collect(run_traversal(&store, &cap([]), &p_a, &CancelFlag::new(), store.current_watermark()));
         assert!(err_a.is_none());
         let mut tos_a: Vec<ContentId> = steps_a.iter().map(|s| s.to).collect();
         // Jede passende Kante bleibt erhalten (keine Unter-Inklusion).
@@ -742,7 +767,7 @@ mod tests {
             max_nodes: 100,
             edge_type_filter: Some(vec![rels[3], rels[4], rels[1], rels[4]]),
         };
-        let (steps_b, err_b) = collect(run_traversal(&store, &cap([]), &p_b, &CancelFlag::new()));
+        let (steps_b, err_b) = collect(run_traversal(&store, &cap([]), &p_b, &CancelFlag::new(), store.current_watermark()));
         assert!(err_b.is_none());
         // Die emittierten Schritte sind über beide Filter-Reihenfolgen IDENTISCH
         // (deterministisch, kein Reihenfolge-Einfluss).
@@ -756,7 +781,7 @@ mod tests {
             100,
             Some(vec![rels[1], rels[4], rels[3]]),
         );
-        let (steps_c, err_c) = collect(run_traversal(&store, &cap([]), &p_c, &CancelFlag::new()));
+        let (steps_c, err_c) = collect(run_traversal(&store, &cap([]), &p_c, &CancelFlag::new(), store.current_watermark()));
         assert!(err_c.is_none());
         assert_eq!(steps_a, steps_c);
     }
@@ -777,8 +802,8 @@ mod tests {
         let a = store.append_datum(&Datum::node(leaves.clone()).unwrap()).unwrap();
 
         let p = params(a, Direction::Forward, 1, 100);
-        let run1 = run_traversal(&store, &cap([]), &p, &CancelFlag::new());
-        let run2 = run_traversal(&store, &cap([]), &p, &CancelFlag::new());
+        let run1 = run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark());
+        let run2 = run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark());
         let (s1, _) = collect(run1);
         let (s2, _) = collect(run2);
         // Stabil über Läufe.
@@ -803,7 +828,7 @@ mod tests {
         let flag = CancelFlag::new();
         flag.cancel();
         let p = params(a, Direction::Forward, 4, 100);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &flag));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &flag, store.current_watermark()));
         assert!(steps.is_empty());
         assert!(matches!(err, Some(KernelError::Cancelled)));
     }
@@ -832,7 +857,7 @@ mod tests {
 
         // Subjekt OHNE den geheimen Bereich.
         let p = params(a, Direction::Forward, 2, 100);
-        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(err.is_none());
         // Das geheime Daten erscheint NIE als Ziel.
         assert!(steps.iter().all(|s| s.to != secret), "geheimes Ziel VANISHt");
@@ -841,7 +866,7 @@ mod tests {
         // Mit gewährtem Bereich wird das geheime sichtbar — die Ergebnisform wächst
         // erst DANN um den Knoten (kein Orakel ohne Recht).
         let p2 = params(a, Direction::Forward, 2, 100);
-        let (steps2, err2) = collect(run_traversal(&store, &cap([area]), &p2, &CancelFlag::new()));
+        let (steps2, err2) = collect(run_traversal(&store, &cap([area]), &p2, &CancelFlag::new(), store.current_watermark()));
         assert!(err2.is_none());
         assert!(steps2.iter().any(|s| s.to == secret), "mit Recht sichtbar");
     }
@@ -876,7 +901,7 @@ mod tests {
             }
             let a = store.append_datum(&Datum::node(owned).unwrap()).unwrap();
             let p = params(a, Direction::Forward, 1, 1000);
-            let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+            let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
             assert!(err.is_none());
             steps.iter().map(|s| s.to).collect()
         }
@@ -919,9 +944,61 @@ mod tests {
         let p = params(a, Direction::Forward, 2, 100);
         // Rechtloses Subjekt: ohne Korruption würde `secret` VANISHen; mit Korruption
         // DENY (fail-closed), nicht etwa als sichtbar durchlassen.
-        let (_steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new()));
+        let (_steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
         assert!(matches!(err, Some(KernelError::Inconsistent)), "fail-closed DENY (§11)");
         assert!(store.metrics().fail_closed_count >= 1, "Fail-closed gezählt (§11)");
+    }
+
+    // ------------------------------------------------------------------------
+    // §13 Aktiv-Marker: ein INAKTIVER Konstituent (gestaget, Marker noch nicht
+    // committet) VANISHt aus der Traversierung — ein halb-vollzogener Umbau leckt
+    // durch keinen Lesepfad (§13.2). Nach dem Marker-Commit ist er sichtbar.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn inactive_constituent_vanishes_from_traversal_then_appears_after_marker() {
+        use crate::serialize::canonical_cbor;
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Den Konstituenten-Inhalt vorab kanonisieren, um seine `ContentId` zu kennen.
+        let c = Datum::leaf(b"constituent".to_vec());
+        let c_id = ContentId::of_datum(&c);
+
+        // ZUERST den aktiven Knoten A anhängen, der den (noch nicht vorhandenen)
+        // Konstituenten besitzt — ein geschlossener Verweis (§3.6); das Ziel trifft als
+        // Konstituent eines Umbaus ein. So entsteht KEIN unbedingter Append NACH dem
+        // Staging (der Staging-Vertrag verlangt, dass der Marker unmittelbar folgt).
+        let a = store.append_datum(&Datum::node([c_id]).unwrap()).unwrap();
+
+        // Jetzt den Konstituenten stagen (inaktiv) — der Marker folgt unmittelbar.
+        let c_bytes = canonical_cbor(&c);
+        let staged = store
+            .log_mut_for_test()
+            .stage_constituents(&[c_bytes.as_slice()])
+            .unwrap();
+        store.insert_staged_for_test(c_id, staged.constituent_offsets()[0], staged.marker_offset());
+
+        // Forward von A: der inaktive Konstituent VANISHt (Front-Stopp), kein Step.
+        let p = params(a, Direction::Forward, 2, 100);
+        let (steps, err) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
+        assert!(err.is_none());
+        assert!(
+            steps.iter().all(|s| s.to != c_id),
+            "inaktiver Konstituent VANISHt aus der Traversierung (§13.2)"
+        );
+
+        // Marker committen → der Konstituent wird aktiv und nun traversierbar.
+        store
+            .log_mut_for_test()
+            .commit_marker(&staged, &canonical_cbor(&Datum::leaf(b"M".to_vec())))
+            .unwrap();
+        let (steps2, err2) = collect(run_traversal(&store, &cap([]), &p, &CancelFlag::new(), store.current_watermark()));
+        assert!(err2.is_none());
+        assert!(
+            steps2.iter().any(|s| s.to == c_id),
+            "nach Marker-Commit ist der Konstituent sichtbar (§13.1)"
+        );
     }
 
     #[test]

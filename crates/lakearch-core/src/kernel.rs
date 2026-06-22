@@ -48,7 +48,7 @@ use crate::id::{AnchorId, ContentId};
 use crate::index::EdgeIndex;
 use crate::log::SegmentLog;
 use crate::model::Datum;
-use crate::store::ContentStore;
+use crate::store::{ContentStore, StagedHandle};
 use crate::traverse::{run_traversal, CancelFlag, TraversalParams};
 
 /// Aggregierte **Betriebs-Zähler** des Kernels (§Betrieb). Reine Mechanik-Signale
@@ -114,8 +114,9 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// — die [`Capability`] des Subjekts, sodass das Tor (§11.3) die Sichtbarkeit
     /// gegen die **gewährten Bereiche** matchen kann: nicht-sichtbare Nachbarn sind
     /// interne Front-Stopps (VANISH) und verändern die Ergebnisform nicht. Der
-    /// Snapshot ist am Start gepinnt (§1.7 a/§13); die volle §13-Epochen-Semantik
-    /// folgt in Phase 5.
+    /// Snapshot ist am `snapshot`-Token gepinnt (§1.7 a/§13): sein Watermark `W`
+    /// fixiert die §13-Aktiv-Sicht für den **ganzen** Lauf (eine Linearisierungs-
+    /// stelle, Snapshot-Isolation — kein Re-Lesen des Live-Watermarks).
     ///
     /// Liefert einen owned [`StepStream`]; jeder Schritt ist ein [`crate::api::Step`] oder ein
     /// definierter [`KernelError`] (Budget/Abbruch/Inkonsistenz — fail-closed §11).
@@ -128,9 +129,10 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         snapshot: SnapshotToken,
         cancel: &CancelFlag,
     ) -> Result<StepStream<'a>, KernelError> {
-        // Snapshot wird am Start gepinnt; in Phase 1/2 ist die Wahrheit alles bis
-        // zur committeten Watermark. Volle §13-Epochen-Semantik: Phase 5.
-        let _ = snapshot;
+        // §13: das am Token gepinnte Watermark `W` fixiert den Snapshot (ein Acquire-
+        // Load; eine Linearisierungsstelle) — es wird in `run_traversal` für den ganzen
+        // Lauf verwendet, nicht das (evtl. vorangerückte) Live-Watermark.
+        let w = snapshot.watermark();
         // Den `edge_type_filter` an der **Verb-Grenze** normalisieren (aufsteigend
         // sortiert + dedupliziert, §1.3/§1.7 a): ein vom Aufrufer direkt befülltes
         // `TraversalParams` darf einen unsortierten Filter tragen — die
@@ -146,7 +148,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
             params.edge_type_filter,
         );
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let steps = run_traversal(&store, capability, &params, cancel);
+        let steps = run_traversal(&store, capability, &params, cancel, w);
         Ok(Box::new(steps.into_iter()))
     }
 
@@ -201,6 +203,78 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         store.resolve_placeholder(placeholder, real)
     }
 
+    /// **append_restructuring** (§13) — die **atomare** Mehr-Daten-„Änderung": ein
+    /// Umbau, der **mehrere Daten** betrifft (Zusammenführen/Spalten §9, Berechtigungs-
+    /// Wechsel §11), wird durch **ein einziges abschließendes Aktiv-Schreiben** (den
+    /// Marker) **gemeinsam sichtbar** (§13.1). Bis der Marker durabel ist, gelten alle
+    /// `constituents` als **inaktiv** und werden von **jedem** Lesepfad ignoriert
+    /// (`get_by_content_id`, Traversierung, alle gegateten Helfer — §13.2); der Marker-
+    /// Commit flippt sie **gemeinsam** sichtbar (§13.3, Atomarität ohne Transaktions-
+    /// Maschinerie).
+    ///
+    /// `constituents` = die gemeinsam sichtbar werdenden Daten (jedes wird als
+    /// **bedingter Konstituent** angehängt, gestempelt mit dem Offset des regierenden
+    /// Markers); `marker` = das abschließende **Marker-Daten**, dessen Commit den Umbau
+    /// freigibt. Liefert `(constituent_ids, marker_id)`. Delegiert an
+    /// [`crate::store::ContentStore::append_restructuring`] (Schreib-Lock; der Store ist
+    /// der eine Append-Pfad).
+    ///
+    /// **Crash-Atomarität (§13.3):** crasht es **nach** den Konstituenten, aber **vor**
+    /// dem Marker-`fsync`, bleiben die Konstituenten für immer **inaktiv** (ihr
+    /// Marker-Offset liegt über dem durablen Watermark `W`, das die Recovery auf den
+    /// letzten voll-durablen Record setzt) — ein halb-vollzogener Umbau ist nie
+    /// sichtbar.
+    ///
+    /// **`set_active_marker`-Bezug.** Dies ist der **konkrete**, voll typisierte
+    /// Restructuring-Einstieg — analog zu [`LakearchKernel::traverse_with`] gegenüber
+    /// der frozen-Form-[`Kernel::traverse`]. Die eingefrorene Phase-0.5-Trait-Form
+    /// [`Kernel::set_active_marker`]`(constituents: &[ContentId])` bleibt unangetastet
+    /// (sie nimmt nur **schon vorhandene** IDs entgegen und kann daher die bedingten
+    /// Konstituenten nicht **stagen**); das §13-Staging+Marker-Modell verlangt die
+    /// **Daten** selbst, weil sie als bedingte Records geschrieben werden müssen.
+    pub fn append_restructuring(
+        &self,
+        constituents: &[Datum],
+        marker: &Datum,
+    ) -> Result<(Vec<ContentId>, ContentId), KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.append_restructuring(constituents, marker)
+    }
+
+    /// **stage_restructuring** (§13, Phase 1) — der **erste** Halbschritt eines
+    /// atomaren Umbaus: hängt die `constituents` als **bedingte, noch INAKTIVE**
+    /// Konstituenten an (§13.2) und liefert einen [`StagedHandle`]. Bis der Marker
+    /// committet ist, ignorieren **alle** Lesepfade die Konstituenten (sie VANISHen
+    /// aus `get_by_content_id`, der Traversierung und jedem gegateten Helfer). Der
+    /// abschließende [`commit_restructuring`](LakearchKernel::commit_restructuring)
+    /// flippt sie **gemeinsam** sichtbar (§13.1).
+    ///
+    /// Dieser zweiphasige Pfad existiert, damit ein Aufrufer (und der Test) den
+    /// **inaktiven Zwischenzustand** über die öffentlichen Lesepfade beobachten kann;
+    /// [`append_restructuring`](LakearchKernel::append_restructuring) ist der
+    /// Ein-Aufruf-Bequempfad (stage + commit unmittelbar).
+    pub fn stage_restructuring(
+        &self,
+        constituents: &[Datum],
+    ) -> Result<StagedHandle, KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.stage_restructuring(constituents)
+    }
+
+    /// **commit_restructuring** (§13, Phase 2) — der **abschließende** Aktiv-
+    /// Schreibvorgang: committet das `marker`-Daten für den gestageten `handle` und
+    /// flippt damit **alle** Konstituenten in **einem** Linearisierungspunkt
+    /// **gemeinsam sichtbar** (§13.1, Atomarität ohne Transaktions-Maschinerie §13.3).
+    /// Liefert die [`ContentId`] des Marker-Daten.
+    pub fn commit_restructuring(
+        &self,
+        handle: StagedHandle,
+        marker: &Datum,
+    ) -> Result<ContentId, KernelError> {
+        let mut store = self.store.write().map_err(|_| KernelError::Poisoned)?;
+        store.commit_restructuring(handle, marker)
+    }
+
     /// **Gegateter Zeit-Aussage-Lookup** (§6.1/§6.2/§11.3) — liefert die für die
     /// `capability` **sichtbaren** Daten, die die Zeit-Aussage `statement` tragen.
     ///
@@ -215,14 +289,19 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// Ergebnis, ununterscheidbar von „existiert nicht"). Es werden **nur**
     /// `ContentId`s geliefert; den Inhalt legt erst das Tor frei (§11.5). Fail-closed
     /// (§11): ein korrupter Bereichs-Index ⇒ [`KernelError::Inconsistent`] (DENY).
+    ///
+    /// **§13-Snapshot:** der `snapshot`-Token pinnt das Watermark `W` (eine
+    /// Linearisierungsstelle, §13); die §13-Aktiv-Sicht ist damit für diesen Token
+    /// stabil — Tor (§11) und §13-Filter laufen über **dasselbe** S.
     pub fn time_carriers_visible(
         &self,
         statement: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.time_carriers_of(statement);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// **Gegatete Ersetzungs-Traversierung — supersedes** (§6.3/§11.3): die für die
@@ -231,15 +310,17 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// Kernel entscheidet **nicht**, welches „aktuell" ist (§6.4/§8).
     ///
     /// **Gated (§11.3):** ein nicht-sichtbares älteres Daten VANISHt. Nur
-    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11). Der
+    /// `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn supersedes_visible(
         &self,
         newer: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.supersedes_of(newer);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// **Gegatete Ersetzungs-Traversierung — superseded-by** (§6.3/§11.3): die für
@@ -251,14 +332,16 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// **Gated (§11.3):** ein nicht-sichtbares überholendes Daten VANISHt — ein
     /// nicht-sichtbares ersetzendes Daten ist damit ununterscheidbar von „es gibt
     /// keines". Nur `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    /// Der `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn superseded_by_visible(
         &self,
         older: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.superseded_by_of(older);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// **Gegatete Platzhalter-Auflösung** (§3.6/§6.3/§11.3): die für die `capability`
@@ -275,17 +358,20 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// **Gated (§11.3):** sowohl der Auflösungs-Knoten als auch das echte Daten
     /// müssen sichtbar sein; nicht-sichtbare VANISHen. Nur `ContentId`s; Inhalt nur
     /// über das Tor (§11.5). Fail-closed (§11). Der Platzhalter selbst bleibt
-    /// append-only unverändert (§7.1) — dieser Helfer mutiert **nichts**.
+    /// append-only unverändert (§7.1) — dieser Helfer mutiert **nichts**. Der
+    /// `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn placeholder_resolvers_visible(
         &self,
         placeholder: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let granted = capability.scopes().scope_ids();
+        let w = snapshot.watermark();
         // superseded-by(placeholder) = die (sichtbaren) Auflösungs-Knoten.
         let resolution_nodes =
-            store.visible_filter(&store.superseded_by_of(placeholder), granted)?;
+            store.visible_filter(&store.superseded_by_of(placeholder), granted, w)?;
         // Die `ContentId` des Ersetzungs-Kontextes ist strukturell bestimmt
         // (`{ supersession_marker, placeholder }`, §6.3): das echte Daten ist der
         // **übrige** besessene Kontext eines Auflösungs-Knotens, der genau diesen
@@ -301,7 +387,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
                 reals.push(ctx);
             }
         }
-        store.visible_filter(&reals, granted)
+        store.visible_filter(&reals, granted, w)
     }
 
     /// **Gegatete Anker-Mitgliedschaft — Anker→Repräsentanten** (§9.1/§9.3/§11.3):
@@ -313,15 +399,17 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// **Gated (§11.3):** ein nicht-sichtbarer (oder kuratorisch verborgener, §9.5)
     /// Repräsentant VANISHt. Nur `ContentId`s; Inhalt nur über das Tor (§11.5).
     /// Fail-closed (§11). Es wird **kein** Repräsentant „gewählt" oder gerankt — die
-    /// Schicht darüber liest den Grad und entscheidet (§1.4/§1.5).
+    /// Schicht darüber liest den Grad und entscheidet (§1.4/§1.5). Der `snapshot`-
+    /// Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn anchor_members_visible(
         &self,
         anchor: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.anchor_members_of(anchor);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// **Gegatete Anker-Mitgliedschaft — Repräsentant→Anker** (§9.1/§11.3): die für
@@ -331,15 +419,17 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// Mitgliedschaft in **beide** Richtungen gegated traversierbar (§1.2).
     ///
     /// **Gated (§11.3):** ein nicht-sichtbarer/verborgener Anker VANISHt. Nur
-    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11). Der
+    /// `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn member_anchors_visible(
         &self,
         member: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.member_anchors_of(member);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// **Gegatete gradierte Identitäts-Links** (§5.5/§11.3): die für die `capability`
@@ -350,15 +440,17 @@ impl<I: EdgeIndex> LakearchKernel<I> {
     /// heraus, deren Stärke/Konfidenz die Schicht darüber liest und wertet (§1.5).
     ///
     /// **Gated (§11.3):** ein nicht-sichtbarer/verborgener Identitäts-Kontext VANISHt.
-    /// Nur `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    /// Nur `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11). Der
+    /// `snapshot`-Token pinnt das Watermark `W` (§13 — stabile §13-Aktiv-Sicht).
     pub fn graded_identity_links_visible(
         &self,
         datum: ContentId,
         capability: &Capability,
+        snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
         let candidates = store.graded_identity_links_of(datum);
-        store.visible_filter(&candidates, capability.scopes().scope_ids())
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
     }
 
     /// Der bestand-**lokale** [`AnchorId`]-Handle eines Anker-Daten (§9.1/§12.4),
@@ -487,19 +579,22 @@ impl<I: EdgeIndex> Kernel for LakearchKernel<I> {
     /// `Inconsistent`) ist ein **Fehler** (DENY + Fail-closed-Vermerk), **nie** ein
     /// stilles `Some`/`None`, das Unsichtbares durchsickern ließe.
     ///
-    /// `snapshot` wird formal entgegengenommen (volle §13-Epoche: Phase 5); jede
-    /// Tor-Operation läuft über **dasselbe** S (§11.2).
+    /// **§13-Snapshot (gepinntes W):** der `snapshot`-Token trägt das gepinnte
+    /// Watermark `W` (eine Linearisierungsstelle, §13); die §13-Aktiv-Sicht
+    /// (`get_sealed`) und der §11-Bereichs-Filter laufen über **dasselbe** S
+    /// (§11.2) — ein nach dem Pinnen committeter Umbau bleibt für diesen Token
+    /// unsichtbar (Snapshot-Isolation, kein Re-Lesen des Live-Watermarks).
     fn get_by_content_id(
         &self,
         id: ContentId,
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Option<SealedRecord>, KernelError> {
-        // `snapshot` wird formal entgegengenommen (volle §13-Epoche: Phase 5).
-        let _ = snapshot;
+        // §13: das am Token gepinnte Watermark `W` fixiert die Aktiv-Sicht (§13.2).
+        let w = snapshot.watermark();
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        // Server-seitig versiegeln: `None` ⇒ nicht vorhanden.
-        let sealed = match store.get_sealed(id)? {
+        // Server-seitig versiegeln: `None` ⇒ nicht vorhanden ODER §13-inaktiv unter `w`.
+        let sealed = match store.get_sealed(id, w)? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -591,7 +686,9 @@ impl<I: EdgeIndex> Kernel for LakearchKernel<I> {
         edge_type_filter: Option<&'a [ContentId]>,
         snapshot: SnapshotToken,
     ) -> Result<StepStream<'a>, KernelError> {
-        let _ = snapshot;
+        // §13: das am Token gepinnte Watermark `W` fixiert die Aktiv-Sicht für den
+        // ganzen Lauf (eine Linearisierungsstelle) — kein Re-Lesen des Live-Watermarks.
+        let w = snapshot.watermark();
         // Frozen-Form ohne Capability ⇒ fail-safe leere gewährte Bereiche: nur
         // unbeschränkte Daten sichtbar, beschränkte VANISHen (§11.3).
         let capability = Capability::issue(GrantedScopes::from_scope_ids([]));
@@ -611,7 +708,7 @@ impl<I: EdgeIndex> Kernel for LakearchKernel<I> {
             edge_type_filter,
         };
         let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let steps = run_traversal(&store, &capability, &params, &CancelFlag::new());
+        let steps = run_traversal(&store, &capability, &params, &CancelFlag::new(), w);
         Ok(Box::new(steps.into_iter()))
     }
 }
@@ -851,12 +948,14 @@ mod tests {
         use crate::api::Direction;
         let dir = tempdir().unwrap();
         let k = open_kernel(dir.path());
-        let snap = k.pin_snapshot().unwrap();
 
         let b = k.append(&Datum::leaf(b"b".to_vec())).unwrap();
         let c = k.append(&Datum::leaf(b"c".to_vec())).unwrap();
         let a = k.append(&Datum::node([b, c]).unwrap()).unwrap();
 
+        // Snapshot NACH den Appends pinnen (Snapshot-Isolation, §13: ein W fixiert
+        // den Snapshot — nur bis dahin Durables ist sichtbar).
+        let snap = k.pin_snapshot().unwrap();
         let stream = k
             .traverse(a, Direction::Forward, 2, 100, None, snap)
             .unwrap();
@@ -1067,21 +1166,21 @@ mod tests {
             let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
 
             // supersedes (neuer → älter): v3→v2, v2→v1.
-            assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
-            assert_eq!(k.supersedes_visible(v2, &cap).unwrap(), vec![v1]);
+            assert_eq!(k.supersedes_visible(v3, &cap, snap).unwrap(), vec![v2]);
+            assert_eq!(k.supersedes_visible(v2, &cap, snap).unwrap(), vec![v1]);
             // superseded-by (älter → neuer): v1→v2, v2→v3.
-            assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
-            assert_eq!(k.superseded_by_visible(v2, &cap).unwrap(), vec![v3]);
+            assert_eq!(k.superseded_by_visible(v1, &cap, snap).unwrap(), vec![v2]);
+            assert_eq!(k.superseded_by_visible(v2, &cap, snap).unwrap(), vec![v3]);
             // Das Älteste hat keine Vorgänger; das Neueste keine Nachfolger.
-            assert!(k.supersedes_visible(v1, &cap).unwrap().is_empty());
-            assert!(k.superseded_by_visible(v3, &cap).unwrap().is_empty());
+            assert!(k.supersedes_visible(v1, &cap, snap).unwrap().is_empty());
+            assert!(k.superseded_by_visible(v3, &cap, snap).unwrap().is_empty());
         }
         // Reopen: die Ersetzungs-Indizes sind aus dem Log rekonstruiert (§8.4).
         let k = open_kernel(dir.path());
         let snap = k.pin_snapshot().unwrap();
         let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
-        assert_eq!(k.supersedes_visible(v3, &cap).unwrap(), vec![v2]);
-        assert_eq!(k.superseded_by_visible(v1, &cap).unwrap(), vec![v2]);
+        assert_eq!(k.supersedes_visible(v3, &cap, snap).unwrap(), vec![v2]);
+        assert_eq!(k.superseded_by_visible(v1, &cap, snap).unwrap(), vec![v2]);
     }
 
     // ------------------------------------------------------------------------
@@ -1111,12 +1210,12 @@ mod tests {
         // Rechtloser Leser: das überholende (geheime) Daten VANISHt.
         let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         assert!(
-            k.superseded_by_visible(older, &denied).unwrap().is_empty(),
+            k.superseded_by_visible(older, &denied, snap).unwrap().is_empty(),
             "nicht-sichtbares überholendes Daten VANISHt (§11.3)"
         );
         // Mit dem Bereich wird es sichtbar.
         let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
-        assert_eq!(k.superseded_by_visible(older, &granted).unwrap(), vec![newer]);
+        assert_eq!(k.superseded_by_visible(older, &granted, snap).unwrap(), vec![newer]);
     }
 
     // ------------------------------------------------------------------------
@@ -1145,13 +1244,13 @@ mod tests {
         // Rechtloser Leser: nur der öffentliche Träger; der geheime VANISHt.
         let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         assert_eq!(
-            k.time_carriers_visible(stmt, &denied).unwrap(),
+            k.time_carriers_visible(stmt, &denied, snap).unwrap(),
             vec![public_carrier],
             "geheimer Träger VANISHt (§11.3)"
         );
         // Mit dem Bereich: beide.
         let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
-        let mut both = k.time_carriers_visible(stmt, &granted).unwrap();
+        let mut both = k.time_carriers_visible(stmt, &granted, snap).unwrap();
         both.sort_unstable();
         let mut expected = vec![public_carrier, secret_carrier];
         expected.sort_unstable();
@@ -1179,7 +1278,7 @@ mod tests {
         let snap = k.pin_snapshot().unwrap();
         let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         // Vom Platzhalter zum auflösenden echten Daten (gegatet).
-        let resolvers = k.placeholder_resolvers_visible(placeholder_id, &cap).unwrap();
+        let resolvers = k.placeholder_resolvers_visible(placeholder_id, &cap, snap).unwrap();
         let real_id = ContentId::of_datum(&Datum::leaf(b"echtes-ziel".to_vec()));
         assert_eq!(resolvers, vec![real_id], "Platzhalter → Auflöser erreichbar (§3.6)");
 
@@ -1217,8 +1316,8 @@ mod tests {
         // Der Lookup liefert je AUSSAGE GENAU ihre Träger — er kombiniert/ordnet die
         // beiden Zeit-Werte NICHT (kein „neuester gewinnt", kein Bereich). Es gibt
         // keinen Verb-Aufruf der Gestalt `active_at(time) -> the_one`.
-        assert_eq!(k.time_carriers_visible(stmt_early, &cap).unwrap(), vec![carrier_early]);
-        assert_eq!(k.time_carriers_visible(stmt_late, &cap).unwrap(), vec![carrier_late]);
+        assert_eq!(k.time_carriers_visible(stmt_early, &cap, snap).unwrap(), vec![carrier_early]);
+        assert_eq!(k.time_carriers_visible(stmt_late, &cap, snap).unwrap(), vec![carrier_late]);
 
         // Das Ergebnis ist eine Adress-sortierte Menge (deterministisch, §5.2/§1.4) —
         // ihre Reihenfolge spiegelt die ContentId-Adressen, NICHT die Zeit-Werte:
@@ -1274,16 +1373,16 @@ mod tests {
         // Rechtloser Leser: nur der öffentliche Repräsentant; der geheime VANISHt.
         let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         assert_eq!(
-            k.anchor_members_visible(anchor, &denied).unwrap(),
+            k.anchor_members_visible(anchor, &denied, snap).unwrap(),
             vec![public_rep],
             "geheimer Repräsentant VANISHt (§11.3)"
         );
         // Repräsentant→Anker (Gegenrichtung, §9.1).
-        assert_eq!(k.member_anchors_visible(public_rep, &denied).unwrap(), vec![anchor]);
+        assert_eq!(k.member_anchors_visible(public_rep, &denied, snap).unwrap(), vec![anchor]);
 
         // Mit dem Bereich: beide Repräsentanten.
         let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
-        let mut both = k.anchor_members_visible(anchor, &granted).unwrap();
+        let mut both = k.anchor_members_visible(anchor, &granted, snap).unwrap();
         both.sort_unstable();
         let mut expected = vec![public_rep, secret_rep];
         expected.sort_unstable();
@@ -1315,8 +1414,8 @@ mod tests {
         let snap = k.pin_snapshot().unwrap();
         let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         // Von a UND b aus auffindbar (beide Richtungen, §1.2).
-        assert_eq!(k.graded_identity_links_visible(a, &cap).unwrap(), vec![ident]);
-        assert_eq!(k.graded_identity_links_visible(b, &cap).unwrap(), vec![ident]);
+        assert_eq!(k.graded_identity_links_visible(a, &cap, snap).unwrap(), vec![ident]);
+        assert_eq!(k.graded_identity_links_visible(b, &cap, snap).unwrap(), vec![ident]);
 
         // Der Identitäts-Kontext ist über das Tor lesbar; seine Stärke + Konfidenz
         // sind GEHALTEN. Der Kernel VERGLEICHT die Konfidenz NICHT (er reicht nur die
@@ -1354,13 +1453,13 @@ mod tests {
         let snap = k.pin_snapshot().unwrap();
         let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         // Anfangs sichtbar.
-        assert_eq!(k.anchor_members_visible(anchor, &cap).unwrap(), vec![rep]);
+        assert_eq!(k.anchor_members_visible(anchor, &cap, snap).unwrap(), vec![rep]);
 
         // Verbergen (§9.5): der Repräsentant VANISHt aus der gegateten Projektion.
         k.append(&Datum::curation_hide_marker()).unwrap();
         k.append(&Datum::curation_hide(rep)).unwrap();
         assert!(
-            k.anchor_members_visible(anchor, &cap).unwrap().is_empty(),
+            k.anchor_members_visible(anchor, &cap, snap).unwrap().is_empty(),
             "verborgener Repräsentant VANISHt (§9.5/§11.3)"
         );
         // Append-only: das Daten bleibt durabel über das Tor lesbar (§7.1) — nur die
@@ -1374,7 +1473,7 @@ mod tests {
         k.append(&Datum::curation_unhide_marker()).unwrap();
         k.append(&Datum::curation_unhide(rep)).unwrap();
         assert_eq!(
-            k.anchor_members_visible(anchor, &cap).unwrap(),
+            k.anchor_members_visible(anchor, &cap, snap).unwrap(),
             vec![rep],
             "Aufheben macht den Repräsentanten wieder sichtbar (§9.5)"
         );
@@ -1416,7 +1515,7 @@ mod tests {
         // Der Kernel liefert BEIDE Repräsentanten (Adress-sortierte Menge) — er rankt
         // NICHT nach Grad und wählt KEINEN „Gewinner" (§9-Präambel/§1.4). Hätte er ein
         // Auflösungs-Verb, läge hier eine Auswahl; es existiert keines.
-        let mut members = k.anchor_members_visible(anchor, &cap).unwrap();
+        let mut members = k.anchor_members_visible(anchor, &cap, snap).unwrap();
         members.sort_unstable();
         let mut expected = vec![rep_high, rep_low];
         expected.sort_unstable();
@@ -1430,12 +1529,424 @@ mod tests {
         let ident = k
             .append(&Datum::graded_identity(a, b, IdentityStrength::Deckungsgleich, []))
             .unwrap();
+        // FRISCHER Snapshot nach den neuen Appends (Snapshot-Isolation, §13: ein W
+        // fixiert den Snapshot — nach dem Pin Angehängtes ist für das alte Token
+        // unsichtbar; wir pinnen daher neu).
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
         // Es gibt KEIN Verb `is_same(a, b) -> bool`/`confidence(a, b) -> f64`/
         // `winner(anchor) -> rep`; der einzige Pfad ist das rohe Link-Lesen.
-        assert_eq!(k.graded_identity_links_visible(a, &cap).unwrap(), vec![ident]);
+        assert_eq!(k.graded_identity_links_visible(a, &cap, snap).unwrap(), vec![ident]);
         // Die Stärke ist nur strukturell ablesbar (kein Vergleich/Rang, §1.4).
         let sealed = k.get_by_content_id(ident, &cap, snap).unwrap().unwrap();
         let decoded = strict_decode(open(&sealed, &cap).unwrap().canonical_bytes()).unwrap();
         assert_eq!(decoded.identity_strength(), Some(IdentityStrength::Deckungsgleich));
+    }
+
+    // ========================================================================
+    // Phase 5 — Atomarität (§13 Aktiv-Marker). Die §13-Sichtbarkeit ist in JEDEN
+    // Lesepfad eingewoben: ein INAKTIVER (durch einen noch nicht committeten Marker
+    // regierter) Konstituent wird über `get_by_content_id`, die Traversierung UND
+    // jeden gegateten Helfer NIE beobachtet (§13.2); der Marker-Commit flippt den
+    // ganzen Umbau ATOMAR gemeinsam sichtbar (§13.1). Orthogonal zum §11-Tor.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // §13: ein Mehr-Daten-Umbau ist über ALLE Lesepfade unsichtbar, bis sein
+    // Marker committet — danach atomar vollständig sichtbar. Gegateter Helfer:
+    // eine atomare Anker-Mitgliedschaft (Phase 4) wird gemeinsam freigegeben.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn restructuring_invisible_until_marker_then_atomically_visible() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // VORBEDINGUNG (aktiv, vor dem Umbau): ein Anker existiert bereits, ebenso die
+        // Marker-Atome, die der Umbau referenziert (geschlossene Verweise, §3.6). Diese
+        // sind UNBEDINGTE Einzel-Appends und damit sofort aktiv.
+        let class = k.append(&Datum::leaf(b"klasse".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor = k.append(&Datum::anchor([class])).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        let grade = k.append(&Datum::leaf(b"g".to_vec())).unwrap();
+        k.append(&Datum::membership_grade(grade)).unwrap();
+
+        // Der UMBAU (§13): zwei gemeinsam sichtbar werdende Daten — der
+        // Mitgliedschafts-Kontext und der ihn besitzende Repräsentant. Vorab ihre
+        // ContentIds berechnen (kein Schreiben).
+        let membership = Datum::membership(anchor, grade);
+        let membership_id = ContentId::of_datum(&membership);
+        let rep = Datum::node([membership_id]).unwrap();
+        let rep_id = ContentId::of_datum(&rep);
+
+        let cap_for = |snap| {
+            k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap()
+        };
+
+        // --- Phase 1: stagen (INAKTIV) ---------------------------------------
+        let handle = k.stage_restructuring(&[membership.clone(), rep.clone()]).unwrap();
+        assert_eq!(handle.constituent_ids(), &[membership_id, rep_id]);
+
+        let snap_staged = k.pin_snapshot().unwrap();
+        let cap_staged = cap_for(snap_staged);
+
+        // (a) get_by_content_id: beide Konstituenten VANISHen (ununterscheidbar von
+        //     „nicht vorhanden", §13.2/§11.3).
+        assert!(k.get_by_content_id(membership_id, &cap_staged, snap_staged).unwrap().is_none());
+        assert!(k.get_by_content_id(rep_id, &cap_staged, snap_staged).unwrap().is_none());
+
+        // (b) Traversierung: der Repräsentant erscheint NICHT als sichtbarer Knoten —
+        //     der gegatete Helfer liefert KEINE Mitglieder für den Anker.
+        assert!(
+            k.anchor_members_visible(anchor, &cap_staged, snap_staged).unwrap().is_empty(),
+            "inaktiver Repräsentant VANISHt aus dem gegateten Helfer (§13.2)"
+        );
+        // (c) Traversierung vom (aktiven) Anker rückwärts findet den inaktiven
+        //     Repräsentanten NICHT (Front-Stopp).
+        let p = TraversalParams {
+            start: anchor,
+            dir: Direction::Backward,
+            max_depth: 3,
+            max_nodes: 100,
+            edge_type_filter: None,
+        };
+        let staged_steps: Vec<_> = k
+            .traverse_with(p.clone(), &cap_staged, snap_staged, &CancelFlag::new())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            staged_steps.iter().all(|s| s.to != rep_id && s.to != membership_id),
+            "inaktive Konstituenten VANISHen aus der Traversierung (§13.2)"
+        );
+
+        // --- Phase 2: Marker committen (ATOMAR sichtbar) ---------------------
+        // Der Marker ist das bloße Aktiv-Marker-Atom (§13): die Konstituenten-Audit-
+        // Information trägt der LOG-Header (`constituent_range`), nicht das Marker-
+        // Daten — so erzeugt der Marker keine semantischen Kanten (er ist KEIN
+        // Repräsentant des Ankers).
+        let marker = Datum::active_marker();
+        let marker_id = k.commit_restructuring(handle, &marker).unwrap();
+
+        let snap_done = k.pin_snapshot().unwrap();
+        let cap_done = cap_for(snap_done);
+
+        // (a) get: BEIDE Konstituenten sind jetzt sichtbar (atomar gemeinsam, §13.1).
+        let m_sealed = k.get_by_content_id(membership_id, &cap_done, snap_done).unwrap();
+        let r_sealed = k.get_by_content_id(rep_id, &cap_done, snap_done).unwrap();
+        assert!(m_sealed.is_some() && r_sealed.is_some(), "Umbau atomar sichtbar (§13.1)");
+        assert!(open(&m_sealed.unwrap(), &cap_done).is_some());
+        assert!(open(&r_sealed.unwrap(), &cap_done).is_some());
+
+        // (b) der gegatete Anker-Helfer liefert nun den Repräsentanten.
+        assert_eq!(
+            k.anchor_members_visible(anchor, &cap_done, snap_done).unwrap(),
+            vec![rep_id],
+            "nach Marker: Mitgliedschaft gemeinsam sichtbar (§13.1)"
+        );
+        // (c) der Marker selbst ist ein unbedingtes, sichtbares Daten.
+        assert!(k.get_by_content_id(marker_id, &cap_done, snap_done).unwrap().is_some());
+    }
+
+    // ------------------------------------------------------------------------
+    // §13 SNAPSHOT-ISOLATION (ein W fixiert den Snapshot): ein VOR dem Marker-Commit
+    // gepinnter Token sieht den Umbau NIE — auch nicht, nachdem der Marker committet
+    // ist. Die §13-Aktiv-Sicht hängt am gepinnten Watermark des Tokens, NICHT am
+    // (vorangerückten) Live-Watermark. Nur ein FRISCH gepinnter Snapshot sieht den
+    // committeten Umbau. Das ist der Kern der Phase-5-Leser-Invariante.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn pinned_snapshot_does_not_see_restructuring_committed_after_pin() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Vorbedingung: ein Anker + Marker-Atome (unbedingt, sofort aktiv).
+        let class = k.append(&Datum::leaf(b"klasse".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor = k.append(&Datum::anchor([class])).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        let grade = k.append(&Datum::leaf(b"g".to_vec())).unwrap();
+        k.append(&Datum::membership_grade(grade)).unwrap();
+
+        // Der Umbau: Mitgliedschaft + Repräsentant, gemeinsam sichtbar werdend.
+        let membership = Datum::membership(anchor, grade);
+        let membership_id = ContentId::of_datum(&membership);
+        let rep = Datum::node([membership_id]).unwrap();
+        let rep_id = ContentId::of_datum(&rep);
+
+        // (1) Snapshot PINNEN, BEVOR der Umbau überhaupt gestaget/committet ist.
+        let snap_old = k.pin_snapshot().unwrap();
+        let cap_old = k.authorize(GrantedScopes::from_scope_ids([]), snap_old).unwrap();
+
+        // (2) Umbau VOLLSTÄNDIG stagen UND committen (Marker durabel) — NACH dem Pin.
+        let (_cids, _mid) = k
+            .append_restructuring(&[membership.clone(), rep.clone()], &Datum::active_marker())
+            .unwrap();
+
+        // (3) Mit dem ALTEN Token: der Umbau bleibt UNSICHTBAR (sein Watermark `W`
+        //     liegt vor dem Marker-Commit) — Snapshot-Isolation, ein W fixiert den
+        //     Snapshot. KEIN Re-Lesen des Live-Watermarks.
+        assert!(
+            k.get_by_content_id(membership_id, &cap_old, snap_old).unwrap().is_none(),
+            "alter Token sieht den nach dem Pin committeten Umbau NICHT (Snapshot-Isolation)"
+        );
+        assert!(
+            k.get_by_content_id(rep_id, &cap_old, snap_old).unwrap().is_none(),
+            "alter Token sieht den Repräsentanten NICHT"
+        );
+        assert!(
+            k.anchor_members_visible(anchor, &cap_old, snap_old).unwrap().is_empty(),
+            "gegateter Helfer am alten Snapshot sieht den Umbau NICHT"
+        );
+        // Auch die Traversierung am alten Token findet den Repräsentanten nicht.
+        let p = TraversalParams {
+            start: anchor,
+            dir: Direction::Backward,
+            max_depth: 3,
+            max_nodes: 100,
+            edge_type_filter: None,
+        };
+        let old_steps: Vec<_> = k
+            .traverse_with(p.clone(), &cap_old, snap_old, &CancelFlag::new())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            old_steps.iter().all(|s| s.to != rep_id && s.to != membership_id),
+            "alter Snapshot: Umbau VANISHt aus der Traversierung"
+        );
+
+        // (4) Ein FRISCH gepinnter Snapshot sieht den (jetzt durablen) Umbau.
+        let snap_new = k.pin_snapshot().unwrap();
+        let cap_new = k.authorize(GrantedScopes::from_scope_ids([]), snap_new).unwrap();
+        assert!(
+            k.get_by_content_id(membership_id, &cap_new, snap_new).unwrap().is_some(),
+            "frischer Snapshot sieht den committeten Umbau (§13.1)"
+        );
+        assert_eq!(
+            k.anchor_members_visible(anchor, &cap_new, snap_new).unwrap(),
+            vec![rep_id],
+            "frischer Snapshot: Mitgliedschaft gemeinsam sichtbar (§13.1)"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // §13 + §11 KOMPONIEREN (beide pre-resolution, orthogonal): ein Umbau, dessen
+    // Konstituent SOWOHL bereichs-beschränkt (out-of-scope) ALS AUCH inaktiv
+    // (Marker fehlt) ist, bleibt verborgen — und zwar:
+    //   - inaktiv  ⇒ verborgen für JEDEN (auch mit gewährtem Bereich),
+    //   - aktiv aber out-of-scope ⇒ verborgen ohne den Bereich (VANISH §11.3),
+    //   - aktiv UND in-scope ⇒ sichtbar.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn gate_and_section13_compose_out_of_scope_and_inactive_stays_hidden() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Vorbedingung: Bereich + Zugehörigkeits-Marker (unbedingt, sofort aktiv).
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        k.append(&Datum::area_membership_marker()).unwrap();
+        let membership = k.append(&Datum::area_membership(area)).unwrap();
+
+        // Der Umbau-Konstituent: ein bereichs-beschränktes Daten (besitzt den
+        // Zugehörigkeits-Kontext) — vorab ID berechnen.
+        let restricted = Datum::node([membership]).unwrap();
+        let restricted_id = ContentId::of_datum(&restricted);
+
+        // --- gestaget (INAKTIV) ---------------------------------------------
+        let handle = k.stage_restructuring(std::slice::from_ref(&restricted)).unwrap();
+        let snap = k.pin_snapshot().unwrap();
+        // Selbst MIT gewährtem Bereich bleibt es verborgen, weil es §13-inaktiv ist
+        // (§13 läuft NEBEN dem §11-Filter; inaktiv ⇒ unsichtbar, unabhängig vom Recht).
+        let cap_granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+        assert!(
+            k.get_by_content_id(restricted_id, &cap_granted, snap).unwrap().is_none(),
+            "inaktiv ⇒ verborgen, AUCH mit gewährtem Bereich (§13 ∧ §11)"
+        );
+        // Ohne den Bereich erst recht.
+        let cap_denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(k.get_by_content_id(restricted_id, &cap_denied, snap).unwrap().is_none());
+
+        // --- Marker committet (jetzt aktiv) ---------------------------------
+        let marker = Datum::active_marker();
+        k.commit_restructuring(handle, &marker).unwrap();
+        let snap2 = k.pin_snapshot().unwrap();
+
+        // Aktiv, aber OHNE den Bereich ⇒ weiterhin VANISH (§11.3 greift jetzt).
+        let cap_denied2 = k.authorize(GrantedScopes::from_scope_ids([]), snap2).unwrap();
+        assert!(
+            k.get_by_content_id(restricted_id, &cap_denied2, snap2).unwrap().is_none(),
+            "aktiv, aber out-of-scope ⇒ VANISH (§11.3)"
+        );
+        // Aktiv UND in-scope ⇒ endlich sichtbar (beide Prädikate erfüllt).
+        let cap_granted2 = k.authorize(GrantedScopes::from_scope_ids([area]), snap2).unwrap();
+        assert!(
+            k.get_by_content_id(restricted_id, &cap_granted2, snap2).unwrap().is_some(),
+            "aktiv ∧ in-scope ⇒ sichtbar (§13 ∧ §11 beide erfüllt)"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // §13 WIPE-&-REBUILD (§8.4): nach dem Verwerfen aller reinen Derivate und Neu-
+    // Bau aus dem Log ist die §13-Sichtbarkeit IDENTISCH rekonstruiert — der
+    // regierende Marker-Offset jedes Konstituenten kommt aus dem Record-Header.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn wipe_and_rebuild_reconstructs_section13_visibility_identically() {
+        let dir = tempdir().unwrap();
+
+        // Einen vollständigen Umbau (stage + commit) anlegen, dann nach Reopen die
+        // Sichtbarkeit prüfen (Reopen baut alle Derivate aus dem Log neu).
+        let (c1_id, c2_id, marker_id);
+        {
+            let k = open_kernel(dir.path());
+            let c1 = Datum::leaf(b"k13-a".to_vec());
+            let c2 = Datum::leaf(b"k13-b".to_vec());
+            c1_id = ContentId::of_datum(&c1);
+            c2_id = ContentId::of_datum(&c2);
+            let (cids, mid) = k
+                .append_restructuring(&[c1, c2], &Datum::active_marker())
+                .unwrap();
+            assert_eq!(cids, vec![c1_id, c2_id]);
+            marker_id = mid;
+
+            // Vor dem Reopen: alle drei sichtbar (Marker committet).
+            let snap = k.pin_snapshot().unwrap();
+            let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+            assert!(k.get_by_content_id(c1_id, &cap, snap).unwrap().is_some());
+            assert!(k.get_by_content_id(c2_id, &cap, snap).unwrap().is_some());
+            assert!(k.get_by_content_id(marker_id, &cap, snap).unwrap().is_some());
+        }
+
+        // Reopen: Dedup-Karte, governing_marker und Index werden VOLLSTÄNDIG aus dem
+        // Log rekonstruiert (§8.4). Die §13-Sichtbarkeit muss identisch sein.
+        let k = open_kernel(dir.path());
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert!(
+            k.get_by_content_id(c1_id, &cap, snap).unwrap().is_some(),
+            "Konstituent nach Wipe-&-Rebuild sichtbar (Marker durabel, §13/§8.4)"
+        );
+        assert!(k.get_by_content_id(c2_id, &cap, snap).unwrap().is_some());
+        assert!(k.get_by_content_id(marker_id, &cap, snap).unwrap().is_some());
+
+        // Auch ein expliziter Index-Wipe + Neu-Bau ändert die Sichtbarkeit nicht.
+        // (Die §13-Karte hängt am Record-Header, nicht am Kanten-Index — aber der
+        // Neu-Bau muss konsistent bleiben.)
+        let again = k.append(&Datum::leaf(b"k13-a".to_vec())).unwrap();
+        assert_eq!(again, c1_id, "Dedup-Treffer: Konstituent aus dem Log rekonstruiert (§5.3)");
+    }
+
+    // ------------------------------------------------------------------------
+    // §13: eine ATOMARE Anker-SPALTUNG (§9.4) gebaut auf Phase 4 — ein Repräsentant
+    // wird per Ersetzungs-Kontext (§6.3) zu einem NEUEN Anker re-verwiesen. Alle
+    // Konstituenten des Splits (neuer Anker, neue Mitgliedschaft, re-verwiesener
+    // Repräsentant, Ersetzungs-Kontext) sind GEMEINSAM unsichtbar, bis der Marker
+    // committet — danach atomar sichtbar. Der ALTE Anker/Repräsentant bleibt
+    // unverändert (append-only §7.1).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn atomic_anchor_split_is_jointly_invisible_until_marker() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Vorbedingung (aktiv): alter Anker + Repräsentant + benötigte Marker-Atome.
+        let class_old = k.append(&Datum::leaf(b"klasse-alt".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor_old = k.append(&Datum::anchor([class_old])).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        let grade = k.append(&Datum::leaf(b"g".to_vec())).unwrap();
+        k.append(&Datum::membership_grade(grade)).unwrap();
+        let m_old = k.append(&Datum::membership(anchor_old, grade)).unwrap();
+        let rep = k.append(&Datum::node([m_old]).unwrap()).unwrap();
+        k.append(&Datum::supersession_marker()).unwrap();
+
+        // Anfangs: der Repräsentant gehört dem ALTEN Anker an.
+        let snap0 = k.pin_snapshot().unwrap();
+        let cap0 = k.authorize(GrantedScopes::from_scope_ids([]), snap0).unwrap();
+        assert_eq!(k.anchor_members_visible(anchor_old, &cap0, snap0).unwrap(), vec![rep]);
+
+        // Der SPLIT als Mehr-Daten-Umbau (§9.4 + §6.3). Vorab alle ContentIds berechnen
+        // (geschlossene Verweise: class_new ist ein neues Blatt-Konstituent).
+        let class_new = Datum::leaf(b"klasse-neu".to_vec());
+        let class_new_id = ContentId::of_datum(&class_new);
+        let anchor_new = Datum::anchor([class_new_id]);
+        let anchor_new_id = ContentId::of_datum(&anchor_new);
+        let m_new = Datum::membership(anchor_new_id, grade);
+        let m_new_id = ContentId::of_datum(&m_new);
+        // Ersetzungs-Kontext: die NEUE Mitgliedschaft überholt die ALTE (§6.3).
+        let sup = Datum::supersedes(m_old);
+        let sup_id = ContentId::of_datum(&sup);
+        // Re-verwiesener Repräsentant: besitzt die neue Mitgliedschaft UND den
+        // Ersetzungs-Kontext (er überholt seine alte Mitgliedschaft, §9.4/§6.3).
+        let rep_new = Datum::node([m_new_id, sup_id]).unwrap();
+        let rep_new_id = ContentId::of_datum(&rep_new);
+
+        let constituents = vec![class_new, anchor_new, m_new, sup, rep_new];
+        let constituent_ids: Vec<ContentId> =
+            vec![class_new_id, anchor_new_id, m_new_id, sup_id, rep_new_id];
+
+        // --- stagen (INAKTIV): der ganze Split ist gemeinsam unsichtbar -------
+        let handle = k.stage_restructuring(&constituents).unwrap();
+        let snap_s = k.pin_snapshot().unwrap();
+        let cap_s = k.authorize(GrantedScopes::from_scope_ids([]), snap_s).unwrap();
+        // Kein Konstituent ist sichtbar.
+        for id in &constituent_ids {
+            assert!(
+                k.get_by_content_id(*id, &cap_s, snap_s).unwrap().is_none(),
+                "Split-Konstituent inaktiv ⇒ VANISH (§13.2)"
+            );
+        }
+        // Der NEUE Anker hat noch keine sichtbaren Mitglieder.
+        assert!(k.anchor_members_visible(anchor_new_id, &cap_s, snap_s).unwrap().is_empty());
+        // Der ALTE Anker ist UNVERÄNDERT: sein ursprünglicher Repräsentant ist
+        // weiterhin sichtbar (append-only §7.1; der Split mutiert nichts Bestehendes).
+        // (Der Anker-Index kann zusätzlich strukturelle Erwähnungen über den
+        // Ersetzungs-Kontext einschließen — eine Phase-4-Eigenschaft, von §13
+        // unabhängig; entscheidend ist hier, dass `rep` unverändert erhalten bleibt.)
+        assert!(
+            k.anchor_members_visible(anchor_old, &cap_s, snap_s).unwrap().contains(&rep),
+            "alter Repräsentant bleibt am alten Anker (append-only §7.1)"
+        );
+
+        // --- Marker committen: der ganze Split wird ATOMAR sichtbar ----------
+        // Bloßes Marker-Atom (§13): der Konstituenten-Bereich liegt im Log-Header, das
+        // Marker-Daten erzeugt keine semantischen Kanten.
+        let marker = Datum::active_marker();
+        k.commit_restructuring(handle, &marker).unwrap();
+        let snap_d = k.pin_snapshot().unwrap();
+        let cap_d = k.authorize(GrantedScopes::from_scope_ids([]), snap_d).unwrap();
+
+        // Alle Konstituenten sind nun sichtbar (atomar gemeinsam, §13.1).
+        for id in &constituent_ids {
+            assert!(
+                k.get_by_content_id(*id, &cap_d, snap_d).unwrap().is_some(),
+                "Split atomar sichtbar nach Marker (§13.1)"
+            );
+        }
+        // Der NEUE Anker hat jetzt den re-verwiesenen Repräsentanten als Mitglied.
+        assert_eq!(
+            k.anchor_members_visible(anchor_new_id, &cap_d, snap_d).unwrap(),
+            vec![rep_new_id],
+            "Repräsentant zum NEUEN Anker re-verwiesen (§9.4)"
+        );
+        // Der ALTE Anker (und der alte Repräsentant) bleiben unverändert bestehen
+        // (append-only §7.1; der Split LÖSCHT nichts) — `rep` ist weiterhin Mitglied.
+        assert!(
+            k.anchor_members_visible(anchor_old, &cap_d, snap_d).unwrap().contains(&rep),
+            "alter Repräsentant nach dem Split unverändert erhalten (append-only §7.1)"
+        );
+        // Die Ersetzungs-Relation ist beidseitig traversierbar (§6.3): die neue
+        // Mitgliedschaft überholt die alte.
+        assert_eq!(k.supersedes_visible(rep_new_id, &cap_d, snap_d).unwrap(), vec![m_old]);
+        assert_eq!(k.superseded_by_visible(m_old, &cap_d, snap_d).unwrap(), vec![rep_new_id]);
     }
 }

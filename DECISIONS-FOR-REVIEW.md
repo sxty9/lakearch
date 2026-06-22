@@ -898,3 +898,205 @@ bleibt auf `model.rs`/`store.rs`/`kernel.rs`/`gate.rs`/`traverse.rs`.
   rekonstruierbar; die zugrundeliegenden Kanten existieren ohnehin als gewöhnliche
   redb-Kanten). Verlagerung in einen persistenten Index ist eine billige spätere
   Änderung (Log = Wahrheit, §8.4).
+
+### Phase 5 — Atomarität / Aktiv-Marker-Sichtbarkeit (§13, Branch `kernel-impl`)
+
+Die **eine Linearisierungsstelle** für Atomarität **ohne Transaktions-Maschinerie**
+(§13.3): ein mehrere Daten berührender Umbau (Merge/Split §9, Berechtigungs-Änderung
+§11) wird durch **einen** abschließenden ACTIVE-Schreibvorgang — den **Marker-Record**
+— **gemeinsam** sichtbar; bis der Marker durabel ist, sind die Konstituenten
+**bedingt/INAKTIV** und Traversierung/Reads **ignorieren** sie (§13.1/§13.2). Die
+Mechanik ist **exakt** das adversariell verifizierte Plan-Design (Abschnitt
+„Aktiv-Marker-Sichtbarkeit (§13) — eine Linearisierungsstelle"); **kein** zweiter,
+frei laufender Epochenzähler. **Grün:** `cargo build --all-targets`, `cargo test`,
+`cargo clippy --all-targets -- -D warnings`.
+
+- **Marker-Record + bedingte Konstituenten (`log.rs`/`format.rs`), reservierte
+  Felder aktiviert:** der Marker ist selbst ein **gewöhnlicher Record**; er trägt im
+  reservierten `constituent_range`-Feld (Phase 0.5/1 reserviert) den **Anfangs-Offset
+  des ersten Konstituenten** (`[first_constituent_offset, marker_offset)`, Audit). Jeder
+  **bedingte** Konstituent referenziert im reservierten `marker_offset`-Feld den Offset
+  seines **regierenden Markers**. Ein **unbedingter** Record (gewöhnlicher Einzel-Append)
+  hat `marker_offset == 0` und **keinen** regierenden Marker. Die Header-Felder werden
+  über `RecordHeader::with_marker_offset`/`with_constituent_range` gesetzt — **kein**
+  Format-Bruch, das append-only-Framing bleibt unverändert (§K5.1).
+- **EIN Commit-Watermark `W` (`SegmentLog::committed_offset`), keine zweite Größe:**
+  `W` = Offset **nach** dem letzten durablen Batch-Footer = die **bestehende**
+  Group-Commit-/fsync-Grenze aus Phase 1 (**nicht** „letzter Marker"). Es gibt
+  **genau eine** Watermark. Sie wird **erst** veröffentlicht, **nachdem** der
+  Group-Commit-`fsync` durch ist **und** die zugehörigen Sekundär-Index-Einträge
+  durabel sind (Invariante **index-durable → publish-watermark**, geerbt aus dem
+  Store-Append-Pfad `log-fsync → index-commit → Watermark`, §8.4). **Memory-Ordering:**
+  der Append-Pfad ist der **eine** `&mut self`-Schreiber, über den `RwLock` in
+  `LakearchKernel` serialisiert; die Lock-Release/Acquire-Paare liefern die
+  Release/Acquire-Barriere des Plans (`committed_offset` ist daher ein einfaches `u64`,
+  **kein** `AtomicU64`). Die lock-freie MPSC-Variante mit explizitem Release-Store/
+  Acquire-Load ist eine spätere Phase (wie schon in Phase 1 vertagt) — die **Semantik**
+  („ein W fixiert den Snapshot") ist hier bereits voll erfüllt.
+- **Leser-Prädikat (`SegmentLog::visible`), reiner Offset-Vergleich (§1.4-sicher):**
+  ein Record an `offset` mit `marker_offset` ist gegenüber `W` sichtbar ⇔
+  `offset < W ∧ (marker_offset == 0 ∨ marker_offset < W)`. Striktes `<`, weil `W`
+  end-exklusiv ist (ein Record ist durabel, sobald `W` über sein Frame-Ende vorgerückt
+  ist). Index-Treffer werden **zusätzlich** über denselben offset-Vergleich gefiltert
+  (`is_active`/`visible_filter`/`get_sealed`) — ein **über-frischer** Index ist harmlos
+  (Treffer fällt am `offset < W`-Filter), ein **unter-frischer** ist per
+  index-durable→publish-watermark-Invariante ausgeschlossen.
+- **`activation_epoch` bleibt AUDIT-only, NICHT Sichtbarkeits-Autorität (§13):** das
+  reservierte Epochenfeld `E` ist **ausschließlich** Metadaten/Audit. Der
+  **Offset-Vergleich ist die ALLEINIGE Autorität**. Es wurde **kein** separater,
+  frei laufender Epochenzähler eingeführt (adversariell verlangt).
+- **Zweiphasiger Restructuring-Pfad (`store.rs`/`kernel.rs`):**
+  `stage_restructuring(constituents)` schreibt die Konstituenten als **bedingte,
+  noch inaktive** Records (jeder mit `marker_offset` = dem noch fehlenden
+  Marker-Offset) als **eigenen** Group-Commit-Batch und gibt einen `StagedHandle`;
+  während des Stagings gilt `W == marker_offset`, also `marker_offset < W` **falsch**
+  ⇒ die genuin neuen Konstituenten sind inaktiv. `commit_restructuring(handle, marker)`
+  schreibt den **unbedingten** Marker-Record (er endet den Batch, sein
+  `constituent_range` zeigt auf den ersten Konstituenten), `fsync`t und veröffentlicht
+  `W` über das Marker-Ende hinaus ⇒ **alle** Konstituenten flippen in **einem**
+  Linearisierungspunkt **gemeinsam** sichtbar. `append_restructuring(constituents,
+  marker)` ist der Ein-Aufruf-Bequempfad (stage + commit unmittelbar). Die
+  eingefrorene Phase-0.5-Trait-Form `Kernel::set_active_marker(&[ContentId])` bleibt
+  **unangetastet** (sie nimmt nur **schon vorhandene** IDs entgegen und kann die
+  bedingten Konstituenten nicht **stagen**); der konkrete `LakearchKernel`-Einstieg
+  verlangt die **Daten** selbst (analog `traverse_with` ↔ `traverse`).
+- **Crash mid-Umbau bleibt INERT (§13.3, Recovery):** wird der Marker nie durabel,
+  setzt die Recovery `W` auf den letzten voll-durablen Record (Footer-Autorität aus
+  Phase 1); die gestageten Konstituenten referenzieren `marker_offset > W` und sind
+  damit **für immer unsichtbar wie geschrieben** — der halb-vollzogene Umbau leckt
+  durch **keinen** Lesepfad. `rebuild_dedup_from_log` rekonstruiert die
+  `governing_marker`-Karte **reihenfolge-unabhängig** aus dem Log (ein **unbedingtes**
+  Vorkommen einer `ContentId` gewinnt immer → bereits geackte Daten bleiben aktiv,
+  §5.3/§7.1). Test `crash_before_marker_keeps_acked_datum_visible_only_new_
+  constituent_lost`.
+- **Orthogonal zum §11-Tor (§11.3), beide pre-resolution:** der §13-Aktiv-Filter
+  und der §11-Scope-Filter sind **getrennte, strukturelle Vor-Auflösungs-Prädikate**,
+  die **nebeneinander** laufen — ein Read wendet **beide** an (inaktiv ⇒ unsichtbar;
+  nicht-sichtbarer Scope ⇒ VANISH). `get_sealed`, `visible_filter`,
+  `is_visible_node` (Traversierung) und alle gegateten Helfer prüfen erst §13-Aktiv,
+  dann §11-Scope, beide über **dasselbe** gepinnte `W` (kein In-Kernel-TOCTOU).
+- **Gepinnter `SnapshotToken` durch ALLE Lesepfade durchgereicht:** `pin_snapshot`
+  fixiert das **aktuelle** `W`; jedes Lese-Verb liest `let w = snapshot.watermark();`
+  und reicht es hinab (`get_sealed(id, w)`, `visible_filter(.., w)`,
+  `run_traversal(.., w)`) statt das **Live**-Watermark erneut zu lesen — ein Leser mit
+  fixiertem Snapshot sieht einen nach dem Pin committeten Umbau **nicht**
+  (Snapshot-Isolation, Test `pinned_snapshot_does_not_see_restructuring_committed_
+  after_pin`). Damit ist die `api.rs`-Zusage „dasselbe S, kein In-Kernel-TOCTOU"
+  in der Implementierung **wahr**.
+- **`#![forbid(unsafe_code)]`** bleibt auf `store.rs`/`kernel.rs`/`gate.rs`/
+  `traverse.rs`/`model.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`
+  (genau ein `MmapOptions::map`, `#[deny(unsafe_op_in_unsafe_fn)]` + SAFETY-Kommentar).
+
+**Vertagte, nicht-blockierende Punkte (Phase 5+):**
+- **Lock-freie MPSC-/Group-Commit-Pipeline + `loom`:** wie in Phase 1 vertagt — der
+  Append ist heute der **eine** `&mut self`-Pfad über den `RwLock`; sobald die
+  lock-freie Producer-Queue gebaut wird, wird `committed_offset` ein `AtomicU64`
+  mit explizitem Release-Store/Acquire-Load und `loom`-Modellen (die Plan-Formulierung
+  „ein Release-Store / ein Acquire-Load" wörtlich). Die §13-**Semantik** ändert sich
+  dadurch **nicht** (Offset-Vergleich bleibt die alleinige Autorität).
+- **Cross-Shard-Umbau:** das `shard_id`-Feld bleibt reserviert/NULL (Phase 0.5);
+  der Marker referenziert Konstituenten-Offsets **innerhalb eines Bestands/Shards**.
+  Cross-Shard-Atomarität (oder ihr Verbot) fällt mit dem Sharding-Design nach dem
+  Benchmark-Gate (Plan „Scale-out reservieren").
+
+### Phase 5 — Review-Härtung (drei blockierende Findings behoben, Branch `kernel-impl`)
+
+Drei blockierende Phase-5-Review-Findings adressiert; **alle drei warranted ⇒ behoben**
+(keine Wegerklärung). **Grün:** `cargo build --all-targets`, `cargo test` (232 Tests:
+204 lib + 12 Kanonik + 11 Kernel-E2E + 5 Store), `cargo clippy --all-targets -- -D
+warnings`.
+
+- **Finding 1 (Atomarität §7.1/§5.3/§13) — ein geacktes UNBEDINGTES Daten konnte durch
+  einen späteren Umbau rückwirkend konditioniert (und bei Crash für immer unsichtbar)
+  werden.** Pfad: `append(X)` (unbedingt, aktiv, kein regierender Marker) →
+  `stage_restructuring(&[X, Y])` schrieb einen zweiten X-Record und stempelte X über
+  `governing_marker.entry(X).or_insert(marker_offset)` einen regierenden Marker auf;
+  während des Stagings ist `w == marker_offset`, also `marker_offset < w` **falsch** ⇒
+  X galt als **inaktiv** ⇒ VANISHt aus `get_*`/Traversierung. Beim Reopen reproduzierte
+  `rebuild_dedup_from_log` das (bedingtes Duplikat setzt einen Marker) ⇒ X für immer
+  unsichtbar, wenn der Marker nie committet (Crash mid-Umbau). Verstieß gegen §7.1
+  (geackter Append nie verloren) und §5.3 (Wert-Identität: inhaltsgleich = dasselbe,
+  bereits sichtbare Daten).
+  **Behebung (zwei koordinierte Stellen, beide Vorkommen der Regel „unbedingt
+  gewinnt"):**
+  1. `ContentStore::stage_restructuring`: vor dem Einfügen `let pre_existing =
+     self.dedup.contains_key(id)`; **nur** wenn `!pre_existing`, wird
+     `governing_marker.insert` gesetzt. Ein bereits (unbedingt) vorhandenes Daten bleibt
+     unbedingt/aktiv — ein Umbau konditioniert es nicht.
+  2. `ContentStore::rebuild_dedup_from_log`: eine `ContentId` mit **irgendeinem**
+     unbedingten Vorkommen (`marker_offset == 0`) wird unbedingt/aktiv geführt
+     **unabhängig** von Reihenfolge/bedingten Duplikaten — ein unbedingtes Vorkommen
+     `governing_marker.remove(id)` (und ein gemerktes `seen_unconditional`-Set
+     verhindert ein nachträgliches Aufstempeln). Reihenfolge-unabhängig (§Append-Order).
+  **Neue Regressions-Tests:** `staging_value_identical_constituent_does_not_retro_
+  condition_acked_datum` (X aktiv vor UND nach dem Marker, kein Marker aufgestempelt;
+  nur das genuin neue Y bis zum Marker inaktiv) und
+  `crash_before_marker_keeps_acked_datum_visible_only_new_constituent_lost` (Reopen nach
+  Crash: X sichtbar, nur Y für immer inaktiv §13.3).
+
+- **Finding 2 + 3 (Phase-5-Leser-Invariante §13.2/§8.4 — „ein W fixiert den Snapshot")
+  — der gepinnte `SnapshotToken` wurde von KEINEM Lesepfad genutzt; sie lasen das
+  LIVE-Watermark.** `pin_snapshot` reichte zwar das gepinnte `W` im `SnapshotToken`
+  heraus, doch `get_by_content_id`/`traverse`/`traverse_with`/alle `*_visible`-Helfer
+  verwarfen den Token (`let _ = snapshot;`) und die Store-/Traversier-Ebene leitete `W`
+  aus dem **Live** `store.current_watermark()` ab. Folge: ein Leser mit fixiertem
+  Snapshot, der zwei Reads um einen Marker-Commit klammert, sah die Konstituenten
+  inaktiv-dann-aktiv — der Umbau war aus Sicht eines festen Snapshots **nicht** atomar
+  (falsche Stabilität); zugleich war die im `api.rs`-Vertrag behauptete „kein In-Kernel-
+  TOCTOU, dasselbe S"-Eigenschaft in der Implementierung **unwahr**. (Der §13-Sicherheits-
+  Boden hielt — ein un-committeter Marker bedeutet `live W <= marker_offset` ⇒ inaktiv;
+  aber die *spezifizierte* gepinnte-W-Leser-Semantik fehlte.)
+  **Behebung (reiner Offset-Vergleich, §1.4-sicher, keine zweite Epoche):** das gepinnte
+  `W` wird durch alle Lesepfade **durchgereicht**, statt das Live-Watermark erneut zu
+  lesen:
+  - `ContentStore::get_sealed(id, w)` und `ContentStore::visible_filter(candidates,
+    granted, w)` nehmen `w` als Parameter (kein internes `self.current_watermark()` mehr).
+  - `traverse::run_traversal(store, cap, params, cancel, w)` erhält `w` vom Aufrufer (kein
+    internes `store.current_watermark()` mehr).
+  - In `kernel.rs` liest jedes Verb `let w = snapshot.watermark();` und reicht es hinab:
+    `get_by_content_id`, `traverse` (frozen-Form), `traverse_with` **und** alle acht
+    gegateten Helfer. Letztere tragen jetzt einen `snapshot: SnapshotToken`-Parameter
+    (analog zu `get_by_content_id`/`traverse_with`), sodass Tor (§11) und §13-Filter über
+    **dasselbe** S laufen.
+  - `SnapshotToken::watermark()` und `::at_watermark()` verlieren ihr stale
+    `#[allow(dead_code)]` (jetzt von den Lesepfaden bzw. `pin_snapshot` genutzt).
+  **Neuer Regressions-Test:** `pinned_snapshot_does_not_see_restructuring_committed_
+  after_pin` (Token VOR dem Umbau gepinnt → `append_restructuring` (stage+commit)
+  NACH dem Pin → mit dem ALTEN Token VANISHen die Konstituenten weiterhin über
+  `get_by_content_id`, den gegateten Anker-Helfer UND die Traversierung; erst ein FRISCH
+  gepinnter Snapshot sieht den committeten Umbau — Snapshot-Isolation).
+  **Test-Anpassung (kein Maskieren mehr):** zwei bestehende Tests
+  (`kernel_never_resolves_ranks_or_thresholds_identity`,
+  `trait_traverse_runs_over_unrestricted_data`) pinnten ihren Snapshot **vor** den
+  Appends, die sie dann lasen, und verließen sich damit auf das (zuvor fälschlich gelesene)
+  Live-Watermark. Sie pinnen den Snapshot jetzt **nach** den Appends (korrekte Snapshot-
+  Isolation) — die Lese-Erwartungen bleiben unverändert.
+  Keine zweite/freilaufende Epoche eingeführt; `activation_epoch` bleibt reines
+  Audit-Feld (Offset-Vergleich ist die alleinige Sichtbarkeits-Autorität, §13).
+
+### Phase 5 — Abschluss & Commit (Branch `kernel-impl`)
+
+Phase 5 ist **fertig und grün** und wird als ein Commit eingefroren (Politik: ein
+Commit pro grüner Phase). **Grün verifiziert** (`source $HOME/.cargo/env`, in
+`/home/nanu/lakearch`):
+- `cargo build --all-targets` — sauber (Exit 0).
+- `cargo test` — **232 Tests** grün: 204 lib-Unit + 12 Kanonik-Vektoren
+  (`tests/canonical_vectors.rs`) + 11 Kernel-E2E (`tests/kernel_e2e.rs`) + 5
+  Store-Integration (`tests/store_index.rs`); 0 fehlgeschlagen, 0 ignoriert
+  (+30 Tests gegenüber Phase 4: +29 lib, +1 E2E).
+- `cargo clippy --all-targets -- -D warnings` — sauber (Exit 0).
+
+Damit deckt Phase 5 die §13-Atomarität vollständig ab — **eine Linearisierungs-
+stelle, ohne Transaktions-Maschinerie**: Marker-Record + bedingte Konstituenten
+über die reservierten `constituent_range`/`marker_offset`-Felder, **das eine**
+Commit-Watermark `W` (= bestehende `committed_offset`-Group-Commit-Grenze), das
+reine Offset-Vergleichs-Leser-Prädikat (`offset < W ∧ (unbedingt ∨ marker_offset
+< W)`), die index-durable→publish-watermark-Invariante, der zweiphasige
+`stage`/`commit`-Pfad (+ Ein-Aufruf-`append_restructuring`), die Crash-Inertheit
+(nie-committeter Marker ⇒ Konstituenten für immer inaktiv), die Orthogonalität
+zum §11-Tor (beide pre-resolution) und der durch **alle** Lesepfade durchgereichte
+gepinnte `SnapshotToken` (Snapshot-Isolation, kein In-Kernel-TOCTOU). **Kein**
+zweiter Epochenzähler — `activation_epoch` bleibt Audit-only. Drei blockierende
+Review-Findings sind behoben (siehe Abschnitt „Phase 5 — Review-Härtung").
+`#![forbid(unsafe_code)]` bleibt auf `store.rs`/`kernel.rs`/`gate.rs`/`traverse.rs`/
+`model.rs`; das `unsafe` lebt allein im `mmap`-Leaf `log.rs`.

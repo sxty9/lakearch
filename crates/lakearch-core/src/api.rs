@@ -47,16 +47,20 @@ pub struct SnapshotToken {
 }
 
 impl SnapshotToken {
-    /// **Crate-interner** Konstruktor (ab Phase 5 aus der publizierten
-    /// Watermark). Kein öffentlicher Weg — ein Token ist nicht fälschbar.
-    #[allow(dead_code)] // Phase 5: pinnt der Kernel; jetzt nur Tests + Form.
+    /// **Crate-interner** Konstruktor aus der publizierten durablen Watermark `W`
+    /// ([`Kernel::pin_snapshot`]). Kein öffentlicher Weg — ein Token ist nicht
+    /// fälschbar.
     pub(crate) fn at_watermark(watermark: u64) -> Self {
         SnapshotToken { watermark }
     }
 
-    /// Crate-interne Sicht auf die gepinnte Watermark (Sichtbarkeits-Filter,
-    /// Phase 5). Bewusst nicht `pub`.
-    #[allow(dead_code)] // Phase 5: liest der Sichtbarkeits-Filter (§13).
+    /// Crate-interne Sicht auf die gepinnte Watermark `W` (§13). Jeder gegatete
+    /// Lesepfad (`get_by_content_id`, `traverse`/`traverse_with`, alle `*_visible`-
+    /// Helfer) liest sie und reicht sie als alleinige Sichtbarkeits-Autorität (§13)
+    /// in den §13-Aktiv-Filter — so fixiert **ein** Acquire-Load den Snapshot
+    /// (Snapshot-Isolation; das Live-Watermark wird **nicht** erneut gelesen).
+    /// Bewusst nicht `pub` (der Wert ist ein opakes Handle, kein öffentlich
+    /// rechenbarer Index, §1.4).
     pub(crate) fn watermark(&self) -> u64 {
         self.watermark
     }
