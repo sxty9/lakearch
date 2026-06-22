@@ -777,3 +777,124 @@ Platzhalter-Auflösung über die `pub`-API.
   strukturell, snapshot-agnostisch in dieser Phase).
 - **Anker / referenzielle Identität (§9):** Phase 4 — die Phase-3-Ersetzung (§6.3) ist
   davon getrennt (Fortschreibung §5.7 a vs. Repräsentantensystem §9).
+
+---
+
+## Phase 4 — Anker / Mitgliedschaft / gradierte Identität / Kuratierung (§9, §5.5)
+
+**Leitsatz (HARTE GRENZE).** Der Kernel **HÄLT** die Strukturen der Identitäts-
+Auflösung; er **löst sie nicht auf**. Es gibt **kein** Verb, das eine Identität
+auflöst, einen „gewinnenden" Repräsentanten wählt/rankt, eine Konfidenz vergleicht/
+schwellt oder destruktiv mergt (§9-Präambel/§1.4/§5.5). Bereitgestellt sind **nur**:
+Anker bauen, (gradierte) Mitgliedschaft anhängen, gradierten Identitäts-Kontext
+anhängen, Repräsentant⇆Anker- und Identitäts-Links traversieren, reversible
+Kuratierung (verbergen/aufheben/ersetzen), Split per Ersetzung (§6.3-Wiederverwendung).
+Die Grenze ist mit einem expliziten **Negativ-Test** eingefroren
+(`kernel_never_resolves_ranks_or_thresholds_identity`).
+
+**Eingefrorene Marker-Atome (`model.rs`, Blatt-Daten §2.1, distinkte Längen):**
+`lakearch/anchor/v1` (Anker-Rolle §9.1) · `lakearch/membership/v1` (Mitgliedschaft
+§9.3) · `lakearch/grade/v1` (Grad-Sub-Kontext §9.3) · fünf gradierte Stärke-Marker
+§5.5 (`lakearch/ident-deckungsgleich/v1`, `…-ergaenzt/v1`, `…-widerspricht-in/v1`,
+`…-verwandt-mit/v1`, `…-bekannt-verschieden/v1`) · drei Kuratierungs-Marker §9.5
+(`lakearch/curation/hide/v1`, `…/unhide/v1`, `…/replace/v1`). Alle paarweise distinkt
+(Negativ-Test friert es ein).
+
+**Modell (`model.rs`) — Konstruktoren + strukturelle Reader auf `Datum`:**
+- **Anker (§9.1):** `Datum::anchor(payload)` = Knoten `{ anchor_marker, …payload }` —
+  ein **gewöhnliches inhaltsadressiertes Daten** (§2.1) mit eigener `ContentId`;
+  `is_anchor()`. Der Anker wird **nie** aus einem Repräsentanten umgewandelt (§9.2).
+- **Mitgliedschaft (§9.1/§9.3):** `Datum::membership(anchor, grade_value)` = Knoten
+  `{ membership_marker, anchor, grade_ctx }`; der Repräsentant **besitzt** ihn und
+  verweist damit auf den **Anker** (§9.2). Grad-Sub-Kontext
+  `Datum::membership_grade(grade_value)` = `{ grade_marker, opaker Grad-Wert }`.
+  Reader `membership_anchor(resolve)` / `membership_grade_context(resolve)` /
+  `membership_grade_value()` — der Grad-**Wert** wird **nie** verglichen/geschwellt.
+- **Gradierte Identität (§5.5/§3.4):** `IdentityStrength` (bewusst **kein** `Ord`/
+  `PartialOrd` — eine Ordnung wäre §1.4-Verstoß). `Datum::graded_identity(a, b,
+  strength, sub_contexts)` = `{ strength_marker, a, b, …reifizierte Sub-Kontexte }`;
+  Sub-Kontexte tragen betroffene Attribute, **Konfidenz**, Urheber, Zeit (native
+  Reifikation §3.4). Reader `identity_strength()` / `is_graded_identity()` /
+  `graded_identity_contexts()` — der Kernel **hält** die Konfidenz, **vergleicht sie
+  nie**.
+- **Kuratierung (§9.5):** `curation_hide(target)` / `curation_unhide(target)` /
+  `curation_replace(replaced, replacement)` + Reader. Verbergen ist ein **reversibler
+  Lese-Filter** (Aufheben reversiert); Ersetzen ein reversibler Hinweis. **Nichts**
+  gelöscht (§7.1); physisches Entfernen ist Compaction (§15/Phase 8).
+
+**Indizes (`store.rs`) — reine, neu-baubare Derivate (§8.4), aus dem Log
+rekonstruiert (`rebuild_identity_and_curation_from_log`), in `rebuild_index_from_log`
+mit-gewipt/-neu-gebaut:**
+- **Anker-Mitgliedschaft beide Richtungen** `anchor_to_reps` / `rep_to_anchors`
+  (§9.1/§9.3; ein Repräsentant darf mehreren Ankern angehören).
+- **AnchorId ⇆ Anker-ContentId-Karte** `anchor_id_of` / `anchor_cid_of` (§12.4) —
+  der bestand-**lokale** Handle, **deterministisch** in Auftretens-Reihenfolge der
+  Anker im Log vergeben (neu-baubar identisch, Reopen-stabil). Der Anker bleibt ein
+  gewöhnliches inhaltsadressiertes Daten; der Handle ist **nie** seine alleinige
+  Identität.
+- **Gradierte-Identitäts-Links** `graded_identity_links: Daten → { Identitäts-Kontexte,
+  die es erwähnen }` (§5.5; von beiden erwähnten Daten auffindbar).
+- **Kuratierungs-Verbergen-Filter** `curation_hidden` — reversibel (Aufheben
+  reversiert), **reihenfolge-unabhängig** (Aufheben dominiert via Dedup-Lookup der
+  strukturell bestimmten Unhide-`ContentId`, analog Entzug §11.4). `visible_filter`
+  lässt verborgene Daten **VANISHen** (§9.5/§11.3), ohne etwas zu löschen.
+- **Designwahl** (wie schon Bereichs-/Zeit-/Ersetzungs-Index): bewusst **nicht** in
+  das redb-Schema gegossen — klein, schnell aus dem Log rekonstruierbar; die
+  zugrundeliegenden **Kanten** existieren ohnehin als gewöhnliche redb-Kanten.
+
+**Gegatete Lese-Helfer (`kernel.rs`, §11.3):** `anchor_members_visible` /
+`member_anchors_visible` / `graded_identity_links_visible` reichen **nur** sichtbare
+`ContentId`s heraus (VANISH; auch **kuratorisch verborgene** VANISHen), Inhalt nur
+über das Tor (§11.5), fail-closed (§11). `anchor_id_of` / `anchor_cid_of` lösen den
+lokalen Handle auf (kein Inhalts-Read). Keine Capability-tragende Trait-Form nötig —
+konkrete `LakearchKernel`-Methoden (wie Phase 2/3); die Phase-0.5-Trait-Form
+(`get_anchor_members`/`get_member_anchors`) bleibt unangetastet.
+
+**Neue Tests (Phase 4, alle grün):** Marker eingefroren + distinkt + dokumentierte
+Länge; Anker = gewöhnlicher inhaltsadressierter Knoten; Mitgliedschaft verweist
+strukturell Rep→Anker; gradierte Identität trägt Stärke + **gespeicherte, nie
+verglichene** Konfidenz; Kuratierung hide/unhide/replace reversibel; **Negativ-Garantie**
+„IdentityStrength hat keine Ordnung, der Kernel rankt nie". Store: Anker-Mitgliedschaft
+beide Richtungen + lokaler Handle deterministisch; Wipe-&-Rebuild + Reopen identisch
+(inkl. stabiler AnchorIds); gradierte Links neu-baubar; Verbergen→VANISH→Aufheben
+reversibel + reihenfolge-unabhängig; **Split (§9.4)** re-verweist einen Repräsentanten
+zu einem NEUEN Anker per Ersetzungs-Kontext (§6.3) — der **alte Anker (und alte
+Repräsentant) werden NICHT mutiert/gelöscht** (append-only §7.1), beide Richtungen +
+Ersetzungs-Relation neu-baubar (`split_re_references_representative_to_new_anchor_
+without_mutating_old`). Kernel: gegatete Anker-Mitgliedschaft + VANISH;
+gradierte Links halten Konfidenz ohne Vergleich; Verbergen ist reversibler Lese-Filter
+(Daten nicht gelöscht); **HARTE-GRENZE-Negativ-Test** (kein Auflösen/Ranken/Schwellen).
+
+### Phase 4 — Abschluss & Commit (Branch `kernel-impl`)
+
+Phase 4 ist **fertig und grün** und wird als ein Commit eingefroren (Politik: ein
+Commit pro grüner Phase). **Grün verifiziert** (`source $HOME/.cargo/env`, in
+`/home/nanu/lakearch`):
+- `cargo build --all-targets` — sauber.
+- `cargo test` — **202 Tests** grün: 175 lib-Unit + 12 Kanonik-Vektoren
+  (`tests/canonical_vectors.rs`) + 10 Kernel-E2E (`tests/kernel_e2e.rs`) + 5
+  Store-Integration (`tests/store_index.rs`); 0 fehlgeschlagen, 0 ignoriert
+  (+17 lib-Tests gegenüber Phase 3).
+- `cargo clippy --all-targets -- -D warnings` — sauber (Exit 0).
+
+Damit deckt Phase 4 die §9-/§5.5-Strukturen vollständig ab — **HALTEN, NIE
+auflösen**: Anker/Repräsentant + gradierte Mitgliedschaft, gradierte referenzielle
+Identität (Konfidenz gespeichert, nie verglichen), reversible Kuratierung
+(VANISH ohne Löschen), Split per Ersetzung (§6.3), die vier neu-baubaren in-memory
+Derivate (Anker-Mitgliedschaft beidseitig, AnchorId⇆Anker-Karte §12.4,
+gradierte-Identitäts-Links, Verbergen-Filter) mit Wipe-&-Rebuild- und Reopen-
+Gleichheit, und die gegateten VANISH-Helfer. Die **HARTE GRENZE** (kein
+Auflösen/Ranken/Schwellen/destruktives Mergen) ist mit dem expliziten Negativ-Test
+`kernel_never_resolves_ranks_or_thresholds_identity` und der bewusst ordnungslosen
+`IdentityStrength` (kein `Ord`/`PartialOrd`) eingefroren. `#![forbid(unsafe_code)]`
+bleibt auf `model.rs`/`store.rs`/`kernel.rs`/`gate.rs`/`traverse.rs`.
+
+**Vertagte, nicht-blockierende Punkte (Phase 4+):**
+- **§13-Aktiv-Marker / volle Snapshot-Epoche:** bleibt **Phase 5** — der
+  `SnapshotToken` pinnt weiterhin nur die committete Watermark `W`; die Anker-/
+  Identitäts-/Kuratierungs-Lookups sind davon unberührt (rein strukturell).
+- **Persistenz der neuen Derivate:** wie schon Bereichs-/Zeit-/Ersetzungs-Index
+  bewusst **nicht** in das redb-Schema gegossen (klein, schnell aus dem Log
+  rekonstruierbar; die zugrundeliegenden Kanten existieren ohnehin als gewöhnliche
+  redb-Kanten). Verlagerung in einen persistenten Index ist eine billige spätere
+  Änderung (Log = Wahrheit, §8.4).

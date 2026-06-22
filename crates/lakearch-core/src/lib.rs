@@ -98,6 +98,31 @@
 //!   `ContentId`s heraus (VANISH, §11.3; Inhalt nur übers Tor) und ordnen/vergleichen
 //!   Zeit **nie** — es gibt **kein** Verb, das nach Zeit ordnet oder „die aktive"
 //!   auswählt (§1.4/§6.4).
+//! - **Anker / referenzielle Identität (Phase 4, §9, §5.5)** auf [`Datum`]: der
+//!   **Anker** ([`Datum::anchor`], §9.1) ist ein gewöhnliches inhaltsadressiertes
+//!   Daten (die **Klasse**); Repräsentanten verweisen per **gradierter
+//!   Mitgliedschaft** ([`Datum::membership`], §9.3) auf den Anker (§9.2, nie auf
+//!   einen Repräsentanten). **Gradierte referenzielle Identität** ([`IdentityStrength`]/
+//!   [`Datum::graded_identity`], §5.5) ist eine Familie von Identitäts-Kontexten
+//!   verschiedener Stärke (*deckungsgleich, ergänzt, widerspricht-in, verwandt-mit,
+//!   bekannt-verschieden*), die reifizierte Sub-Kontexte (Attribute, **Konfidenz**,
+//!   Urheber, Zeit, §3.4) tragen. **Kuratierung** ([`Datum::curation_hide`]/
+//!   `curation_unhide`/`curation_replace`, §9.5) fügt nur **reversible** Kontexte
+//!   hinzu; ein verborgenes Daten VANISHt aus der gegateten Projektion, nichts wird
+//!   gelöscht (§7.1). Der Kernel **hält und traversiert** diese Strukturen — er
+//!   **berechnet/vergleicht/schwellt Konfidenz nie** und **entscheidet keine
+//!   Identität/Mitgliedschaft** (§9-Präambel/§1.4); ein expliziter Negativ-Test
+//!   friert diese Grenze ein.
+//! - **Anker-/Identitäts-/Kuratierungs-Indizes (Phase 4, §9/§5.5/§8.4)** im
+//!   [`ContentStore`]: weitere **reine, neu-baubare Derivate** — Anker-Mitgliedschaft
+//!   in beide Richtungen, die **bestand-lokale** AnchorId⇆Anker-Karte (§12.4,
+//!   deterministisch vergeben), gradierte-Identitäts-Links und der reversible
+//!   Kuratierungs-Verbergen-Filter. Aus dem Log rekonstruiert und in
+//!   `rebuild_index_from_log` mit-gewipt/-neu-gebaut (§8.4). Die **gegateten** Helfer
+//!   ([`LakearchKernel::anchor_members_visible`]/[`LakearchKernel::member_anchors_visible`]/
+//!   [`LakearchKernel::graded_identity_links_visible`]) reichen **nur sichtbare**
+//!   `ContentId`s heraus (VANISH inkl. kuratorisch verborgener; Inhalt nur übers Tor)
+//!   und ranken/werten **nie**.
 
 mod model;
 mod serialize;
@@ -125,7 +150,7 @@ pub use id::{AnchorId, ContentId, DOMAIN_TAG_V1};
 pub use index::{Edge, EdgeIndex, RedbEdgeIndex};
 pub use kernel::{KernelMetrics, LakearchKernel};
 pub use log::{LogMetrics, LoggedRecord, SegmentLog};
-pub use model::Datum;
+pub use model::{Datum, IdentityStrength};
 pub use serialize::{canonical_cbor, strict_decode};
 pub use store::{ContentStore, StoreMetrics};
 pub use traverse::{CancelFlag, TraversalParams};

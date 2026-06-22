@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::KernelError;
 use crate::gate::SealedRecord;
-use crate::id::ContentId;
+use crate::id::{AnchorId, ContentId};
 use crate::index::{Edge, EdgeIndex};
 use crate::log::SegmentLog;
 use crate::model::Datum;
@@ -127,6 +127,52 @@ pub struct ContentStore<I: EdgeIndex> {
     /// — *superseded-by* (älter → neuer). Damit ist die Ersetzungs-Relation in
     /// **beide** Richtungen traversierbar (§1.2). Reines, neu-baubares Derivat (§8.4).
     superseded_by: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Anker-Mitgliedschafts-Index — Anker→Repräsentanten** (§9.1/§9.3):
+    /// `Anker-ContentId → { Repräsentanten, die per Mitgliedschafts-Kontext auf ihn
+    /// verweisen }`. Ein Repräsentant R verweist auf den Anker A, wenn R einen
+    /// **Mitgliedschafts-Kontext** ([`Datum::membership`]) besitzt, dessen Anker A ist
+    /// (§9.2: anderes verweist auf den Anker, nie auf einen Repräsentanten). Reines,
+    /// neu-baubares Derivat (§8.4). Der Kernel **entscheidet keine Mitgliedschaft**
+    /// (§9-Präambel) — er hält nur die Kante.
+    anchor_to_reps: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Anker-Mitgliedschafts-Index — Repräsentant→Anker** (§9.1/§9.3):
+    /// die Umkehrung von [`anchor_to_reps`](ContentStore::anchor_to_reps); ein
+    /// Repräsentant darf mehreren Ankern angehören (§9.1). So ist die
+    /// Mitgliedschaft in **beide** Richtungen traversierbar (§1.2). Reines,
+    /// neu-baubares Derivat (§8.4).
+    rep_to_anchors: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **AnchorId ⇆ Anker-ContentId-Karte** (§9.1/§12.4): der bestand-
+    /// **lokale** Auflösungs-Handle [`AnchorId`] zu seiner bestand-globalen
+    /// Anker-`ContentId`. Der Anker ist ein gewöhnliches inhaltsadressiertes Daten
+    /// (§2.1); die [`AnchorId`] ist **nur** sein lokaler Handle, **nie** seine
+    /// alleinige Identität (§12.4). Deterministisch und neu-baubar: AnchorIds werden
+    /// in der **Reihenfolge des ersten Auftretens** der Anker im Log vergeben (ein
+    /// Neu-Bau aus demselben Log vergibt dieselben Handles). Reines Derivat (§8.4).
+    anchor_id_of: HashMap<ContentId, AnchorId>,
+    /// Die Umkehrung von [`anchor_id_of`](ContentStore::anchor_id_of):
+    /// `AnchorId → Anker-ContentId` (§12.4-Versöhnung). Reines, neu-baubares Derivat.
+    anchor_cid_of: HashMap<AnchorId, ContentId>,
+    /// Laufender Zähler für die nächste zu vergebende [`AnchorId`] (bestand-lokal,
+    /// §9.1). Wird beim Neu-Bau aus dem Log zurückgesetzt, sodass die Vergabe
+    /// deterministisch bleibt.
+    next_anchor_id: u128,
+    /// In-memory **Gradierte-Identitäts-Link-Index** (§5.5): `Daten-ContentId →
+    /// { gradierte Identitäts-Kontext-IDs, die dieses Daten erwähnen }`. Ein
+    /// gradierter Identitäts-Kontext ([`Datum::graded_identity`]) erwähnt **zwei**
+    /// Daten; dieser Index findet — von einem Daten aus — alle Identitäts-Kontexte,
+    /// die es betreffen (beide Richtungen, §1.2). Reines, neu-baubares Derivat (§8.4).
+    /// Der Kernel **vergleicht/schwellt Konfidenz nie** (§1.4/§5.5) — er hält nur die
+    /// Links.
+    graded_identity_links: HashMap<ContentId, Vec<ContentId>>,
+    /// In-memory **Kuratierungs-Verbergen-Filter** (§9.5): die `ContentId`s der
+    /// Daten, die ein **Verbergen**-Kontext ([`Datum::curation_hide`]) benennt und
+    /// die **nicht** durch ein späteres **Aufheben** ([`Datum::curation_unhide`])
+    /// wieder sichtbar gemacht wurden. Ein **reversibler** Lese-Seiten-Filter (analog
+    /// zum Bereichs-Filter, §11.3): ein hier enthaltenes Daten **VANISHt** aus der
+    /// gegateten Projektion. Es wird **nichts** gelöscht (§7.1) — Verbergen und
+    /// Aufheben sind beide append-only Kontexte; physisches Entfernen ist Compaction
+    /// (§15/Phase 8). Reines, neu-baubares Derivat (§8.4).
+    curation_hidden: HashSet<ContentId>,
     /// Betriebs-Zähler (§Betrieb).
     metrics: StoreMetrics,
     /// **Fail-closed-Zähler** als Atomic (§11): er wird auch auf `&self`-Lese-/
@@ -150,6 +196,13 @@ impl<I: EdgeIndex> ContentStore<I> {
             time_carriers: HashMap::new(),
             supersedes: HashMap::new(),
             superseded_by: HashMap::new(),
+            anchor_to_reps: HashMap::new(),
+            rep_to_anchors: HashMap::new(),
+            anchor_id_of: HashMap::new(),
+            anchor_cid_of: HashMap::new(),
+            next_anchor_id: 0,
+            graded_identity_links: HashMap::new(),
+            curation_hidden: HashSet::new(),
             metrics: StoreMetrics::default(),
             fail_closed: AtomicU64::new(0),
         };
@@ -157,6 +210,7 @@ impl<I: EdgeIndex> ContentStore<I> {
         store.rebuild_areas_from_log()?;
         store.rebuild_permissions_from_log()?;
         store.rebuild_time_and_supersession_from_log()?;
+        store.rebuild_identity_and_curation_from_log()?;
         store.reconcile_index_with_log()?;
         Ok(store)
     }
@@ -208,6 +262,9 @@ impl<I: EdgeIndex> ContentStore<I> {
         self.index_permission_or_revocation_of(id, datum)?;
         // Zeit-Aussage-Mitgliedschafts- und Ersetzungs-Index (§6.1–§6.3) nachziehen.
         self.index_time_and_supersession_of(id, datum)?;
+        // Anker-/Mitgliedschafts-/Gradierte-Identitäts-/Kuratierungs-Index
+        // (§9.1/§9.3/§5.5/§9.5) nachziehen.
+        self.index_identity_and_curation_of(id, datum)?;
 
         Ok(id)
     }
@@ -486,6 +543,12 @@ impl<I: EdgeIndex> ContentStore<I> {
             if !self.contains(id) {
                 continue;
             }
+            // Kuratierung (§9.5): ein **verborgenes** Daten VANISHt ebenfalls aus der
+            // gegateten Projektion (reversibler Lese-Filter, ununterscheidbar von
+            // „existiert nicht", §9.5/§11.3) — nichts gelöscht (§7.1).
+            if self.is_curation_hidden(id) {
+                continue;
+            }
             // Fail-closed (§11): Bereiche gegen die durable Wahrheit geprüft.
             let areas = self.areas_of_checked(id)?;
             if crate::gate::is_visible(&areas, granted) {
@@ -574,10 +637,12 @@ impl<I: EdgeIndex> ContentStore<I> {
         // zurück (Mechanik-Zähler, §1.4) — wir vermerken die neu committeten Kanten.
         self.metrics.edge_count = self.metrics.edge_count.saturating_add(edges.len() as u64);
         // Auch die in-memory Derivate verwerfen und aus dem Log neu bauen (§8.4):
-        // Bereichs-, Berechtigungs-/Entzugs-, Zeit-Aussage- und Ersetzungs-Index.
+        // Bereichs-, Berechtigungs-/Entzugs-, Zeit-Aussage-, Ersetzungs-, Anker-/
+        // Mitgliedschafts-, Gradierte-Identitäts- und Kuratierungs-Index.
         self.rebuild_areas_from_log()?;
         self.rebuild_permissions_from_log()?;
         self.rebuild_time_and_supersession_from_log()?;
+        self.rebuild_identity_and_curation_from_log()?;
         Ok(())
     }
 
@@ -795,6 +860,217 @@ impl<I: EdgeIndex> ContentStore<I> {
         Ok(())
     }
 
+    /// Baut den **Anker-/Mitgliedschafts-Index**, die **AnchorId-Karte**, den
+    /// **Gradierte-Identitäts-Link-Index** und den **Kuratierungs-Verbergen-Filter**
+    /// (§9.1/§9.3/§5.5/§9.5) vollständig aus dem Log neu (§8.4: Log = Wahrheit).
+    /// Idempotent. Setzt voraus, dass die Dedup-Karte bereits gebaut ist (sie löst
+    /// die besessenen Kontexte zu deren Inhalt auf). Die AnchorIds werden in der
+    /// **Reihenfolge des ersten Auftretens** der Anker im Log vergeben — daher ist
+    /// die Vergabe deterministisch und neu-baubar (§12.4).
+    fn rebuild_identity_and_curation_from_log(&mut self) -> Result<(), KernelError> {
+        self.anchor_to_reps.clear();
+        self.rep_to_anchors.clear();
+        self.anchor_id_of.clear();
+        self.anchor_cid_of.clear();
+        self.next_anchor_id = 0;
+        self.graded_identity_links.clear();
+        self.curation_hidden.clear();
+        let records = self.log.read_all()?;
+        for rec in &records {
+            let datum = strict_decode(&rec.payload)?;
+            let id = ContentId::of_datum(&datum);
+            self.index_identity_and_curation_of(id, &datum)?;
+        }
+        Ok(())
+    }
+
+    /// Trägt **Anker** (§9.1), **Mitgliedschaft** (§9.3), **gradierte Identität**
+    /// (§5.5) und **Kuratierung** (§9.5) eines Daten `id` (mit Inhalt `datum`) in die
+    /// jeweiligen Indizes ein — rein **mechanisch** (§1.4):
+    ///
+    /// - Ist `datum` ein **Anker** ([`Datum::is_anchor`]), erhält es einen bestand-
+    ///   **lokalen** [`AnchorId`]-Handle (in Auftretens-Reihenfolge vergeben, §12.4).
+    /// - Besitzt `datum` einen **Mitgliedschafts-Kontext**, verweist es als
+    ///   Repräsentant auf den darin benannten **Anker** (§9.2) → `anchor_to_reps`
+    ///   und `rep_to_anchors` (beide Richtungen, §1.2).
+    /// - Ist `datum` ein **gradierter Identitäts-Kontext** ([`Datum::is_graded_identity`]),
+    ///   wird er von jedem darin erwähnten Daten aus auffindbar gemacht
+    ///   (`graded_identity_links`, §5.5).
+    /// - Ist `datum` ein **Verbergen**-/**Aufheben**-Kuratierungs-Kontext (§9.5),
+    ///   wird der Lese-Filter [`curation_hidden`](ContentStore::curation_hidden)
+    ///   gesetzt bzw. **reversiert**.
+    ///
+    /// Ein noch nicht vorhandener besessener Kontext (Geschlossenheit erzwingt die
+    /// schreibende Schicht, §3.6/§7.2) wird übersprungen — der Kernel **validiert
+    /// nicht** (§1.4). Der Kernel **entscheidet keine Identität/Mitgliedschaft** und
+    /// **wertet/schwellt Konfidenz nicht** (§9-Präambel/§5.5) — er hält und verknüpft
+    /// nur (§1.2/§1.3).
+    fn index_identity_and_curation_of(
+        &mut self,
+        id: ContentId,
+        datum: &Datum,
+    ) -> Result<(), KernelError> {
+        // Anker (§9.1): bestand-lokalen Handle vergeben (idempotent, deterministisch).
+        if datum.is_anchor() {
+            self.ensure_anchor_id(id);
+        }
+
+        // Verbergen/Aufheben (§9.5): reversibler Lese-Filter. Ein Verbergen-Kontext
+        // setzt das Ziel verborgen, ein Aufheben reversiert es. Da der Index aus dem
+        // gesamten Log neu gebaut wird, ist die Endmenge unabhängig von der
+        // Append-Reihenfolge **nicht** wohldefiniert, wenn beide vorkommen; daher
+        // wird das Verbergen über die **Existenz eines aufhebenden Kontextes** im
+        // Snapshot reversiert (struktur-aktiv-im-Snapshot, analog zum Entzug §11.4).
+        // Wir sammeln zuerst alle Ziele; die Reversion erfolgt nach dem Sammeln über
+        // `recompute_curation_hidden` ist hier nicht nötig — wir tragen Verbergen ein
+        // und entfernen bei einem Aufheben. Reihenfolge-Unabhängigkeit stellt der
+        // Neu-Bau-Pfad sicher (s. u.).
+        if let Some(target) = datum.curation_hide_target() {
+            // Nur verbergen, wenn KEIN Aufheben-Kontext im Snapshot existiert.
+            if !self.has_unhide_for(target)? {
+                self.curation_hidden.insert(target);
+            }
+        }
+        if let Some(target) = datum.curation_unhide_target() {
+            // Ein Aufheben reversiert ein Verbergen (§9.5) — append-only, nichts
+            // gelöscht (§7.1). Künftige/vorhandene Verbergen für `target` greifen
+            // nicht mehr.
+            self.curation_hidden.remove(&target);
+        }
+
+        // Gradierter Identitäts-Kontext (§5.5): von jedem erwähnten Daten auffindbar.
+        if datum.is_graded_identity() {
+            if let Some(mentioned) = datum.graded_identity_contexts() {
+                for d in mentioned {
+                    push_sorted_dedup(self.graded_identity_links.entry(d).or_default(), id);
+                }
+            }
+        }
+
+        // Mitgliedschaft (§9.1/§9.3): `id` ist Repräsentant, verweist auf den Anker.
+        // Der Mitgliedschafts-Kontext ist ein **besessener** Kontext von `id`; sein
+        // Anker wird über den `resolve`-Closure aus dem Store gelesen.
+        let owns = match datum.owns() {
+            Some(o) => o,
+            None => return Ok(()), // Blatt: keine Mitgliedschaft.
+        };
+        for ctx_id in owns {
+            let bytes = match self.get_canonical_bytes(*ctx_id)? {
+                Some(b) => b,
+                None => continue, // §3.6 Schreibschicht; keine Wertung (§1.4).
+            };
+            let ctx = strict_decode(&bytes)?;
+            // Den Anker eines Mitgliedschafts-Kontextes ablesen; der Resolve-Closure
+            // löst den Grad-Sub-Kontext auf (um Anker vs. Grad zu unterscheiden).
+            let mut read_err: Option<KernelError> = None;
+            let resolve = |sub: ContentId| -> Option<Datum> {
+                match self.get_canonical_bytes(sub) {
+                    Ok(Some(b)) => match strict_decode(&b) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            read_err = Some(e);
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(e) => {
+                        read_err = Some(e);
+                        None
+                    }
+                }
+            };
+            let anchor = ctx.membership_anchor(resolve);
+            if let Some(e) = read_err {
+                return Err(e);
+            }
+            if let Some(anchor) = anchor {
+                push_sorted_dedup(self.anchor_to_reps.entry(anchor).or_default(), id);
+                push_sorted_dedup(self.rep_to_anchors.entry(id).or_default(), anchor);
+                // Der Anker ist ein gewöhnliches Daten (§2.1). Sein bestand-lokaler
+                // [`AnchorId`]-Handle wird **ausschließlich** an seinem **eigenen**
+                // Anker-Record vergeben (s. `is_anchor()`-Zweig oben) — niemals von
+                // der Mitgliedschaftsseite. Sonst hinge die Vergabe-Reihenfolge davon
+                // ab, ob das Anker-Daten beim inkrementellen Append schon dedup-
+                // präsent war (Mitgliedschaft kann es per §3.6 vorzeitig benennen),
+                // was inkrementell und beim Neu-Bau **divergierende** Handles erzeugte
+                // und §8.4/§12.4 (stabiles, neu-baubares Derivat) bräche. Ein nur per
+                // Mitgliedschaft benannter Anker ohne eigenes Anker-Daten erhält daher
+                // bewusst `None` (treuer zu §9.1: der Anker ist ein reales Daten).
+            }
+        }
+        Ok(())
+    }
+
+    /// `true`, wenn im Log ein **Aufheben**-Kuratierungs-Kontext
+    /// ([`Datum::curation_unhide`]) für `target` existiert (§9.5). Reines
+    /// strukturelles Matching (§1.3): die `ContentId` des Aufheben-Kontextes ist
+    /// strukturell bestimmt, also genügt ein Dedup-Lookup — **kein** Log-Scan.
+    fn has_unhide_for(&self, target: ContentId) -> Result<bool, KernelError> {
+        let unhide_id = ContentId::of_datum(&Datum::curation_unhide(target));
+        Ok(self.contains(unhide_id))
+    }
+
+    /// Sichert dem Anker `anchor` einen bestand-**lokalen** [`AnchorId`]-Handle
+    /// (§9.1/§12.4) — idempotent: existiert er schon, bleibt er. Neue Handles werden
+    /// **monoton in Auftretens-Reihenfolge** vergeben (deterministisch/neu-baubar).
+    /// Der Anker bleibt ein gewöhnliches inhaltsadressiertes Daten; der Handle ist
+    /// **nie** seine alleinige Identität (§12.4).
+    fn ensure_anchor_id(&mut self, anchor: ContentId) {
+        if self.anchor_id_of.contains_key(&anchor) {
+            return;
+        }
+        let aid = AnchorId::new(self.next_anchor_id);
+        self.next_anchor_id = self.next_anchor_id.saturating_add(1);
+        self.anchor_id_of.insert(anchor, aid);
+        self.anchor_cid_of.insert(aid, anchor);
+    }
+
+    /// Die **Repräsentanten eines Ankers** (§9.1/§9.3) — *Anker → Repräsentanten*:
+    /// die Daten, die per Mitgliedschafts-Kontext auf `anchor` verweisen. Owned,
+    /// aufsteigend in 32-Byte-`ContentId`-Order (kein Wert-Sort §1.4). Reines
+    /// strukturelles Lesen (§1.3); der Kernel **entscheidet keine Mitgliedschaft**
+    /// (§9-Präambel). **Ungated** (`pub(crate)`): die Sichtbarkeit (VANISH) setzt die
+    /// gegatete Kernel-Schicht durch.
+    pub(crate) fn anchor_members_of(&self, anchor: ContentId) -> Vec<ContentId> {
+        self.anchor_to_reps.get(&anchor).cloned().unwrap_or_default()
+    }
+
+    /// Die **Anker eines Repräsentanten** (§9.1) — *Repräsentant → Anker*: die Anker,
+    /// denen `member` per Mitgliedschafts-Kontext angehört (ein Daten darf mehreren
+    /// angehören, §9.1). Owned, aufsteigend (kein Wert-Sort §1.4). **Ungated**.
+    pub(crate) fn member_anchors_of(&self, member: ContentId) -> Vec<ContentId> {
+        self.rep_to_anchors.get(&member).cloned().unwrap_or_default()
+    }
+
+    /// Der bestand-**lokale** [`AnchorId`]-Handle eines Anker-Daten (§9.1/§12.4),
+    /// falls vergeben; sonst `None`. Reine Karten-Auflösung — der Anker ist ein
+    /// gewöhnliches inhaltsadressiertes Daten (§2.1).
+    pub fn anchor_id_of(&self, anchor: ContentId) -> Option<AnchorId> {
+        self.anchor_id_of.get(&anchor).copied()
+    }
+
+    /// Die Anker-`ContentId` zu einem bestand-lokalen [`AnchorId`]-Handle (§12.4),
+    /// falls vergeben; sonst `None`. Umkehrung von
+    /// [`anchor_id_of`](ContentStore::anchor_id_of).
+    pub fn anchor_cid_of(&self, anchor_id: AnchorId) -> Option<ContentId> {
+        self.anchor_cid_of.get(&anchor_id).copied()
+    }
+
+    /// Die **gradierten Identitäts-Kontexte, die `datum` erwähnen** (§5.5) — owned,
+    /// aufsteigend (kein Wert-Sort §1.4). Reines strukturelles Lesen (§1.3); der
+    /// Kernel **vergleicht/schwellt Konfidenz nie** (§1.4/§5.5). **Ungated**.
+    pub(crate) fn graded_identity_links_of(&self, datum: ContentId) -> Vec<ContentId> {
+        self.graded_identity_links.get(&datum).cloned().unwrap_or_default()
+    }
+
+    /// `true`, wenn `id` durch einen **Verbergen**-Kuratierungs-Kontext (§9.5) für
+    /// die **Leseseite** verborgen **und nicht** wieder aufgehoben ist. Reversibler
+    /// struktureller Lese-Filter (analog zum Bereichs-Filter, §11.3); es wird
+    /// **nichts** gelöscht (§7.1). Reines Mengen-Matching (§1.3).
+    pub fn is_curation_hidden(&self, id: ContentId) -> bool {
+        self.curation_hidden.contains(&id)
+    }
+
     /// **Versöhnt** den Index mit dem durablen Log-Tail (§8.4-Recovery-
     /// Reconciliation). Watermark `W` vs. committed Log-Offset `T`:
     /// - `W == T` ⇒ in sync, nichts zu tun.
@@ -863,6 +1139,7 @@ fn edges_of(owner: ContentId, datum: &Datum) -> Vec<Edge> {
 mod tests {
     use super::*;
     use crate::index::RedbEdgeIndex;
+    use crate::model::IdentityStrength;
     use tempfile::tempdir;
 
     /// Baut einen frischen Store (Log + redb-Index) in `dir`.
@@ -1510,5 +1787,349 @@ mod tests {
         assert_eq!(store.time_carriers_of(rec_stmt), vec![carrier]);
         assert_eq!(store.supersedes_of(newer), vec![older]);
         assert_eq!(store.superseded_by_of(older), vec![newer]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Anker / Mitgliedschaft (§9.1/§9.3): ein Repräsentant verweist per
+    // Mitgliedschafts-Kontext auf den ANKER; der Anker-Index ist in BEIDE
+    // Richtungen traversierbar (§1.2). Ein Repräsentant darf mehreren Ankern
+    // angehören (§9.1). Der AnchorId-Handle (§12.4) ist deterministisch vergeben.
+    // ------------------------------------------------------------------------
+
+    /// Hängt einen Anker + die nötigen Marker an und liefert die Anker-ContentId.
+    fn append_anchor(store: &mut ContentStore<RedbEdgeIndex>, class: ContentId) -> ContentId {
+        store.append_datum(&Datum::anchor_marker()).unwrap();
+        store.append_datum(&Datum::anchor([class])).unwrap()
+    }
+
+    /// Hängt eine Mitgliedschaft (Marker + Grad-Sub-Kontext + Mitgliedschaft) an und
+    /// liefert die Mitgliedschafts-ContentId. Der Repräsentant besitzt sie dann.
+    fn append_membership(
+        store: &mut ContentStore<RedbEdgeIndex>,
+        anchor: ContentId,
+        grade_value: ContentId,
+    ) -> ContentId {
+        store.append_datum(&Datum::membership_marker()).unwrap();
+        store.append_datum(&Datum::membership_grade_marker()).unwrap();
+        store.append_datum(&Datum::membership_grade(grade_value)).unwrap();
+        store.append_datum(&Datum::membership(anchor, grade_value)).unwrap()
+    }
+
+    #[test]
+    fn anchor_membership_is_indexed_both_directions_with_local_handle() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        let class = store.append_datum(&Datum::leaf(b"klasse".to_vec())).unwrap();
+        let anchor = append_anchor(&mut store, class);
+        // Der Anker ist ein gewöhnliches inhaltsadressiertes Daten (§2.1) mit lokalem
+        // Handle (§12.4): erster Anker ⇒ AnchorId 0.
+        let aid = store.anchor_id_of(anchor).expect("Anker hat einen lokalen Handle");
+        assert_eq!(aid, AnchorId::new(0));
+        assert_eq!(store.anchor_cid_of(aid), Some(anchor));
+
+        // Zwei Repräsentanten verweisen per Mitgliedschaft auf den Anker (§9.2).
+        let g1 = store.append_datum(&Datum::leaf(b"grad-0.9".to_vec())).unwrap();
+        let g2 = store.append_datum(&Datum::leaf(b"grad-0.7".to_vec())).unwrap();
+        let m1 = append_membership(&mut store, anchor, g1);
+        let m2 = append_membership(&mut store, anchor, g2);
+        let rep1 = store.append_datum(&Datum::node([m1]).unwrap()).unwrap();
+        let rep2 = store.append_datum(&Datum::node([m2]).unwrap()).unwrap();
+
+        // Anker→Repräsentanten (§9.1): beide.
+        let mut members = store.anchor_members_of(anchor);
+        members.sort_unstable();
+        let mut expected = vec![rep1, rep2];
+        expected.sort_unstable();
+        assert_eq!(members, expected, "Anker→Repräsentanten (§9.1)");
+        // Repräsentant→Anker (§9.1): jeder verweist auf den Anker.
+        assert_eq!(store.member_anchors_of(rep1), vec![anchor]);
+        assert_eq!(store.member_anchors_of(rep2), vec![anchor]);
+
+        // Ein Repräsentant darf MEHREREN Ankern angehören (§9.1).
+        let class2 = store.append_datum(&Datum::leaf(b"klasse-2".to_vec())).unwrap();
+        let anchor2 = append_anchor(&mut store, class2);
+        let g3 = store.append_datum(&Datum::leaf(b"grad-0.5".to_vec())).unwrap();
+        let m3 = append_membership(&mut store, anchor2, g3);
+        // rep1 erhält eine zweite Mitgliedschaft (zu anchor2) — neues Daten, das beide
+        // Mitgliedschafts-Kontexte besitzt (append-only, §7.1; rep1 bleibt unverändert).
+        let rep1_multi = store.append_datum(&Datum::node([m1, m3]).unwrap()).unwrap();
+        let mut anchors = store.member_anchors_of(rep1_multi);
+        anchors.sort_unstable();
+        let mut expected_anchors = vec![anchor, anchor2];
+        expected_anchors.sort_unstable();
+        assert_eq!(anchors, expected_anchors, "Repräsentant in mehreren Ankern (§9.1)");
+        // Der zweite Anker bekam den nächsten Handle (deterministisch, Auftretens-Order).
+        assert_eq!(store.anchor_id_of(anchor2), Some(AnchorId::new(1)));
+    }
+
+    #[test]
+    fn anchor_membership_and_handles_survive_wipe_rebuild_and_reopen() {
+        // §8.4 + §12.4: die Anker-/Mitgliedschafts-Indizes UND die AnchorId-Karte sind
+        // reine, neu-baubare Derivate; Wipe + Neu-Bau und Reopen ergeben identische
+        // Inhalte UND identische (deterministische) lokale Handles.
+        let dir = tempdir().unwrap();
+        let (anchor, rep, aid);
+        {
+            let mut store = open_store(dir.path());
+            let class = store.append_datum(&Datum::leaf(b"k".to_vec())).unwrap();
+            anchor = append_anchor(&mut store, class);
+            let g = store.append_datum(&Datum::leaf(b"g".to_vec())).unwrap();
+            let m = append_membership(&mut store, anchor, g);
+            rep = store.append_datum(&Datum::node([m]).unwrap()).unwrap();
+            aid = store.anchor_id_of(anchor).unwrap();
+
+            // Schnappschuss vor dem Wipe.
+            let members_before = store.anchor_members_of(anchor);
+            let anchors_before = store.member_anchors_of(rep);
+            store.rebuild_index_from_log().unwrap();
+            assert_eq!(store.anchor_members_of(anchor), members_before, "Anker→Reps identisch");
+            assert_eq!(store.member_anchors_of(rep), anchors_before, "Rep→Anker identisch");
+            // Der lokale Handle ist nach dem Neu-Bau derselbe (deterministisch, §12.4).
+            assert_eq!(store.anchor_id_of(anchor), Some(aid));
+            assert_eq!(store.anchor_cid_of(aid), Some(anchor));
+        }
+        // Reopen von Platte (§8.4): alles aus dem Log rekonstruiert, Handle stabil.
+        let store = open_store(dir.path());
+        assert_eq!(store.anchor_members_of(anchor), vec![rep]);
+        assert_eq!(store.member_anchors_of(rep), vec![anchor]);
+        assert_eq!(store.anchor_id_of(anchor), Some(aid));
+    }
+
+    #[test]
+    fn anchor_id_assignment_is_log_order_only_and_survives_rebuild_reopen() {
+        // §8.4/§12.4-Regression: der bestand-LOKALE [`AnchorId`]-Handle wird
+        // AUSSCHLIESSLICH am EIGENEN Anker-Record vergeben (Auftretens-Reihenfolge im
+        // Log) — NIE von der Mitgliedschaftsseite. Andernfalls divergierten
+        // inkrementeller Append und Neu-Bau: ein Mitgliedschafts-Kontext darf den
+        // Anker per §3.6 benennen, BEVOR das Anker-Daten selbst angehängt ist; beim
+        // inkrementellen Append ist die Dedup-Karte dann partiell (Anker noch nicht
+        // präsent), beim Neu-Bau aus dem Log voll — eine mitgliedschaftsseitige
+        // Vergabe würde dem Anker so unterschiedliche Handles geben.
+        let dir = tempdir().unwrap();
+
+        // Log-Reihenfolge: [Repräsentant R, der Mitgliedschaft M→A2 besitzt;
+        // Anker A1; Anker A2]. A2 wird vom Mitgliedschafts-Kontext BENANNT, bevor das
+        // A2-Daten existiert (§3.6 — geschlossenheits-legal: M braucht nur A2s
+        // ContentId, nicht das A2-Daten).
+        let (anchor_a1, anchor_a2, rep, aid_a1, aid_a2);
+        {
+            let mut store = open_store(dir.path());
+
+            // Die Anker-ContentIds VORAB berechnen (inhaltsadressiert, §2.1), ohne die
+            // Anker-Daten anzuhängen.
+            let class1 = store.append_datum(&Datum::leaf(b"klasse-1".to_vec())).unwrap();
+            let class2 = store.append_datum(&Datum::leaf(b"klasse-2".to_vec())).unwrap();
+            anchor_a1 = ContentId::of_datum(&Datum::anchor([class1]));
+            anchor_a2 = ContentId::of_datum(&Datum::anchor([class2]));
+
+            // Eine Mitgliedschaft M→A2 anlegen; der Grad-Sub-Kontext muss durabel sein
+            // (er unterscheidet Anker von Grad, §9.3), das Anker-Daten A2 aber NICHT.
+            store.append_datum(&Datum::anchor_marker()).unwrap();
+            store.append_datum(&Datum::membership_marker()).unwrap();
+            store.append_datum(&Datum::membership_grade_marker()).unwrap();
+            let grade = store.append_datum(&Datum::leaf(b"grad".to_vec())).unwrap();
+            store.append_datum(&Datum::membership_grade(grade)).unwrap();
+            let m = store.append_datum(&Datum::membership(anchor_a2, grade)).unwrap();
+
+            // Repräsentant R besitzt M (verweist auf A2) — A1/A2 sind hier noch KEINE
+            // durablen Anker-Daten.
+            rep = store.append_datum(&Datum::node([m]).unwrap()).unwrap();
+            assert_eq!(store.member_anchors_of(rep), vec![anchor_a2], "R ⊳ A2 (§9.2)");
+            // Solange kein Anker-Daten existiert, gibt es KEINEN Handle (§9.1: der
+            // Anker ist ein reales Daten; die Mitgliedschaftsseite vergibt nichts).
+            assert_eq!(store.anchor_id_of(anchor_a2), None, "kein Handle ohne Anker-Daten");
+
+            // Jetzt die Anker-Daten anhängen — ZUERST A1, DANN A2.
+            let a1 = store.append_datum(&Datum::anchor([class1])).unwrap();
+            let a2 = store.append_datum(&Datum::anchor([class2])).unwrap();
+            assert_eq!(a1, anchor_a1);
+            assert_eq!(a2, anchor_a2);
+
+            // Inkrementell: A1 bekommt AnchorId(0) (erstes Anker-Record), A2 AnchorId(1)
+            // — Vergabe rein in Anker-Record-Reihenfolge, NICHT in Mitgliedschafts-
+            // Reihenfolge (sonst wäre A2 zuerst).
+            aid_a1 = store.anchor_id_of(anchor_a1).expect("A1 hat Handle");
+            aid_a2 = store.anchor_id_of(anchor_a2).expect("A2 hat Handle");
+            assert_eq!(aid_a1, AnchorId::new(0), "A1 zuerst (eigenes Anker-Record)");
+            assert_eq!(aid_a2, AnchorId::new(1), "A2 danach");
+
+            // §8.4: Wipe + Neu-Bau aus dem Log vergibt IDENTISCHE Handles (genau die
+            // Regression — vorher wäre A2=0, A1=1 geworden).
+            store.rebuild_index_from_log().unwrap();
+            assert_eq!(store.anchor_id_of(anchor_a1), Some(aid_a1), "A1-Handle nach Rebuild stabil");
+            assert_eq!(store.anchor_id_of(anchor_a2), Some(aid_a2), "A2-Handle nach Rebuild stabil");
+            assert_eq!(store.anchor_cid_of(aid_a1), Some(anchor_a1));
+            assert_eq!(store.anchor_cid_of(aid_a2), Some(anchor_a2));
+        }
+
+        // Reopen von Platte (§8.4-Recovery): die Handles sind dieselben wie inkrementell
+        // vergeben — der bestand-lokale Handle ist ein stabiles, neu-baubares Derivat
+        // (§12.4), keine still wechselnde Identität.
+        let store = open_store(dir.path());
+        assert_eq!(store.anchor_id_of(anchor_a1), Some(aid_a1), "A1-Handle nach Reopen stabil");
+        assert_eq!(store.anchor_id_of(anchor_a2), Some(aid_a2), "A2-Handle nach Reopen stabil");
+        assert_eq!(store.member_anchors_of(rep), vec![anchor_a2]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Split (§9.4): ein Split entsteht durch NEUE Kontexte, die alte ERSETZEN
+    // (§6.3-Wiederverwendung); betroffene Repräsentanten werden zu einem NEUEN
+    // Anker RE-VERWIESEN. Append-only — der alte Anker (und der alte Repräsentant)
+    // werden NIE geändert oder gelöscht (§7.1/§9.2). Der Kernel hält die Strukturen
+    // und re-verweist mechanisch; er entscheidet keine Identität (§9-Präambel).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn split_re_references_representative_to_new_anchor_without_mutating_old() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        // Ausgangslage: Repräsentant `rep_a` gehört per Mitgliedschaft `m_a` dem
+        // Anker `anchor_a` an (§9.1/§9.3).
+        let class_a = store.append_datum(&Datum::leaf(b"klasse-a".to_vec())).unwrap();
+        let anchor_a = append_anchor(&mut store, class_a);
+        let grade = store.append_datum(&Datum::leaf(b"grad".to_vec())).unwrap();
+        let m_a = append_membership(&mut store, anchor_a, grade);
+        let rep_a = store.append_datum(&Datum::node([m_a]).unwrap()).unwrap();
+        assert_eq!(store.anchor_members_of(anchor_a), vec![rep_a], "Start: rep_a ⊳ anchor_a");
+        assert_eq!(store.member_anchors_of(rep_a), vec![anchor_a]);
+
+        // SPLIT (§9.4): ein NEUER Anker `anchor_b` entsteht; der Repräsentant wird
+        // zu ihm RE-VERWIESEN, indem ein NEUES Repräsentanten-Daten `rep_b` mit einer
+        // NEUEN Mitgliedschaft `m_b → anchor_b` angehängt wird, das den alten
+        // Repräsentanten `rep_a` per Ersetzungs-Kontext (§6.3) als überholt markiert.
+        // Nichts Altes wird mutiert (append-only, §7.1) — `rep_a` wird NICHT in den
+        // (neuen) Anker umgewandelt (§9.2).
+        let class_b = store.append_datum(&Datum::leaf(b"klasse-b".to_vec())).unwrap();
+        let anchor_b = append_anchor(&mut store, class_b);
+        let m_b = append_membership(&mut store, anchor_b, grade);
+        store.append_datum(&Datum::supersession_marker()).unwrap();
+        let supersede_rep_a = store.append_datum(&Datum::supersedes(rep_a)).unwrap();
+        // Das re-verwiesene Repräsentanten-Daten besitzt die neue Mitgliedschaft UND
+        // den Ersetzungs-Kontext, der den alten Repräsentanten überholt.
+        let rep_b = store
+            .append_datum(&Datum::node([m_b, supersede_rep_a]).unwrap())
+            .unwrap();
+
+        // Der alte Anker ist UNVERÄNDERT durabel lesbar (§7.1/§9.2): rep_a bleibt sein
+        // Repräsentant, der alte Repräsentant ist nicht mutiert/gelöscht.
+        assert!(store.contains(anchor_a), "alter Anker unverändert vorhanden (§7.1)");
+        assert!(store.contains(rep_a), "alter Repräsentant unverändert vorhanden (§7.1)");
+        assert_eq!(
+            store.anchor_members_of(anchor_a),
+            vec![rep_a],
+            "alter Anker NICHT mutiert — rep_a bleibt sein Mitglied (§9.2)"
+        );
+        // Der alte Anker behält seinen lokalen Handle (§12.4) und wurde nie in einen
+        // Repräsentanten umgewandelt; ein neuer Anker bekam den nächsten Handle.
+        assert_eq!(store.anchor_id_of(anchor_a), Some(AnchorId::new(0)));
+        assert_eq!(store.anchor_id_of(anchor_b), Some(AnchorId::new(1)));
+
+        // Der RE-VERWIESENE Repräsentant `rep_b` gehört nun dem NEUEN Anker an (§9.4).
+        assert_eq!(store.member_anchors_of(rep_b), vec![anchor_b], "rep_b ⊳ anchor_b (§9.4)");
+        assert_eq!(store.anchor_members_of(anchor_b), vec![rep_b]);
+
+        // Die Ersetzungs-Relation (§6.3) ist in beide Richtungen traversierbar: der
+        // neue Repräsentant überholt den alten; die Leseseite (nicht der Kernel)
+        // entscheidet, welcher Re-Verweis „gilt" (§6.4/§8). Append-only: rep_a bleibt.
+        assert_eq!(store.supersedes_of(rep_b), vec![rep_a], "rep_b überholt rep_a (§6.3)");
+        assert_eq!(store.superseded_by_of(rep_a), vec![rep_b], "rep_a ist überholt von rep_b");
+
+        // §8.4: der ganze Split-Zustand ist ein reines, neu-baubares Derivat.
+        store.rebuild_index_from_log().unwrap();
+        assert_eq!(store.anchor_members_of(anchor_a), vec![rep_a]);
+        assert_eq!(store.member_anchors_of(rep_b), vec![anchor_b]);
+        assert_eq!(store.anchor_id_of(anchor_a), Some(AnchorId::new(0)));
+        assert_eq!(store.anchor_id_of(anchor_b), Some(AnchorId::new(1)));
+        assert_eq!(store.superseded_by_of(rep_a), vec![rep_b]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Gradierte Identitäts-Links (§5.5): ein gradierter Identitäts-Kontext ist von
+    // jedem erwähnten Daten aus auffindbar; der Kernel hält ihn nur (kein Werten).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn graded_identity_links_are_indexed_and_rebuildable() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        let a = store.append_datum(&Datum::leaf(b"daten-a".to_vec())).unwrap();
+        let b = store.append_datum(&Datum::leaf(b"daten-b".to_vec())).unwrap();
+        // Reifizierte (opake) Konfidenz als Sub-Kontext (§3.4/§5.5).
+        let conf_val = store.append_datum(&Datum::leaf(b"konf=0.8".to_vec())).unwrap();
+        let conf_ctx = store.append_datum(&Datum::node([conf_val]).unwrap()).unwrap();
+        store.append_datum(&Datum::identity_strength_marker(IdentityStrength::Ergaenzt)).unwrap();
+        let ident = store
+            .append_datum(&Datum::graded_identity(a, b, IdentityStrength::Ergaenzt, [conf_ctx]))
+            .unwrap();
+
+        // Von a UND von b aus ist der Identitäts-Kontext auffindbar (beide Richtungen).
+        assert_eq!(store.graded_identity_links_of(a), vec![ident]);
+        assert_eq!(store.graded_identity_links_of(b), vec![ident]);
+        // Wipe-&-Rebuild: reines Derivat, identisch (§8.4).
+        store.rebuild_index_from_log().unwrap();
+        assert_eq!(store.graded_identity_links_of(a), vec![ident]);
+        assert_eq!(store.graded_identity_links_of(b), vec![ident]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Kuratierung — Verbergen/Aufheben (§9.5): ein Verbergen-Kontext verbirgt ein
+    // Daten für die Leseseite (VANISH); ein Aufheben reversiert es. NICHTS wird
+    // gelöscht (§7.1); reihenfolge-unabhängig + neu-baubar.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn curation_hide_then_unhide_is_reversible_and_rebuildable() {
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+
+        let target = store.append_datum(&Datum::leaf(b"verborgen?".to_vec())).unwrap();
+        assert!(!store.is_curation_hidden(target), "anfangs sichtbar");
+
+        // Verbergen (§9.5): das Daten VANISHt für die Leseseite.
+        store.append_datum(&Datum::curation_hide_marker()).unwrap();
+        store.append_datum(&Datum::curation_hide(target)).unwrap();
+        assert!(store.is_curation_hidden(target), "verborgen nach hide (§9.5)");
+        // Das Daten bleibt durabel lesbar (append-only, §7.1) — nur die Leseseite filtert.
+        assert!(store.contains(target));
+
+        // VANISH im gegateten Filter: ein verborgenes Daten erscheint nicht.
+        let visible = store.visible_filter(&[target], &[]).unwrap();
+        assert!(visible.is_empty(), "verborgenes Daten VANISHt aus der Projektion (§9.5/§11.3)");
+
+        // Aufheben (§9.5): reversiert das Verbergen — append-only, nichts gelöscht.
+        store.append_datum(&Datum::curation_unhide_marker()).unwrap();
+        store.append_datum(&Datum::curation_unhide(target)).unwrap();
+        assert!(!store.is_curation_hidden(target), "Aufheben reversiert (§9.5)");
+        assert_eq!(store.visible_filter(&[target], &[]).unwrap(), vec![target]);
+
+        // Neu-Bau aus dem Log (§8.4): das Aufheben bleibt wirksam (reihenfolge-
+        // unabhängig); der reversierte Zustand ist neu-baubar identisch.
+        store.rebuild_index_from_log().unwrap();
+        assert!(!store.is_curation_hidden(target), "Aufheben bleibt nach Rebuild (§8.4)");
+    }
+
+    #[test]
+    fn curation_unhide_before_hide_in_log_still_reverses() {
+        // §9.5/§Append-Order-Semantik: steht das Aufheben VOR dem Verbergen im Log
+        // (etwa nach Neu-Aufbau), reversiert es trotzdem — „neuester Offset gewinnt"
+        // gibt es nicht (analog Entzug §11.4, reihenfolge-unabhängig).
+        let dir = tempdir().unwrap();
+        let target;
+        {
+            let mut store = open_store(dir.path());
+            target = store.append_datum(&Datum::leaf(b"x".to_vec())).unwrap();
+            store.append_datum(&Datum::curation_unhide_marker()).unwrap();
+            store.append_datum(&Datum::curation_unhide(target)).unwrap();
+            // Erst danach das Verbergen — es greift nicht, weil ein Aufheben existiert.
+            store.append_datum(&Datum::curation_hide_marker()).unwrap();
+            store.append_datum(&Datum::curation_hide(target)).unwrap();
+            assert!(!store.is_curation_hidden(target), "Aufheben dominiert (§9.5)");
+        }
+        // Auch nach Reopen (Neu-Aufbau aus dem Log) bleibt es reversiert.
+        let store = open_store(dir.path());
+        assert!(!store.is_curation_hidden(target));
     }
 }

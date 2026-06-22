@@ -44,7 +44,7 @@ use std::sync::RwLock;
 use crate::api::{Direction, Kernel, SnapshotToken, StepStream};
 use crate::error::KernelError;
 use crate::gate::{Capability, GrantedScopes, SealedRecord};
-use crate::id::ContentId;
+use crate::id::{AnchorId, ContentId};
 use crate::index::EdgeIndex;
 use crate::log::SegmentLog;
 use crate::model::Datum;
@@ -302,6 +302,81 @@ impl<I: EdgeIndex> LakearchKernel<I> {
             }
         }
         store.visible_filter(&reals, granted)
+    }
+
+    /// **Gegatete Anker-Mitgliedschaft — Anker→Repräsentanten** (§9.1/§9.3/§11.3):
+    /// die für die `capability` **sichtbaren** Repräsentanten, die per Mitgliedschafts-
+    /// Kontext auf den Anker `anchor` verweisen (§9.2). Reines strukturelles Folgen der
+    /// Mitgliedschafts-Kanten (§1.2/§1.3); der Kernel **entscheidet keine
+    /// Mitgliedschaft** und **wertet/schwellt den Grad nie** (§9-Präambel/§1.4).
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbarer (oder kuratorisch verborgener, §9.5)
+    /// Repräsentant VANISHt. Nur `ContentId`s; Inhalt nur über das Tor (§11.5).
+    /// Fail-closed (§11). Es wird **kein** Repräsentant „gewählt" oder gerankt — die
+    /// Schicht darüber liest den Grad und entscheidet (§1.4/§1.5).
+    pub fn anchor_members_visible(
+        &self,
+        anchor: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.anchor_members_of(anchor);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// **Gegatete Anker-Mitgliedschaft — Repräsentant→Anker** (§9.1/§11.3): die für
+    /// die `capability` **sichtbaren** Anker, denen `member` per Mitgliedschafts-
+    /// Kontext angehört (ein Daten darf mehreren angehören, §9.1) — die Gegenrichtung
+    /// zu [`anchor_members_visible`](LakearchKernel::anchor_members_visible). So ist die
+    /// Mitgliedschaft in **beide** Richtungen gegated traversierbar (§1.2).
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbarer/verborgener Anker VANISHt. Nur
+    /// `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    pub fn member_anchors_visible(
+        &self,
+        member: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.member_anchors_of(member);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// **Gegatete gradierte Identitäts-Links** (§5.5/§11.3): die für die `capability`
+    /// **sichtbaren** gradierten Identitäts-Kontexte ([`Datum::graded_identity`]), die
+    /// `datum` erwähnen. Reines strukturelles Folgen der Identitäts-Links (§1.2/§1.3);
+    /// der Kernel **vergleicht/schwellt Konfidenz nie** und **entscheidet keine
+    /// Identität** (§5.5/§9-Präambel/§1.4) — er reicht nur die rohen Kontext-IDs
+    /// heraus, deren Stärke/Konfidenz die Schicht darüber liest und wertet (§1.5).
+    ///
+    /// **Gated (§11.3):** ein nicht-sichtbarer/verborgener Identitäts-Kontext VANISHt.
+    /// Nur `ContentId`s; Inhalt nur über das Tor (§11.5). Fail-closed (§11).
+    pub fn graded_identity_links_visible(
+        &self,
+        datum: ContentId,
+        capability: &Capability,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = store.graded_identity_links_of(datum);
+        store.visible_filter(&candidates, capability.scopes().scope_ids())
+    }
+
+    /// Der bestand-**lokale** [`AnchorId`]-Handle eines Anker-Daten (§9.1/§12.4),
+    /// falls vergeben; sonst `None`. **Kein** Inhalts-Read (nur eine Handle-Auflösung
+    /// über die rebuildbare Karte) — der Anker bleibt ein gewöhnliches
+    /// inhaltsadressiertes Daten (§2.1), die [`AnchorId`] ist **nie** seine alleinige
+    /// Identität (§12.4).
+    pub fn anchor_id_of(&self, anchor: ContentId) -> Result<Option<AnchorId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        Ok(store.anchor_id_of(anchor))
+    }
+
+    /// Die Anker-`ContentId` zu einem bestand-lokalen [`AnchorId`]-Handle (§12.4),
+    /// falls vergeben; sonst `None`. Umkehrung von
+    /// [`anchor_id_of`](LakearchKernel::anchor_id_of).
+    pub fn anchor_cid_of(&self, anchor_id: AnchorId) -> Result<Option<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        Ok(store.anchor_cid_of(anchor_id))
     }
 
     /// Aggregierte **Betriebs-Zähler** (§Betrieb). Liest sowohl die Store- als auch
@@ -1156,5 +1231,211 @@ mod tests {
         // wir belegen nur, dass kein Zeit-Vergleich stattfindet (beide Lookups sind
         // unabhängig und je-Aussage exakt).
         let _ = early_addr_first;
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 4: gegatete Anker-Mitgliedschaft in BEIDE Richtungen (§9.1/§9.3); ein
+    // nicht-sichtbarer Repräsentant VANISHt (§11.3). Der lokale AnchorId-Handle
+    // (§12.4) ist über die öffentliche Oberfläche erreichbar.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn gated_anchor_membership_both_directions_and_vanish() {
+        use crate::id::AnchorId;
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Anker (§9.1) — ein gewöhnliches Daten mit lokalem Handle (§12.4).
+        let class = k.append(&Datum::leaf(b"klasse".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor = k.append(&Datum::anchor([class])).unwrap();
+        assert_eq!(k.anchor_id_of(anchor).unwrap(), Some(AnchorId::new(0)));
+        assert_eq!(k.anchor_cid_of(AnchorId::new(0)).unwrap(), Some(anchor));
+
+        // Bereich für einen „geheimen" Repräsentanten.
+        let area = k.append(&Datum::leaf(b"area".to_vec())).unwrap();
+        k.append(&Datum::area_membership_marker()).unwrap();
+        let area_member = k.append(&Datum::area_membership(area)).unwrap();
+
+        // Zwei Mitgliedschaften (gradiert) zum selben Anker (§9.3).
+        let g1 = k.append(&Datum::leaf(b"g1".to_vec())).unwrap();
+        let g2 = k.append(&Datum::leaf(b"g2".to_vec())).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        k.append(&Datum::membership_grade(g1)).unwrap();
+        k.append(&Datum::membership_grade(g2)).unwrap();
+        let m1 = k.append(&Datum::membership(anchor, g1)).unwrap();
+        let m2 = k.append(&Datum::membership(anchor, g2)).unwrap();
+        let public_rep = k.append(&Datum::node([m1]).unwrap()).unwrap();
+        // Der geheime Repräsentant ist bereichs-beschränkt.
+        let secret_rep = k.append(&Datum::node([m2, area_member]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        // Rechtloser Leser: nur der öffentliche Repräsentant; der geheime VANISHt.
+        let denied = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        assert_eq!(
+            k.anchor_members_visible(anchor, &denied).unwrap(),
+            vec![public_rep],
+            "geheimer Repräsentant VANISHt (§11.3)"
+        );
+        // Repräsentant→Anker (Gegenrichtung, §9.1).
+        assert_eq!(k.member_anchors_visible(public_rep, &denied).unwrap(), vec![anchor]);
+
+        // Mit dem Bereich: beide Repräsentanten.
+        let granted = k.authorize(GrantedScopes::from_scope_ids([area]), snap).unwrap();
+        let mut both = k.anchor_members_visible(anchor, &granted).unwrap();
+        both.sort_unstable();
+        let mut expected = vec![public_rep, secret_rep];
+        expected.sort_unstable();
+        assert_eq!(both, expected);
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 4: gradierte Identitäts-Links (§5.5) sind von beiden erwähnten Daten
+    // gegated erreichbar; die reifizierte Konfidenz wird GEHALTEN, aber NIE
+    // verglichen (es existiert kein solches Verb).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn gated_graded_identity_links_hold_confidence_without_comparing() {
+        use crate::model::IdentityStrength;
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        let a = k.append(&Datum::leaf(b"a".to_vec())).unwrap();
+        let b = k.append(&Datum::leaf(b"b".to_vec())).unwrap();
+        // Reifizierte, opake Konfidenz (§3.4/§5.5).
+        let conf_val = k.append(&Datum::leaf(b"konf=0.8".to_vec())).unwrap();
+        let conf_ctx = k.append(&Datum::node([conf_val]).unwrap()).unwrap();
+        k.append(&Datum::identity_strength_marker(IdentityStrength::WidersprichtIn)).unwrap();
+        let ident = k
+            .append(&Datum::graded_identity(a, b, IdentityStrength::WidersprichtIn, [conf_ctx]))
+            .unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        // Von a UND b aus auffindbar (beide Richtungen, §1.2).
+        assert_eq!(k.graded_identity_links_visible(a, &cap).unwrap(), vec![ident]);
+        assert_eq!(k.graded_identity_links_visible(b, &cap).unwrap(), vec![ident]);
+
+        // Der Identitäts-Kontext ist über das Tor lesbar; seine Stärke + Konfidenz
+        // sind GEHALTEN. Der Kernel VERGLEICHT die Konfidenz NICHT (er reicht nur die
+        // rohen Sub-Kontext-IDs heraus; die Schicht darüber wertet, §1.4/§5.5).
+        let sealed = k.get_by_content_id(ident, &cap, snap).unwrap().unwrap();
+        let visible = open(&sealed, &cap).unwrap();
+        let decoded = strict_decode(visible.canonical_bytes()).unwrap();
+        assert_eq!(decoded.identity_strength(), Some(IdentityStrength::WidersprichtIn));
+        let ctxs = decoded.graded_identity_contexts().unwrap();
+        assert!(ctxs.contains(&conf_ctx), "Konfidenz reifiziert + gehalten (§3.4/§5.5)");
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 4: Kuratierung — Verbergen ist ein reversibler Lese-Filter (§9.5). Ein
+    // verborgenes Daten VANISHt aus der gegateten Projektion; ein Aufheben
+    // reversiert es. NICHTS wird gelöscht (§7.1) — das Daten bleibt durabel.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn curation_hide_is_a_reversible_readside_filter_over_public_api() {
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Ein Anker mit einem Repräsentanten, den wir kuratorisch verbergen.
+        let class = k.append(&Datum::leaf(b"k".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor = k.append(&Datum::anchor([class])).unwrap();
+        let g = k.append(&Datum::leaf(b"g".to_vec())).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        k.append(&Datum::membership_grade(g)).unwrap();
+        let m = k.append(&Datum::membership(anchor, g)).unwrap();
+        let rep = k.append(&Datum::node([m]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+        // Anfangs sichtbar.
+        assert_eq!(k.anchor_members_visible(anchor, &cap).unwrap(), vec![rep]);
+
+        // Verbergen (§9.5): der Repräsentant VANISHt aus der gegateten Projektion.
+        k.append(&Datum::curation_hide_marker()).unwrap();
+        k.append(&Datum::curation_hide(rep)).unwrap();
+        assert!(
+            k.anchor_members_visible(anchor, &cap).unwrap().is_empty(),
+            "verborgener Repräsentant VANISHt (§9.5/§11.3)"
+        );
+        // Append-only: das Daten bleibt durabel über das Tor lesbar (§7.1) — nur die
+        // (kuratierte) Leseseite filtert es. Es ist NICHT gelöscht.
+        // (get_by_content_id filtert NUR nach Bereich; Kuratierung greift in der
+        // gegateten Mengen-Projektion. Der Inhalt selbst bleibt erhalten.)
+        let sealed = k.get_by_content_id(rep, &cap, snap).unwrap();
+        assert!(sealed.is_some(), "verborgenes Daten ist nicht gelöscht (§7.1)");
+
+        // Aufheben (§9.5): reversiert — append-only, nichts gelöscht.
+        k.append(&Datum::curation_unhide_marker()).unwrap();
+        k.append(&Datum::curation_unhide(rep)).unwrap();
+        assert_eq!(
+            k.anchor_members_visible(anchor, &cap).unwrap(),
+            vec![rep],
+            "Aufheben macht den Repräsentanten wieder sichtbar (§9.5)"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 4 / HARTE GRENZE (§9-Präambel/§1.4/§5.5): es gibt KEIN Kernel-Verb, das
+    // eine Identität AUFLÖST, einen „gewinnenden" Repräsentanten WÄHLT/RANKT, eine
+    // Konfidenz VERGLEICHT/SCHWELLT oder destruktiv MERGT. Dieser Test friert die
+    // Grenze ein: der Kernel liefert nur ROHE Mengen (Vec<ContentId>) — er hält die
+    // Strukturen, er entscheidet nicht.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn kernel_never_resolves_ranks_or_thresholds_identity() {
+        use crate::model::IdentityStrength;
+        let dir = tempdir().unwrap();
+        let k = open_kernel(dir.path());
+
+        // Ein Anker mit ZWEI Repräsentanten unterschiedlichen Grades — der Kernel
+        // wählt KEINEN „besten" aus; er gibt beide roh heraus.
+        let class = k.append(&Datum::leaf(b"k".to_vec())).unwrap();
+        k.append(&Datum::anchor_marker()).unwrap();
+        let anchor = k.append(&Datum::anchor([class])).unwrap();
+        let g_high = k.append(&Datum::leaf(b"0.99".to_vec())).unwrap();
+        let g_low = k.append(&Datum::leaf(b"0.10".to_vec())).unwrap();
+        k.append(&Datum::membership_marker()).unwrap();
+        k.append(&Datum::membership_grade_marker()).unwrap();
+        k.append(&Datum::membership_grade(g_high)).unwrap();
+        k.append(&Datum::membership_grade(g_low)).unwrap();
+        let m_high = k.append(&Datum::membership(anchor, g_high)).unwrap();
+        let m_low = k.append(&Datum::membership(anchor, g_low)).unwrap();
+        let rep_high = k.append(&Datum::node([m_high]).unwrap()).unwrap();
+        let rep_low = k.append(&Datum::node([m_low]).unwrap()).unwrap();
+
+        let snap = k.pin_snapshot().unwrap();
+        let cap = k.authorize(GrantedScopes::from_scope_ids([]), snap).unwrap();
+
+        // Der Kernel liefert BEIDE Repräsentanten (Adress-sortierte Menge) — er rankt
+        // NICHT nach Grad und wählt KEINEN „Gewinner" (§9-Präambel/§1.4). Hätte er ein
+        // Auflösungs-Verb, läge hier eine Auswahl; es existiert keines.
+        let mut members = k.anchor_members_visible(anchor, &cap).unwrap();
+        members.sort_unstable();
+        let mut expected = vec![rep_high, rep_low];
+        expected.sort_unstable();
+        assert_eq!(members, expected, "beide Repräsentanten roh, kein Ranking (§1.4)");
+
+        // Auch die gradierte Identität liefert nur rohe Kontext-IDs; die Stärke ist
+        // eine Etikette OHNE Ordnung (IdentityStrength leitet kein Ord ab, §5.5/§1.4).
+        let a = k.append(&Datum::leaf(b"a".to_vec())).unwrap();
+        let b = k.append(&Datum::leaf(b"b".to_vec())).unwrap();
+        k.append(&Datum::identity_strength_marker(IdentityStrength::Deckungsgleich)).unwrap();
+        let ident = k
+            .append(&Datum::graded_identity(a, b, IdentityStrength::Deckungsgleich, []))
+            .unwrap();
+        // Es gibt KEIN Verb `is_same(a, b) -> bool`/`confidence(a, b) -> f64`/
+        // `winner(anchor) -> rep`; der einzige Pfad ist das rohe Link-Lesen.
+        assert_eq!(k.graded_identity_links_visible(a, &cap).unwrap(), vec![ident]);
+        // Die Stärke ist nur strukturell ablesbar (kein Vergleich/Rang, §1.4).
+        let sealed = k.get_by_content_id(ident, &cap, snap).unwrap().unwrap();
+        let decoded = strict_decode(open(&sealed, &cap).unwrap().canonical_bytes()).unwrap();
+        assert_eq!(decoded.identity_strength(), Some(IdentityStrength::Deckungsgleich));
     }
 }
