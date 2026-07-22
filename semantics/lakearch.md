@@ -13,7 +13,7 @@
 1.1 lakearch **speichert** Daten und ihre Kontexte.
 1.2 lakearch **traversiert** entlang von Kontexten — vorwärts wie rückwärts.
 1.3 lakearch **matcht strukturell**: Gleichheit auf Inhalts-/Adressebene, „zeigt ein Kontext auf ein Daten?", Zugehörigkeit zu einer per Kontext gegebenen Menge.
-1.4 lakearch **rechnet nicht** (keine Arithmetik, Ordnung, Aggregation), **wertet nicht** (erzeugt keine Konfidenz, entscheidet keine Identität, validiert keine Eingabe) und **sortiert nicht**.
+1.4 lakearch **deutet nicht** (Inhalte bleiben opak, §2.1; Bedeutung entsteht erst durch das Vokabular der Ableitung, §14), **rechnet nicht** (keine Arithmetik, Ordnung, Aggregation), **wertet nicht** (erzeugt keine Konfidenz, entscheidet keine Identität, validiert keine Eingabe) und **sortiert nicht**. lakearch ist ein **passiver Speicher**: es hält Daten, ohne eigene Logik über sie auszuführen.
 1.5 Alles Rechnen, Werten und Sortieren liegt in einer **Schicht über lakearch**. Sie liest per Traversierung und schreibt ihre Ergebnisse als Daten zurück.
 1.6 **Zyklen sind erlaubt.** Der Graph ist kein DAG; ein Kontext darf mittelbar auf sein eigenes Besitzer-Daten zurückzeigen. Strukturelle Terminierung folgt nicht aus der Form, sondern aus der Art der Traversierung (§1.7).
 1.7 Traversierung tritt in zwei Sorten auf:
@@ -110,9 +110,11 @@
 
 ## §13 Atomarität
 
-13.1 Ein Umbau, der mehrere Daten betrifft (Zusammenführen/Spalten §9, Berechtigungs-Wechsel §11), wird **gemeinsam sichtbar** durch ein einziges abschließendes **Aktiv-Schreiben**.
-13.2 Bis der Aktiv-Marker gesetzt ist, gelten die Teile als inaktiv; Traversierung ignoriert sie.
-13.3 Ein halb-vollzogener Umbau ist damit unsichtbar, bis er vollständig ist — Atomarität ohne Transaktions-Maschinerie.
+13.1 Jeder Datenzugriff — **lesend wie schreibend** — ist **atomar**: unteilbar und ohne beobachtbaren Zwischenzustand. Kein Zugriff beobachtet je einen halb-vollzogenen Schreibvorgang; er sieht den Bestand entweder vollständig davor oder vollständig danach.
+13.2 Für den **einzelnen Schreibvorgang** ist Atomarität strukturell gegeben: die einzige Mutation ist *append* (§7.1), und ein Daten wird nie geändert und nie gelöscht. Das neue Daten samt Kontexten wird als Ganzes sichtbar oder gar nicht; ein teil-geschriebenes Daten ist unbeobachtbar.
+13.3 Für das **einzelne Lesen** folgt Atomarität aus der Unveränderlichkeit: Lesen projiziert (§8.4) aus bereits vorhandenen, unveränderlichen Daten und beobachtet keinen von einem nebenläufigen Schreiben erzeugten Zwischenzustand.
+13.4 Für den **mehrere Daten betreffenden Umbau** (Zusammenführen/Spalten §9, Berechtigungs-Wechsel §11) entsteht gemeinsame Sichtbarkeit durch ein einziges abschließendes **Aktiv-Schreiben**. Bis der Aktiv-Marker gesetzt ist, gelten die Teile als inaktiv; Traversierung ignoriert sie (§7.4).
+13.5 Ein halb-vollzogener Umbau ist damit unsichtbar, bis er vollständig ist — **Atomarität ohne Transaktions-Maschinerie**. Nebenläufigkeit über dieses Muster hinaus ist Umsetzungssache (§15).
 
 ## §14 Ableitung & Trennung
 
@@ -136,4 +138,4 @@ Geteilte Intuition: es gibt nur eine Sorte Ding, und Beziehungen sind selbst von
 
 ## Anhang B — Wesen in einem Satz
 
-lakearch ist ein append-only Substrat aus genau einer Entität — Daten, die andere Daten als Kontext besitzen —, das **speichert, traversiert und strukturell matcht** (Typ, Identität und Zeit sind besondere Kontexte; Identität ist gradiert, bitemporal und über Inhalts-Hash föderierbar; Anker, Materialisierung und ein unumgehbares Zugriffs-Tor sind native Strukturen; Schreiben ist allein *append*, während das Finden des Platzes außerhalb liegt; Verweise sind geschlossen — Platzhalter statt Lücke —, Zyklen erlaubt, Atomarität entsteht durch einen Aktiv-Marker), während **Rechnen, Werten und Sortieren bewusst außerhalb** liegen.
+lakearch ist ein append-only Substrat aus genau einer Entität — Daten, die andere Daten als Kontext besitzen —, das **speichert, traversiert und strukturell matcht** (Typ, Identität und Zeit sind besondere Kontexte; Identität ist gradiert, bitemporal und über Inhalts-Hash föderierbar; Anker, Materialisierung und ein unumgehbares Zugriffs-Tor sind native Strukturen; Schreiben ist allein *append*, während das Finden des Platzes außerhalb liegt; Verweise sind geschlossen — Platzhalter statt Lücke —, Zyklen erlaubt, jeder Zugriff ist atomar — Umbauten werden durch einen Aktiv-Marker gemeinsam sichtbar), während **Rechnen, Werten und Sortieren bewusst außerhalb** liegen.
