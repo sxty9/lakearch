@@ -1,2 +1,6 @@
 # macOS Finder metadata — OS junk, never part of the repository
 .DS_Store
+
+# Python PDF-build environment (see semantics/build_pdf.py) — never committed
+.venv/
+__pycache__/
