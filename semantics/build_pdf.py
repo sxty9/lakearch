@@ -48,14 +48,26 @@ GREY = HexColor(0x7F8891)
 RULE = HexColor(0xCCCCCC)
 
 # --- font resolution: first existing candidate per face, coverage-safe ----------
+# No hardcoded single path: each face lists the known distro locations of the very
+# same font file (Debian/Ubuntu first, then Fedora/RHEL, then Arch). first-match
+# wins, so the build stays instance-neutral and portable without changing metrics.
+def _dirs(*names):
+    roots = (
+        "/usr/share/fonts/truetype/freefont", "/usr/share/fonts/gnu-free",
+        "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu",
+        "/usr/share/fonts/TTF", "/usr/local/share/fonts", "/usr/share/fonts",
+    )
+    return [os.path.join(r, n) for n in names for r in roots]
+
+
 _CANDIDATES = {
-    "Body": ["/usr/share/fonts/truetype/freefont/FreeSerif.ttf"],
-    "Body-Bold": ["/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf"],
-    "Body-Italic": ["/usr/share/fonts/truetype/freefont/FreeSerifItalic.ttf"],
-    "Body-BoldItalic": ["/usr/share/fonts/truetype/freefont/FreeSerifBoldItalic.ttf"],
-    "Head": ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
-    "Head-Bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
-    "Mono": ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"],
+    "Body": _dirs("FreeSerif.ttf"),
+    "Body-Bold": _dirs("FreeSerifBold.ttf"),
+    "Body-Italic": _dirs("FreeSerifItalic.ttf"),
+    "Body-BoldItalic": _dirs("FreeSerifBoldItalic.ttf"),
+    "Head": _dirs("DejaVuSans.ttf"),
+    "Head-Bold": _dirs("DejaVuSans-Bold.ttf"),
+    "Mono": _dirs("DejaVuSansMono.ttf"),
 }
 
 
