@@ -303,6 +303,32 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         store.commit_restructuring(handle, marker)
     }
 
+    /// **Gemeinsamer Rumpf der einstufigen gegateten Kanten-Lesehelfer** (§11.3).
+    ///
+    /// Alle `*_visible`-Helfer, die **eine** Kanten-Relation eines Daten lesen
+    /// (Zeit-Träger §6, Ersetzung §6.3, Herkunft/Abhängige §10, Anker §9,
+    /// gradierte Identität §5.5), teilen **exakt einen** Ablauf: Lese-Lock nehmen,
+    /// die Kandidaten über den übergebenen Kanten-Selektor `select` beziehen und am
+    /// gepinnten Watermark VANISH-/fail-closed-filtern. [`ContentStore::visible_filter`]
+    /// bündelt is_active (§13) + Kuratierung (§9.5) + §11-Bereich + fail-closed (§11)
+    /// und ist die **alleinige** Sichtbarkeits-Autorität; `select` liefert nur rohe
+    /// Kandidaten-`ContentId`s.
+    ///
+    /// So lebt der §11.3-Vertrag an **einer** Stelle statt in identischen
+    /// Geschwister-Rümpfen (Minimalism: keine ähnlichen Geschwister). Bewusst
+    /// `impl FnOnce`: der Selektor läuft **unter** dem Lese-Lock (konsistenter
+    /// Snapshot), genau einmal.
+    fn gated_edge_read(
+        &self,
+        capability: &Capability,
+        snapshot: SnapshotToken,
+        select: impl FnOnce(&ContentStore<I>) -> Vec<ContentId>,
+    ) -> Result<Vec<ContentId>, KernelError> {
+        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
+        let candidates = select(&store);
+        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+    }
+
     /// **Gegateter Zeit-Aussage-Lookup** (§6.1/§6.2/§11.3) — liefert die für die
     /// `capability` **sichtbaren** Daten, die die Zeit-Aussage `statement` tragen.
     ///
@@ -327,9 +353,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.time_carriers_of(statement);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.time_carriers_of(statement))
     }
 
     /// **Gegatetes context_points_to** (§1.3 ii / §11.3) — der **gegatete** Einstieg
@@ -429,9 +453,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.supersedes_of(newer);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.supersedes_of(newer))
     }
 
     /// **Gegatete Ersetzungs-Traversierung — superseded-by** (§6.3/§11.3): die für
@@ -450,9 +472,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.superseded_by_of(older);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.superseded_by_of(older))
     }
 
     /// **Gegatete Platzhalter-Auflösung** (§3.6/§6.3/§11.3): die für die `capability`
@@ -536,9 +556,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.origin_inputs_of(result);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.origin_inputs_of(result))
     }
 
     /// **Gegatete Invalidierung — find_dependents (eine Stufe)** (§10.3/§11.3): die
@@ -562,9 +580,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.dependents_of(input);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.dependents_of(input))
     }
 
     /// **Gegatete Anker-Mitgliedschaft — Anker→Repräsentanten** (§9.1/§9.3/§11.3):
@@ -584,9 +600,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.anchor_members_of(anchor);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.anchor_members_of(anchor))
     }
 
     /// **Gegatete Anker-Mitgliedschaft — Repräsentant→Anker** (§9.1/§11.3): die für
@@ -604,9 +618,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.member_anchors_of(member);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.member_anchors_of(member))
     }
 
     /// **Gegatete gradierte Identitäts-Links** (§5.5/§11.3): die für die `capability`
@@ -625,9 +637,7 @@ impl<I: EdgeIndex> LakearchKernel<I> {
         capability: &Capability,
         snapshot: SnapshotToken,
     ) -> Result<Vec<ContentId>, KernelError> {
-        let store = self.store.read().map_err(|_| KernelError::Poisoned)?;
-        let candidates = store.graded_identity_links_of(datum);
-        store.visible_filter(&candidates, capability.scopes().scope_ids(), snapshot.watermark())
+        self.gated_edge_read(capability, snapshot, |s| s.graded_identity_links_of(datum))
     }
 
     /// Der bestand-**lokale** [`AnchorId`]-Handle eines Anker-Daten (§9.1/§12.4),
