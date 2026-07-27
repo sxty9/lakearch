@@ -390,19 +390,12 @@ impl Datum {
     /// Ein Blatt, ein Knoten ohne den Marker oder ein Knoten mit ≠ 2 Kontexten ist
     /// **kein** Zugehörigkeits-Kontext (`None`).
     pub fn area_membership_target(&self) -> Option<ContentId> {
-        let marker = ContentId::of_datum(&Datum::area_membership_marker());
-        let owns = self.owns()?;
-        // Genau zwei Kontexte, einer davon der Marker; der andere ist der Bereich.
-        if owns.len() != 2 {
-            return None;
-        }
-        if owns[0] == marker {
-            Some(owns[1])
-        } else if owns[1] == marker {
-            Some(owns[0])
-        } else {
-            None
-        }
+        // `{ Marker, Bereich }` ist strukturell derselbe zwei-elementige markierte
+        // Kontext wie ein Rollen-Kontext (§1.3) — daher den bestehenden Zugangspunkt
+        // [`role_target`](Datum::role_target) wiederverwenden, statt die
+        // len==2/Marker-Position-Logik zu duplizieren (Keine Redundanz / Zugangspunkt
+        // wiederverwenden).
+        self.role_target(ContentId::of_datum(&Datum::area_membership_marker()))
     }
 }
 
