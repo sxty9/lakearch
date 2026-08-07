@@ -1569,7 +1569,18 @@ impl<I: EdgeIndex> ContentStore<I> {
     /// freigegebenen Umbaus wird **nicht** emittiert — ein halb-vollzogener Umbau
     /// leckt nicht über die Föderation (er ist über jeden Lesepfad unsichtbar). Der
     /// Snapshot ist das aktuelle durable Watermark `W`.
-    pub fn iter_active_data(&self) -> Result<Vec<(ContentId, Datum)>, KernelError> {
+    ///
+    /// **Crate-intern (`pub(crate)`):** dieser Pfad legt dekodierte `Datum`-Inhalte
+    /// **ungegatet** offen und ist daher — wie
+    /// [`get_by_content_id`](ContentStore::get_by_content_id) /
+    /// [`get_canonical_bytes`](ContentStore::get_canonical_bytes) — **nicht** Teil
+    /// der öffentlichen Oberfläche (§11.2/§11.5): der einzige externe Lesepfad
+    /// bleibt das Tor (`get_sealed` + [`crate::gate::open`] gegen eine `Capability`).
+    /// Die internen Aufnehmer ([`ingest_foreign`](ContentStore::ingest_foreign),
+    /// Föderation §12 / Compaction §15) konsumieren die Daten crate-intern und
+    /// re-kanonisieren sie — der Inhalt erreicht **nie** einen externen Leser an
+    /// diesem Tor vorbei (Zugangspunkt wiederverwenden: kein paralleler Datenpfad).
+    pub(crate) fn iter_active_data(&self) -> Result<Vec<(ContentId, Datum)>, KernelError> {
         let w = self.current_watermark();
         // Alle aktiven IDs, deterministisch aufsteigend (§5.2/§1.4).
         let mut active: Vec<ContentId> = self
